@@ -14,7 +14,7 @@ namespace StockIpoReminder.Infrastructure;
 
 public static class DependencyInjection
 {
-    private static readonly string ProductUserAgent = $"StockIpoReminder/{typeof(DependencyInjection).Assembly.GetName().Version?.ToString(3) ?? "0.1.0"}";
+    private static readonly string ProductUserAgent = $"StockIpoReminder/{typeof(DependencyInjection).Assembly.GetName().Version?.ToString(3) ?? "0.1.1"}";
 
     public static IServiceCollection AddStockIpoReminderInfrastructure(
         this IServiceCollection services,

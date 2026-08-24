@@ -2,7 +2,7 @@
 
 一个常驻 Windows 系统托盘的 A 股新股申购提醒程序。它从公开渠道发现沪市、深市和北交所申购任务，并持续提醒，直到你对每只股票分别完成“确认已申购”的二次确认。
 
-当前版本：`0.1.0`
+当前版本：`0.1.1`
 
 ## 能做什么
 
@@ -53,7 +53,7 @@
 运行：
 
 ```text
-StockIpoReminder-Setup-0.1.0-win-x64.exe
+StockIpoReminder-Setup-0.1.1-win-x64.exe
 ```
 
 默认目录：
@@ -69,7 +69,7 @@ StockIpoReminder-Setup-0.1.0-win-x64.exe
 
 ## 便携版
 
-解压 `StockIpoReminder-0.1.0-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
+解压 `StockIpoReminder-0.1.1-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
 
 便携版不自动注册登录计划任务；如果你在设置中主动开启自启动，程序仍会按当前可执行文件位置注册。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序不会自动删除确认记录。
 
@@ -110,7 +110,7 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 未签名风险
 
-`0.1.0` 首版发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
+`0.1.1` 发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
 
 发布清单会明确记录 `signed: false`。代码签名属于后续增强，不会通过隐藏警告来伪装成已签名版本。
 

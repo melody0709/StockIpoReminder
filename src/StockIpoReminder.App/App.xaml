@@ -19,6 +19,7 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Background" Value="{StaticResource BackgroundBrush}" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="Icon" Value="pack://application:,,,/Assets/StockIpoReminder.ico" />
         </Style>
         <Style TargetType="Button">
             <Setter Property="Background" Value="{StaticResource PanelHoverBrush}" />

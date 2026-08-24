@@ -8,6 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\StockIpoReminder.ico</ApplicationIcon>
     <AssemblyName>StockIpoReminder</AssemblyName>
     <RootNamespace>StockIpoReminder.App</RootNamespace>
     <PublishSingleFile>false</PublishSingleFile>
@@ -20,6 +21,10 @@
   <ItemGroup>
     <ProjectReference Include="..\StockIpoReminder.Core\StockIpoReminder.Core.csproj" />
     <ProjectReference Include="..\StockIpoReminder.Infrastructure\StockIpoReminder.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\StockIpoReminder.ico" />
   </ItemGroup>
 
   <ItemGroup>

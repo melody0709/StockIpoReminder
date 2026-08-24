@@ -54,7 +54,7 @@ internal static class SetupJson
         WriteIndented = true,
     };
 
-    public static string ProductVersion => Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.0";
+    public static string ProductVersion => Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.1";
 
     public static async Task WriteAtomicAsync<T>(string path, T value, CancellationToken cancellationToken = default)
     {
