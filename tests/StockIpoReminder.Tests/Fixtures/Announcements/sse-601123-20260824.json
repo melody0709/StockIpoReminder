@@ -1,0 +1,28 @@
+{
+  "pageHelp": {
+    "pageNo": 1,
+    "pageSize": 100,
+    "total": 1,
+    "data": [
+      {
+        "ADDDATE": "2026-08-19 19:00:35",
+        "BULLETIN_HEADING": "发行上市公告",
+        "BULLETIN_TYPE": "IPO公司公告",
+        "BULLETIN_YEAR": "2026",
+        "SECURITY_CODE": "601123",
+        "SECURITY_NAME": "马矿股份",
+        "SSEDATE": "2026-08-20",
+        "SSEDate": null,
+        "TITLE": "马矿股份首次公开发行股票并在主板上市发行公告",
+        "URL": "/disclosure/listedinfo/announcement/c/new/2026-08-20/601123_20260820_HUOS.pdf"
+      },
+      {
+        "SECURITY_CODE": "601123",
+        "SECURITY_NAME": "马矿股份",
+        "SSEDATE": "2026-08-18",
+        "TITLE": "马矿股份投资者关系活动记录表",
+        "URL": "/irrelevant.pdf"
+      }
+    ]
+  }
+}

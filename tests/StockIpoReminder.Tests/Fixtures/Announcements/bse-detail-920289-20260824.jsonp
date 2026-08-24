@@ -1,0 +1,82 @@
+ipoDetailCb([
+  {
+    "sysDate": {
+      "time": 1787500800000
+    },
+    "newShare": {
+      "enquiryType": "3",
+      "fxCode": "920289",
+      "id": 346,
+      "issueNoticeDate": {
+        "time": 1787241600000
+      },
+      "issuePrice": 17.71,
+      "purchaseDate": {
+        "time": 1787500800000
+      },
+      "stockCode": "874378",
+      "stockName": "华汇智能"
+    },
+    "listInfo": {
+      "content": [
+        {
+          "companyCd": "920289",
+          "companyName": "华汇智能",
+          "destFilePath": "/disclosure/2026/2026-08-20/1787216708640_260570.pdf",
+          "disclosureCode": "09bfe628aa5c4bd7bc55e71bc1d02f5a",
+          "disclosurePostTitle": "",
+          "disclosureTitle": "华汇智能:最近三年及一期的财务报告和审计报告",
+          "fileExt": "pdf",
+          "pubDate": {
+            "time": 1787155200000
+          },
+          "publishDate": "2026-08-20"
+        },
+        {
+          "companyCd": "920289",
+          "companyName": "华汇智能",
+          "destFilePath": "/disclosure/2026/2026-08-20/1787216710034_112727.pdf",
+          "disclosureCode": "b79d55ebbdcc40bca656d729181aeb3b",
+          "disclosurePostTitle": "",
+          "disclosureTitle": "华汇智能:向不特定合格投资者公开发行股票并在北京证券交易所上市网上路演公告",
+          "fileExt": "pdf",
+          "pubDate": {
+            "time": 1787155200000
+          },
+          "publishDate": "2026-08-20"
+        },
+        {
+          "companyCd": "920289",
+          "companyName": "华汇智能",
+          "destFilePath": "/disclosure/2026/2026-08-20/1787216707589_212520.pdf",
+          "disclosureCode": "e19a3708133a4f5aae066aa26216173d",
+          "disclosurePostTitle": "",
+          "disclosureTitle": "华汇智能:向不特定合格投资者公开发行股票并在北京证券交易所上市投资风险特别公告",
+          "fileExt": "pdf",
+          "pubDate": {
+            "time": 1787155200000
+          },
+          "publishDate": "2026-08-20"
+        },
+        {
+          "companyCd": "920289",
+          "companyName": "华汇智能",
+          "destFilePath": "/disclosure/2026/2026-08-20/1787216709992_052262.pdf",
+          "disclosureCode": "f1b6935be05f4f8680c4486d0b87ba4c",
+          "disclosurePostTitle": "",
+          "disclosureTitle": "华汇智能:向不特定合格投资者公开发行股票并在北京证券交易所上市发行公告",
+          "fileExt": "pdf",
+          "pubDate": {
+            "time": 1787155200000
+          },
+          "publishDate": "2026-08-20"
+        }
+      ],
+      "number": 0,
+      "numberOfElements": 12,
+      "size": 20,
+      "totalElements": 12,
+      "totalPages": 1
+    }
+  }
+])

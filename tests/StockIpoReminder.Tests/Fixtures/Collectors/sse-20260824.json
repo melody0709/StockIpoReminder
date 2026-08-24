@@ -1,0 +1,58 @@
+{
+  "actionErrors": [],
+  "actionMessages": [],
+  "fieldErrors": {},
+  "isPagination": "true",
+  "pageHelp": {
+    "beginPage": 1,
+    "pageNo": 1,
+    "pageSize": 5,
+    "total": 2,
+    "data": [
+      {
+        "TOTAL_INITIAL_ISSUE": "12350.0000",
+        "ONLINE_CIRCULATION": "6916.0000",
+        "LOT_WINNING_RATE": "0.03225550",
+        "STOCK_TYPE": "0",
+        "COMPANY_FULL_NAME": "福建马坑矿业股份有限公司",
+        "SECURITY_CODE": "601123",
+        "TOTAL_ISSUED": "12350.0000",
+        "IPO_OVERALL_STATUS": "0",
+        "ONLINE_PURCHASE_LIMIT": "2.9500",
+        "ISSUE_PRICE": "6.6500",
+        "OFFLINE_ISSUANCE_START_DATE": "2026-08-21",
+        "ACTUAL_FUNDS_RAISED": "-",
+        "SECURITY_EXPAND_NAME": "马矿股份",
+        "ANNOUNCE_SUCC_RATE_RS_DATE": "2026-08-25",
+        "NUM": "1",
+        "LISTED_DATE": "-",
+        "PAYMENT_START_DATE": "2026-08-25",
+        "SECURITY_NAME": "马矿股份",
+        "ONLINE_ISSUANCE_DATE": "2026-08-21",
+        "ANNOUNCEMENT_URL": "-"
+      },
+      {
+        "TOTAL_INITIAL_ISSUE": "2498.7677",
+        "ONLINE_CIRCULATION": "799.6500",
+        "LOT_WINNING_RATE": "0.01929561",
+        "STOCK_TYPE": "2",
+        "COMPANY_FULL_NAME": "江苏高凯精密流体技术股份有限公司",
+        "SECURITY_CODE": "688835",
+        "TOTAL_ISSUED": "2498.7677",
+        "IPO_OVERALL_STATUS": "0",
+        "ONLINE_PURCHASE_LIMIT": "0.5500",
+        "ISSUE_PRICE": "61.3600",
+        "OFFLINE_ISSUANCE_START_DATE": "2026-08-14",
+        "ACTUAL_FUNDS_RAISED": "153324.3861",
+        "SECURITY_EXPAND_NAME": "高凯技术",
+        "ANNOUNCE_SUCC_RATE_RS_DATE": "2026-08-18",
+        "NUM": "2",
+        "LISTED_DATE": "2026-08-25",
+        "PAYMENT_START_DATE": "2026-08-18",
+        "SECURITY_NAME": "高凯技术",
+        "ONLINE_ISSUANCE_DATE": "2026-08-14",
+        "ANNOUNCEMENT_URL": "-"
+      }
+    ]
+  }
+}

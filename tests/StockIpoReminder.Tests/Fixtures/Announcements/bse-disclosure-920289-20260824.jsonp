@@ -1,0 +1,29 @@
+ipoDisclosureCb([
+  {
+    "listInfo": {
+      "content": [
+        {
+          "companyCd": "920289",
+          "companyName": "华汇智能",
+          "destFilePath": "/disclosure/2026/2026-08-20/1787216709992_052262.pdf",
+          "disclosureCode": "346",
+          "disclosurePostTitle": "",
+          "disclosureTitle": "华汇智能:向不特定合格投资者公开发行股票并在北京证券交易所上市发行公告",
+          "fileExt": "pdf",
+          "pubDate": {
+            "time": 1787155200000
+          },
+          "publishDate": "2026-08-20"
+        }
+      ],
+      "firstPage": true,
+      "lastPage": true,
+      "number": 0,
+      "numberOfElements": 1,
+      "size": 20,
+      "totalElements": 1,
+      "totalPages": 1
+    },
+    "status": 0
+  }
+])

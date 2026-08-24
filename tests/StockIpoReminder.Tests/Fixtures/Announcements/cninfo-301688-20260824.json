@@ -1,0 +1,24 @@
+{
+  "announcements": [
+    {
+      "secCode": "301688",
+      "secName": "格林生物",
+      "orgId": "9900041955",
+      "announcementId": "1225479053",
+      "announcementTitle": "首次公开发行股票并在创业板上市发行公告",
+      "announcementTime": 1787068800000,
+      "adjunctUrl": "finalpage/2026-08-19/1225479053.PDF",
+      "adjunctSize": 4174,
+      "adjunctType": "PDF",
+      "pageColumn": "SZCY"
+    },
+    {
+      "secCode": "301688",
+      "secName": "格林生物",
+      "announcementId": "irrelevant",
+      "announcementTitle": "公司章程",
+      "announcementTime": 1787068800000,
+      "adjunctUrl": "finalpage/2026-08-19/irrelevant.PDF"
+    }
+  ]
+}

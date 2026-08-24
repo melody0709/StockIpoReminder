@@ -1,0 +1,41 @@
+{
+  "version": "fdd835bd1f86177bd931635e37c49005",
+  "success": true,
+  "result": {
+    "pages": 1124,
+    "data": [
+      {
+        "SECUCODE": "301689.SZ",
+        "SECURITY_CODE": "301689",
+        "APPLY_CODE": "301689",
+        "APPLY_DATE": "2026-08-28 00:00:00",
+        "LISTING_DATE": null,
+        "TRADE_MARKET": "深圳证券交易所",
+        "MARKET_TYPE_NEW": "深交所其他",
+        "BALLOT_PAY_DATE": "2026-09-01 00:00:00",
+        "ASSIGN_DATE": "2026-08-31 00:00:00",
+        "ONLINE_ISSUE_DATE": "2026-08-28 00:00:00",
+        "BALLOT_NUM_DATE": "2026-09-01 00:00:00",
+        "ISSUE_PRICE": null,
+        "PREDICT_ISSUE_PRICE": 0,
+        "ISSUE_NUM": 10206.9432,
+        "ONLINE_ISSUE_NUM": 12248000,
+        "ONLINE_APPLY_UPPER": 12000,
+        "TOP_APPLY_MARKETCAP": 12,
+        "SECURITY_NAME": "电科思仪",
+        "MARKET_TYPE": "非科创板",
+        "MARKET": "深交所创业板",
+        "INFO_CODE": "AN202604291821735471",
+        "START_DATE": "2026-09-01 00:00:00",
+        "MAIN_BUSINESS": "从事电子测量仪器研发、制造和销售",
+        "EACHBALLOT_SHARES": "500",
+        "UP_DATE": "2026-08-24 00:00:00",
+        "IS_BEIJING": 0,
+        "SECURITY_NAME_FULL": "中电科思仪科技股份有限公司",
+        "ISSUE_STATE": "1",
+        "BOARD_CODE": "545",
+        "IS_REGISTRATION": "1"
+      }
+    ]
+  }
+}
