@@ -1,0 +1,1076 @@
+import { ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+export struct TaskRow {
+    event-id: string,
+    event-version: int,
+    name: string,
+    market-and-codes: string,
+    date-and-cutoff: string,
+    numbers: string,
+    session: string,
+    status: string,
+    quality: string,
+    updated: string,
+    warning: string,
+    needs-review: bool,
+    can-acknowledge: bool,
+    can-revoke: bool,
+    confirm-label: string,
+}
+
+export struct SourceHealthRow {
+    source: string,
+    state: string,
+    record-text: string,
+    last-success-text: string,
+    error-text: string,
+    state-level: int,
+}
+
+export struct FieldSourceRow {
+    field-name: string,
+    normalized-value: string,
+    raw-value: string,
+    source-text: string,
+    fetched-text: string,
+}
+
+export struct AnnouncementRow {
+    id: string,
+    title: string,
+    metadata: string,
+    evidence: string,
+    source-url: string,
+    local-path: string,
+    local-available: bool,
+}
+
+export struct OverrideRow {
+    id: string,
+    summary: string,
+    metadata: string,
+    can-revoke: bool,
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    min-width: 104px;
+    height: 38px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: !root.enabled ? #334155 : root.danger ? #dc2626 : root.primary ? #3b82f6 : #334155;
+    background: !root.enabled ? #172033 : touch.has-hover ? (root.danger ? #991b1b : root.primary ? #2563eb : #253552) : (root.danger ? #7f1d1d : root.primary ? #1d4ed8 : #17233a);
+    Text {
+        text: root.label;
+        color: root.enabled ? #f8fafc : #64748b;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+component NavButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    callback clicked();
+    min-width: 128px;
+    height: 42px;
+    border-radius: 8px;
+    background: root.selected ? #1d4ed8 : touch.has-hover ? #253552 : #111b2e;
+    Text {
+        text: root.label;
+        color: root.selected ? white : #cbd5e1;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+component Toggle inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> label;
+    min-width: 174px;
+    height: 34px;
+    background: transparent;
+    HorizontalBox {
+        spacing: 9px;
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            border-radius: 5px;
+            border-width: 1px;
+            border-color: root.checked ? #60a5fa : #52647d;
+            background: root.checked ? #2563eb : #0f172a;
+            Text {
+                text: root.checked ? "✓" : "";
+                color: white;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.label;
+            color: #e2e8f0;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    touch := TouchArea { clicked => { root.checked = !root.checked; } }
+}
+
+component StatCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <color> value-color: #f8fafc;
+    height: 82px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: #26334a;
+    background: #111b2e;
+    VerticalBox {
+        padding: 12px;
+        spacing: 3px;
+        Text { text: root.label; color: #94a3b8; font-size: 13px; }
+        Text { text: root.value; color: root.value-color; font-size: 26px; font-weight: 700; }
+    }
+}
+
+component LabeledInput inherits Rectangle {
+    in property <string> label;
+    in-out property <string> value;
+    in property <string> placeholder: "";
+    min-width: 180px;
+    height: 62px;
+    background: transparent;
+    VerticalBox {
+        spacing: 4px;
+        Text { text: root.label; color: #94a3b8; font-size: 12px; }
+        LineEdit { text <=> root.value; placeholder-text: root.placeholder; }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "A 股新股申购提醒";
+    preferred-width: 1180px;
+    preferred-height: 780px;
+    min-width: 980px;
+    min-height: 680px;
+    // Toggling repaint-token marks the complete window background dirty. This
+    // is used when a tray-resident software-rendered window becomes visible
+    // again, because a plain request-redraw may otherwise repaint only the
+    // previously dirty child region.
+    background: Math.mod(root.repaint-token, 2) == 0 ? #0b1220 : #0b1221;
+    default-font-family: "Microsoft YaHei UI";
+    default-font-size: 14px;
+    always-on-top: root.show-reminder || root.show-notification-confirmation || root.show-confirmation || root.show-override-confirmation || root.show-exit-confirmation;
+
+    in-out property <int> active-page: 0;
+    in-out property <int> repaint-token: 0;
+    in-out property <bool> is-synchronizing: false;
+    in-out property <int> runtime-level: 0;
+    in-out property <string> status-text: "正在初始化…";
+    in-out property <string> sync-text: "尚未同步";
+    in-out property <string> health-text: "正在读取健康状态…";
+    in-out property <string> clock-text: "系统时间尚未检查";
+
+    in-out property <int> today-count: 0;
+    in-out property <int> pending-count: 0;
+    in-out property <int> acknowledged-count: 0;
+    in-out property <int> issue-count: 0;
+    in-out property <[TaskRow]> today-tasks: [];
+    in-out property <[TaskRow]> future-tasks: [];
+
+    in-out property <string> health-title: "健康状态尚未建立";
+    in-out property <string> health-summary: "";
+    in-out property <string> heartbeat-text: "";
+    in-out property <[SourceHealthRow]> source-health: [];
+    in-out property <string> data-root-text: "";
+
+    in-out property <bool> auto-start: true;
+    in-out property <bool> shanghai-enabled: true;
+    in-out property <bool> shenzhen-enabled: true;
+    in-out property <bool> beijing-enabled: true;
+    in-out property <string> shanghai-start: "09:30";
+    in-out property <string> shenzhen-start: "09:15";
+    in-out property <string> beijing-start: "09:15";
+    in-out property <string> safety-cutoff: "14:55";
+    in-out property <bool> beijing-reservation: false;
+    in-out property <bool> sound-enabled: true;
+    in-out property <bool> flash-taskbar: true;
+    in-out property <bool> toast-enabled: true;
+    in-out property <bool> health-summary-enabled: true;
+    in-out property <bool> notification-test-completed: false;
+    in-out property <bool> onboarding-completed: false;
+    in-out property <string> notification-test-status: "尚未完成提醒通道测试";
+
+    in-out property <bool> show-details: false;
+    in-out property <string> selected-event-id: "";
+    in-out property <int> selected-event-version: 0;
+    in-out property <string> selected-title: "";
+    in-out property <string> selected-detail: "";
+    in-out property <string> selected-summary: "";
+    in-out property <string> selected-warning: "";
+    in-out property <string> selected-quality: "";
+    in-out property <bool> selected-quality-alert: false;
+    in-out property <int> details-active-tab: 0;
+    in-out property <[FieldSourceRow]> field-source-rows: [];
+    in-out property <[AnnouncementRow]> announcement-rows: [];
+    in-out property <[string]> announcement-choices: ["不指定公告"];
+    in-out property <[OverrideRow]> override-rows: [];
+    in-out property <int> override-field-index: 0;
+    in-out property <int> override-announcement-index: 0;
+    in-out property <string> override-value: "";
+    in-out property <string> override-reason: "";
+    in-out property <string> override-status: "";
+
+    in-out property <bool> show-override-confirmation: false;
+    in-out property <bool> override-confirmation-is-revoke: false;
+    in-out property <string> override-confirmation-id: "";
+    in-out property <string> override-confirmation-title: "";
+    in-out property <string> override-confirmation-body: "";
+
+    in-out property <bool> show-confirmation: false;
+    in-out property <bool> confirmation-is-revoke: false;
+    in-out property <string> confirmation-event-id: "";
+    in-out property <int> confirmation-event-version: 0;
+    in-out property <string> confirmation-title: "";
+    in-out property <string> confirmation-body: "";
+
+    in-out property <bool> show-reminder: false;
+    in-out property <string> reminder-title: "";
+    in-out property <string> reminder-body: "";
+    in-out property <string> reminder-event-id: "";
+    in-out property <int> reminder-event-version: 0;
+    in-out property <bool> show-notification-confirmation: false;
+    in-out property <bool> show-exit-confirmation: false;
+
+    callback save-settings();
+    callback sync-now();
+    callback refresh-data();
+    callback select-task(string);
+    callback acknowledge(string, int);
+    callback revoke-acknowledgement(string, int);
+    callback apply-override(string, int, int, string, string, int);
+    callback revoke-override(string, int, string);
+    callback open-external(string);
+    callback open-local(string);
+    callback create-diagnostics();
+    callback open-data-folder();
+    callback copy-diagnostics();
+    callback test-notifications();
+    callback complete-notification-test(bool);
+    callback hide-to-tray();
+    callback exit-app();
+
+    VerticalBox {
+        padding: 20px;
+        spacing: 12px;
+
+        HorizontalBox {
+            height: 54px;
+            spacing: 12px;
+            VerticalBox {
+                spacing: 3px;
+                Text { text: "A 股新股申购提醒"; font-size: 27px; font-weight: 700; color: #f8fafc; }
+                HorizontalBox {
+                    spacing: 7px;
+                    Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
+                    Text { text: root.status-text + " · " + root.sync-text; color: #94a3b8; font-size: 12px; }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            ActionButton { label: "立即同步"; primary: true; enabled: !root.is-synchronizing; clicked => { root.sync-now(); } }
+            ActionButton { label: "隐藏到托盘"; clicked => { root.hide-to-tray(); } }
+        }
+
+        HorizontalBox {
+            height: 42px;
+            spacing: 6px;
+            NavButton { label: "今日任务"; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
+            NavButton { label: "未来 60 天"; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
+            NavButton { label: "健康与诊断"; selected: root.active-page == 2; clicked => { root.active-page = 2; } }
+            NavButton { label: "设置"; selected: root.active-page == 3; clicked => { root.active-page = 3; } }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: root.health-text; color: #94a3b8; font-size: 12px; vertical-alignment: center; }
+        }
+
+        if root.active-page == 0 : VerticalBox {
+            spacing: 12px;
+            HorizontalBox {
+                spacing: 10px;
+                StatCard { label: "今日任务"; value: "" + root.today-count; horizontal-stretch: 1; }
+                StatCard { label: "待确认"; value: "" + root.pending-count; value-color: #fca5a5; horizontal-stretch: 1; }
+                StatCard { label: "已确认"; value: "" + root.acknowledged-count; value-color: #86efac; horizontal-stretch: 1; }
+                StatCard { label: "异常数据"; value: "" + root.issue-count; value-color: #fcd34d; horizontal-stretch: 1; }
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #26334a;
+                background: #111b2e;
+                ScrollView {
+                    VerticalBox {
+                        padding: 12px;
+                        spacing: 10px;
+                        if root.today-tasks.length == 0 : Text {
+                            text: "今天暂未发现新股申购任务。请同时确认同步状态和数据源健康正常。";
+                            color: #94a3b8;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            height: 320px;
+                            wrap: word-wrap;
+                        }
+                        for task in root.today-tasks : Rectangle {
+                            height: task.warning == "" ? 132px : 158px;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: task.needs-review ? #d97706 : #26334a;
+                            background: #0f172a;
+                            HorizontalBox {
+                                padding: 14px;
+                                spacing: 16px;
+                                VerticalBox {
+                                    width: 29%;
+                                    spacing: 5px;
+                                    Text { text: task.name; color: #f8fafc; font-size: 20px; font-weight: 700; }
+                                    Text { text: task.market-and-codes; color: #93c5fd; wrap: word-wrap; }
+                                    if task.warning != "" : Text { text: task.warning; color: #fbbf24; font-size: 12px; wrap: word-wrap; }
+                                }
+                                VerticalBox {
+                                    width: 25%;
+                                    spacing: 5px;
+                                    Text { text: "申购日 / 安全截止"; color: #94a3b8; font-size: 12px; }
+                                    Text { text: task.date-and-cutoff; color: #f8fafc; font-weight: 600; }
+                                    Text { text: "发行价 / 上限 / 单位"; color: #94a3b8; font-size: 12px; }
+                                    Text { text: task.numbers; color: #e2e8f0; wrap: word-wrap; }
+                                }
+                                VerticalBox {
+                                    horizontal-stretch: 1;
+                                    spacing: 5px;
+                                    Text { text: "官方申购时段"; color: #94a3b8; font-size: 12px; }
+                                    Text { text: task.session; color: #e2e8f0; wrap: word-wrap; }
+                                    Text { text: task.status + " · " + task.quality; color: task.needs-review ? #fcd34d : #86efac; font-weight: 600; wrap: word-wrap; }
+                                    Text { text: task.updated; color: #94a3b8; font-size: 12px; }
+                                }
+                                VerticalBox {
+                                    width: 120px;
+                                    spacing: 6px;
+                                    ActionButton { label: "查看详情"; clicked => { root.select-task(task.event-id); } }
+                                    if task.can-acknowledge : ActionButton {
+                                        label: task.confirm-label;
+                                        primary: true;
+                                        clicked => {
+                                            root.confirmation-is-revoke = false;
+                                            root.confirmation-event-id = task.event-id;
+                                            root.confirmation-event-version = task.event-version;
+                                            root.confirmation-title = "二次确认：已经提交申购委托？";
+                                            root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后，本申购日内停止该股票的重复提醒。";
+                                            root.show-confirmation = true;
+                                        }
+                                    }
+                                    if task.can-revoke : ActionButton {
+                                        label: "撤销确认";
+                                        danger: true;
+                                        clicked => {
+                                            root.confirmation-is-revoke = true;
+                                            root.confirmation-event-id = task.event-id;
+                                            root.confirmation-event-version = task.event-version;
+                                            root.confirmation-title = "撤销已申购确认";
+                                            root.confirmation-body = "撤销 " + task.name + " 的确认后，程序会立即恢复后续提醒。确定撤销吗？";
+                                            root.show-confirmation = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.active-page == 1 : Rectangle {
+            vertical-stretch: 1;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #26334a;
+            background: #111b2e;
+            ScrollView {
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 10px;
+                    if root.future-tasks.length == 0 : Text {
+                        text: "未来 60 天暂未发现可展示的申购任务。";
+                        color: #94a3b8;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        height: 380px;
+                    }
+                    for task in root.future-tasks : Rectangle {
+                        height: task.warning == "" ? 132px : 158px;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: task.needs-review ? #d97706 : #26334a;
+                        background: #0f172a;
+                        HorizontalBox {
+                            padding: 14px;
+                            spacing: 16px;
+                            VerticalBox {
+                                width: 30%;
+                                spacing: 5px;
+                                Text { text: task.name; color: #f8fafc; font-size: 20px; font-weight: 700; }
+                                Text { text: task.market-and-codes; color: #93c5fd; wrap: word-wrap; }
+                                if task.warning != "" : Text { text: task.warning; color: #fbbf24; font-size: 12px; wrap: word-wrap; }
+                            }
+                            VerticalBox {
+                                width: 26%;
+                                spacing: 5px;
+                                Text { text: "申购日 / 安全截止"; color: #94a3b8; font-size: 12px; }
+                                Text { text: task.date-and-cutoff; color: #f8fafc; font-weight: 600; }
+                                Text { text: task.numbers; color: #e2e8f0; wrap: word-wrap; }
+                            }
+                            VerticalBox {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: task.session; color: #e2e8f0; wrap: word-wrap; }
+                                Text { text: task.status + " · " + task.quality; color: task.needs-review ? #fcd34d : #86efac; font-weight: 600; wrap: word-wrap; }
+                                Text { text: task.updated; color: #94a3b8; font-size: 12px; }
+                            }
+                            VerticalBox {
+                                width: 120px;
+                                spacing: 6px;
+                                ActionButton { label: "查看详情"; clicked => { root.select-task(task.event-id); } }
+                                if task.can-acknowledge : ActionButton {
+                                    label: task.confirm-label;
+                                    primary: true;
+                                    clicked => {
+                                        root.confirmation-is-revoke = false;
+                                        root.confirmation-event-id = task.event-id;
+                                        root.confirmation-event-version = task.event-version;
+                                        root.confirmation-title = "二次确认：已经提交申购委托？";
+                                        root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后，本申购日内停止该股票的重复提醒。";
+                                        root.show-confirmation = true;
+                                    }
+                                }
+                                if task.can-revoke : ActionButton {
+                                    label: "撤销确认";
+                                    danger: true;
+                                    clicked => {
+                                        root.confirmation-is-revoke = true;
+                                        root.confirmation-event-id = task.event-id;
+                                        root.confirmation-event-version = task.event-version;
+                                        root.confirmation-title = "撤销已申购确认";
+                                        root.confirmation-body = "撤销 " + task.name + " 的确认后，程序会立即恢复后续提醒。确定撤销吗？";
+                                        root.show-confirmation = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.active-page == 2 : VerticalBox {
+            spacing: 12px;
+            Rectangle {
+                height: 124px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #26334a;
+                background: #111b2e;
+                HorizontalBox {
+                    padding: 14px;
+                    spacing: 12px;
+                    VerticalBox {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: root.health-title; color: root.runtime-level == 2 ? #fca5a5 : root.runtime-level == 1 ? #86efac : #fcd34d; font-size: 21px; font-weight: 700; }
+                        Text { text: root.health-summary; color: #e2e8f0; wrap: word-wrap; }
+                        Text { text: root.heartbeat-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                        Text { text: root.clock-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                    }
+                    ActionButton { label: "刷新诊断"; clicked => { root.refresh-data(); } }
+                }
+            }
+            Text { text: "数据源"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #26334a;
+                background: #111b2e;
+                ScrollView {
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 8px;
+                        for source in root.source-health : Rectangle {
+                            height: source.error-text == "" ? 62px : 80px;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: source.state-level == 1 ? #26334a : #d97706;
+                            background: #0f172a;
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 3px;
+                                HorizontalBox {
+                                    spacing: 12px;
+                                    Text { text: source.source; color: #f8fafc; font-weight: 600; width: 180px; }
+                                    Text { text: source.state; color: source.state-level == 1 ? #86efac : source.state-level == 2 ? #fcd34d : #fca5a5; width: 110px; }
+                                    Text { text: source.record-text; color: #94a3b8; width: 120px; }
+                                    Text { text: source.last-success-text; color: #94a3b8; horizontal-stretch: 1; wrap: word-wrap; }
+                                }
+                                if source.error-text != "" : Text { text: source.error-text; color: #fca5a5; font-size: 12px; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 104px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #26334a;
+                background: #111b2e;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 7px;
+                    Text { text: "本地诊断"; color: #f8fafc; font-size: 17px; font-weight: 600; }
+                    Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        ActionButton { label: "打开数据目录"; clicked => { root.open-data-folder(); } }
+                        ActionButton { label: "复制诊断摘要"; clicked => { root.copy-diagnostics(); } }
+                        ActionButton { label: "导出脱敏诊断包"; clicked => { root.create-diagnostics(); } }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+            }
+        }
+
+        if root.active-page == 3 : Rectangle {
+            vertical-stretch: 1;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #26334a;
+            background: #111b2e;
+            ScrollView {
+                VerticalBox {
+                    padding: 14px;
+                    spacing: 12px;
+                    if !root.onboarding-completed : Rectangle {
+                        height: 62px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: #d97706;
+                        background: #3a2510;
+                        Text {
+                            text: "首次使用请确认市场、券商受理时间和安全截止时间，并完成一次提醒通道测试。测试通过之前会持续显示此提示。";
+                            color: #fcd34d;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            x: 12px; width: parent.width - 24px;
+                        }
+                    }
+                    Rectangle {
+                        height: 88px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "启用市场"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            HorizontalBox {
+                                spacing: 12px;
+                                Toggle { label: "沪市主板 / 科创板"; checked <=> root.shanghai-enabled; }
+                                Toggle { label: "深市主板 / 创业板"; checked <=> root.shenzhen-enabled; }
+                                Toggle { label: "北交所"; checked <=> root.beijing-enabled; }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 176px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "券商受理与安全截止"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: "时间格式 HH:mm。安全截止应在 13:00–15:00，建议保留几分钟券商处理余量。"; color: #94a3b8; font-size: 12px; }
+                            HorizontalBox {
+                                spacing: 12px;
+                                LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
+                                LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
+                                LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
+                                LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                            }
+                            Toggle { label: "我的券商支持北交所开盘前预约申购"; checked <=> root.beijing-reservation; }
+                        }
+                    }
+                    Rectangle {
+                        height: 188px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "提醒通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            HorizontalBox {
+                                spacing: 10px;
+                                Toggle { label: "声音"; checked <=> root.sound-enabled; }
+                                Toggle { label: "临近截止闪烁任务栏"; checked <=> root.flash-taskbar; }
+                                Toggle { label: "Windows 通知 / 托盘气泡"; checked <=> root.toast-enabled; }
+                            }
+                            HorizontalBox {
+                                spacing: 10px;
+                                Toggle { label: "每日 08:00 健康摘要"; checked <=> root.health-summary-enabled; }
+                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
+                            }
+                            HorizontalBox {
+                                spacing: 10px;
+                                ActionButton { label: "测试所有提醒通道"; clicked => { root.test-notifications(); } }
+                                Text { text: root.notification-test-status; color: root.notification-test-completed ? #86efac : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 78px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 7px;
+                            Text { text: "同步频率"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: "启动时同步一次，之后每 24 小时自动同步一次；也可以随时手动立即同步。"; color: #94a3b8; }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton { label: "保存设置"; primary: true; clicked => { root.save-settings(); } }
+                        ActionButton {
+                            label: "安全退出";
+                            danger: true;
+                            clicked => {
+                                if (root.pending-count > 0) {
+                                    root.show-exit-confirmation = true;
+                                } else {
+                                    root.exit-app();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "本程序只记录你的人工确认，不连接券商、不自动下单，也无法验证券商委托是否成功。";
+            color: #94a3b8;
+            font-size: 12px;
+        }
+    }
+
+    if root.show-details : Rectangle {
+        background: #aa020617;
+        Rectangle {
+            width: parent.width > 1040px ? 960px : parent.width - 40px;
+            height: parent.height > 720px ? 680px : parent.height - 30px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #3b82f6;
+            background: #111b2e;
+            VerticalBox {
+                padding: 18px;
+                spacing: 10px;
+                HorizontalBox {
+                    VerticalBox {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        Text { text: root.selected-title; color: #f8fafc; font-size: 22px; font-weight: 700; wrap: word-wrap; }
+                        Text { text: root.selected-summary; color: #93c5fd; font-size: 12px; wrap: word-wrap; }
+                        if root.selected-warning != "" : Text { text: root.selected-warning; color: #fcd34d; font-size: 12px; wrap: word-wrap; }
+                    }
+                    Rectangle {
+                        width: 126px;
+                        height: 34px;
+                        border-radius: 7px;
+                        background: root.selected-quality-alert ? #9a3412 : #166534;
+                        Text { text: root.selected-quality; color: white; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    ActionButton { label: "关闭"; clicked => { root.show-details = false; } }
+                }
+                HorizontalBox {
+                    height: 40px;
+                    spacing: 6px;
+                    NavButton { label: "任务摘要"; selected: root.details-active-tab == 0; clicked => { root.details-active-tab = 0; } }
+                    NavButton { label: "字段来源"; selected: root.details-active-tab == 1; clicked => { root.details-active-tab = 1; } }
+                    NavButton { label: "正式公告"; selected: root.details-active-tab == 2; clicked => { root.details-active-tab = 2; } }
+                    NavButton { label: "人工核验与覆盖"; selected: root.details-active-tab == 3; clicked => { root.details-active-tab = 3; } }
+                }
+
+                if root.details-active-tab == 0 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: #0f172a;
+                    ScrollView { Text { text: root.selected-detail; color: #cbd5e1; wrap: word-wrap; x: 12px; y: 12px; width: parent.width - 24px; } }
+                }
+
+                if root.details-active-tab == 1 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: #0f172a;
+                    ScrollView {
+                        VerticalBox {
+                            padding: 10px;
+                            spacing: 7px;
+                            if root.field-source-rows.length == 0 : Text { text: "尚无可显示的字段来源记录。"; color: #94a3b8; horizontal-alignment: center; height: 300px; vertical-alignment: center; }
+                            for source in root.field-source-rows : Rectangle {
+                                height: 70px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #26334a;
+                                background: #111b2e;
+                                HorizontalBox {
+                                    padding: 10px;
+                                    spacing: 12px;
+                                    Text { text: source.field-name; color: #f8fafc; font-weight: 600; width: 112px; wrap: word-wrap; }
+                                    Text { text: source.normalized-value; color: #e2e8f0; width: 155px; wrap: word-wrap; }
+                                    Text { text: source.source-text; color: #93c5fd; width: 170px; wrap: word-wrap; }
+                                    Text { text: source.fetched-text; color: #94a3b8; width: 140px; wrap: word-wrap; }
+                                    Text { text: source.raw-value; color: #cbd5e1; horizontal-stretch: 1; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.details-active-tab == 2 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: #0f172a;
+                    ScrollView {
+                        VerticalBox {
+                            padding: 10px;
+                            spacing: 8px;
+                            if root.announcement-rows.length == 0 : Text { text: "尚未下载到相关正式公告；任务仍会保留并继续提醒。"; color: #94a3b8; horizontal-alignment: center; height: 300px; vertical-alignment: center; wrap: word-wrap; }
+                            for announcement in root.announcement-rows : Rectangle {
+                                height: 112px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #26334a;
+                                background: #111b2e;
+                                HorizontalBox {
+                                    padding: 11px;
+                                    spacing: 12px;
+                                    VerticalBox {
+                                        horizontal-stretch: 1;
+                                        spacing: 4px;
+                                        Text { text: announcement.title; color: #f8fafc; font-weight: 600; wrap: word-wrap; }
+                                        Text { text: announcement.metadata; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: announcement.evidence; color: #cbd5e1; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    VerticalBox {
+                                        width: 120px;
+                                        spacing: 7px;
+                                        ActionButton { label: "打开原文"; clicked => { root.open-external(announcement.source-url); } }
+                                        ActionButton { label: "打开本地文件"; enabled: announcement.local-available; clicked => { root.open-local(announcement.local-path); } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.details-active-tab == 3 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: 8px;
+                    background: #0f172a;
+                    ScrollView {
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 9px;
+                            Rectangle {
+                                height: 60px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #d97706;
+                                background: #3a2510;
+                                Text { text: "仅在核对正式公告后使用。人工覆盖会记录字段、值、理由、依据公告和当前发行版本；外部关键数据形成新版本后不会沿用旧覆盖。"; color: #fcd34d; wrap: word-wrap; x: 10px; width: parent.width - 20px; vertical-alignment: center; }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                VerticalBox {
+                                    spacing: 4px;
+                                    width: 210px;
+                                    Text { text: "覆盖字段"; color: #94a3b8; font-size: 12px; }
+                                    ComboBox {
+                                        model: ["申购代码", "申购日期", "发行价格", "申购上限（股）", "申购单位（股）", "官方申购时段", "发行状态"];
+                                        current-index <=> root.override-field-index;
+                                    }
+                                }
+                                LabeledInput { label: "覆盖值"; value <=> root.override-value; horizontal-stretch: 1; }
+                                LabeledInput { label: "核验理由"; value <=> root.override-reason; horizontal-stretch: 1; }
+                                VerticalBox {
+                                    spacing: 4px;
+                                    width: 250px;
+                                    Text { text: "依据公告（可选）"; color: #94a3b8; font-size: 12px; }
+                                    ComboBox { model: root.announcement-choices; current-index <=> root.override-announcement-index; }
+                                }
+                            }
+                            HorizontalBox {
+                                spacing: 8px;
+                                Text { text: root.override-status; color: #94a3b8; horizontal-stretch: 1; wrap: word-wrap; }
+                                ActionButton {
+                                    label: "保存人工覆盖";
+                                    primary: true;
+                                    enabled: root.selected-event-id != "" && root.override-value != "" && root.override-reason != "";
+                                    clicked => {
+                                        root.override-confirmation-is-revoke = false;
+                                        root.override-confirmation-title = "确认人工覆盖";
+                                        root.override-confirmation-body = "确定保存当前人工核验值吗？此操作会记录审计信息，并重算后续提醒。";
+                                        root.show-override-confirmation = true;
+                                    }
+                                }
+                            }
+                            Text { text: "当前版本的人工覆盖记录"; color: #f8fafc; font-size: 16px; font-weight: 600; }
+                            if root.override-rows.length == 0 : Text { text: "当前版本尚无人工覆盖记录。"; color: #94a3b8; }
+                            for entry in root.override-rows : Rectangle {
+                                height: 76px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #26334a;
+                                background: #111b2e;
+                                HorizontalBox {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    VerticalBox {
+                                        horizontal-stretch: 1;
+                                        spacing: 4px;
+                                        Text { text: entry.summary; color: #f8fafc; font-weight: 600; wrap: word-wrap; }
+                                        Text { text: entry.metadata; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    ActionButton {
+                                        label: "撤销覆盖";
+                                        danger: true;
+                                        enabled: entry.can-revoke;
+                                        clicked => {
+                                            root.override-confirmation-is-revoke = true;
+                                            root.override-confirmation-id = entry.id;
+                                            root.override-confirmation-title = "撤销人工覆盖";
+                                            root.override-confirmation-body = "确定撤销这条人工覆盖吗？撤销后将恢复公开来源值并重算提醒。";
+                                            root.show-override-confirmation = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.show-override-confirmation : Rectangle {
+        background: #b0020617;
+        Rectangle {
+            width: 560px;
+            height: 250px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: root.override-confirmation-is-revoke ? #dc2626 : #f59e0b;
+            background: #111b2e;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: root.override-confirmation-title; color: #f8fafc; font-size: 21px; font-weight: 700; }
+                Text { text: root.override-confirmation-body; color: #cbd5e1; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "取消"; clicked => { root.show-override-confirmation = false; } }
+                    ActionButton {
+                        label: root.override-confirmation-is-revoke ? "确定撤销" : "确定保存";
+                        primary: !root.override-confirmation-is-revoke;
+                        danger: root.override-confirmation-is-revoke;
+                        clicked => {
+                            if (root.override-confirmation-is-revoke) {
+                                root.revoke-override(root.selected-event-id, root.selected-event-version, root.override-confirmation-id);
+                            } else {
+                                root.apply-override(root.selected-event-id, root.selected-event-version, root.override-field-index, root.override-value, root.override-reason, root.override-announcement-index);
+                            }
+                            root.show-override-confirmation = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.show-confirmation : Rectangle {
+        background: #b0020617;
+        Rectangle {
+            width: 560px;
+            height: 280px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: root.confirmation-is-revoke ? #dc2626 : #f59e0b;
+            background: #111b2e;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: root.confirmation-title; color: #f8fafc; font-size: 21px; font-weight: 700; wrap: word-wrap; }
+                Text { text: root.confirmation-body; color: #cbd5e1; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "取消"; clicked => { root.show-confirmation = false; } }
+                    ActionButton {
+                        label: root.confirmation-is-revoke ? "确定撤销" : "确认已申购";
+                        primary: !root.confirmation-is-revoke;
+                        danger: root.confirmation-is-revoke;
+                        clicked => {
+                            if (root.confirmation-is-revoke) {
+                                root.revoke-acknowledgement(root.confirmation-event-id, root.confirmation-event-version);
+                            } else {
+                                root.acknowledge(root.confirmation-event-id, root.confirmation-event-version);
+                            }
+                            root.show-confirmation = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.show-reminder : Rectangle {
+        background: #b0020617;
+        Rectangle {
+            width: 620px;
+            height: 320px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 2px;
+            border-color: #e7a52d;
+            background: #3a2510;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: root.reminder-title; color: #fcd34d; font-size: 24px; font-weight: 700; wrap: word-wrap; }
+                Text { text: root.reminder-body; color: #f8fafc; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton {
+                        label: "打开详情";
+                        enabled: root.reminder-event-id != "";
+                        clicked => {
+                            root.show-reminder = false;
+                            root.select-task(root.reminder-event-id);
+                        }
+                    }
+                    ActionButton {
+                        label: "确认已申购";
+                        primary: true;
+                        enabled: root.reminder-event-id != "";
+                        clicked => {
+                            root.confirmation-is-revoke = false;
+                            root.confirmation-event-id = root.reminder-event-id;
+                            root.confirmation-event-version = root.reminder-event-version;
+                            root.confirmation-title = "二次确认：已经提交申购委托？";
+                            root.confirmation-body = "请确认已经在券商客户端提交申购委托。本程序不会检查委托是否受理或成功。";
+                            root.show-reminder = false;
+                            root.show-confirmation = true;
+                        }
+                    }
+                    ActionButton { label: "稍后处理"; clicked => { root.show-reminder = false; } }
+                }
+            }
+        }
+    }
+
+    if root.show-notification-confirmation : Rectangle {
+        background: #b0020617;
+        Rectangle {
+            width: 560px;
+            height: 250px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #3b82f6;
+            background: #111b2e;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: "确认提醒通道测试"; color: #f8fafc; font-size: 21px; font-weight: 700; }
+                Text { text: "刚才已触发应用内提醒、托盘气泡、声音以及任务栏闪烁。你是否已经看到并听到当前启用的提醒通道？"; color: #cbd5e1; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "未通过"; danger: true; clicked => { root.complete-notification-test(false); root.show-notification-confirmation = false; } }
+                    ActionButton { label: "已通过"; primary: true; clicked => { root.complete-notification-test(true); root.show-notification-confirmation = false; } }
+                }
+            }
+        }
+    }
+
+    if root.show-exit-confirmation : Rectangle {
+        background: #b0020617;
+        Rectangle {
+            width: 560px;
+            height: 250px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #dc2626;
+            background: #111b2e;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: "仍有未确认任务"; color: #f8fafc; font-size: 21px; font-weight: 700; }
+                Text {
+                    text: "今天仍有 " + root.pending-count + " 只新股没有确认申购。退出后程序无法继续提醒，确定退出吗？";
+                    color: #cbd5e1;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "取消"; clicked => { root.show-exit-confirmation = false; } }
+                    ActionButton { label: "仍然退出"; danger: true; clicked => { root.exit-app(); } }
+                }
+            }
+        }
+    }
+}

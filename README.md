@@ -2,7 +2,11 @@
 
 一个常驻 Windows 系统托盘的 A 股新股申购提醒程序。它从公开渠道发现沪市、深市和北交所申购任务，并持续提醒，直到你对每只股票分别完成“确认已申购”的二次确认。
 
-当前版本：`0.1.1`
+当前版本：`0.2.2`
+
+正式运行版本已经完全迁移到 Rust：界面使用 Slint，Windows 托盘、通知、单实例、声音和登录计划任务使用 `windows-rs`，数据层使用内嵌 SQLite。安装包和便携包都不依赖 .NET Runtime，仓库也已移除旧 C#/.NET 工程。
+
+程序启动时自动同步一次，之后每 24 小时同步一次，并保留“立即同步”。PDF 由同一 Rust EXE 的短生命周期 Worker 解析；Worker 完成后退出，因此同步期的响应、正文和 PDF 解析内存不会留在常驻主进程中。
 
 ## 能做什么
 
@@ -53,7 +57,7 @@
 运行：
 
 ```text
-StockIpoReminder-Setup-0.1.1-win-x64.exe
+StockIpoReminder-Setup-0.2.2-win-x64.exe
 ```
 
 默认目录：
@@ -69,7 +73,7 @@ StockIpoReminder-Setup-0.1.1-win-x64.exe
 
 ## 便携版
 
-解压 `StockIpoReminder-0.1.1-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
+解压 `StockIpoReminder-0.2.2-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
 
 便携版不自动注册登录计划任务；如果你在设置中主动开启自启动，程序仍会按当前可执行文件位置注册。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序不会自动删除确认记录。
 
@@ -95,7 +99,7 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 也可以使用环境变量 `STOCK_IPO_REMINDER_DATA_ROOT`。命令行参数优先于环境变量。不同数据目录使用不同的单实例互斥量和自启动任务名，避免测试污染正式数据。
 
-`--smoke-mode`、`--smoke-enable-autostart`、`--ready-file <path>` 和 `--exit-after-seconds <n>` 是发布 smoke 使用的参数；smoke 模式不会注册 Windows Toast，不建议日常使用。
+`--skip-startup-sync`、`--self-test-report <path>` 和 `--exit-after-seconds <n>` 是发布 smoke 使用的参数，不建议日常使用。
 
 ## 默认提醒规则
 
@@ -110,20 +114,35 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 未签名风险
 
-`0.1.1` 发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
+`0.2.2` 发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
 
 发布清单会明确记录 `signed: false`。代码签名属于后续增强，不会通过隐藏警告来伪装成已签名版本。
 
 ## 开发与验证
 
-工作区使用固定 SDK：
+正式版使用 Rust/Cargo；发布脚本只接受 Cargo 生成的 `StockIpoReminder.exe`：
 
 ```powershell
-.\.tools\dotnet\dotnet.exe test StockIpoReminder.sln --configuration Release
-.\scripts\build-release.ps1
-.\scripts\smoke-release.ps1
+rtk cargo test --locked
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Version 0.2.2
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1 -Version 0.2.2
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1 -Version 0.2.2
 ```
 
-联网诊断工具位于 `tools/StockIpoReminder.Diagnostics`。普通单元测试使用固定真实响应裁剪，不把随机网络访问混入日常测试。
+日常测试使用四来源和正式公告的固定真实响应裁剪，不把随机网络访问混入单元测试。联网端到端验收必须使用独立 `--data-root`，不得污染正式数据。
 
-完整设计、发布闸门和 15 项验收标准见 `.plan/feat/windows-ipo-reminder.md`。
+当前 Rust 固定 fixture、SQLite 状态迁移、字段来源、公告关联、确认撤销和人工覆盖回归测试共 16 项。
+
+## 仓库结构
+
+```text
+Cargo.toml / Cargo.lock   Rust 正式项目与锁定依赖
+src/                      应用、同步、存储、PDF、部署和 Windows 集成
+ui/                       Slint 界面
+assets/                   Windows 应用图标
+tests/fixtures/           四来源与正式公告的离线固定响应样本
+scripts/                  构建、smoke、发布审计和内存测量
+artifacts/                本地生成的发布物与验收报告（不提交）
+```
+
+完整迁移、PDF Worker、内存结果和发布闸门见 `.plan/feat/memory-footprint-pdf-rust.md`；产品设计基线见 `.plan/feat/windows-ipo-reminder.md`。

@@ -1,6 +1,5 @@
 # Build output
-**/bin/
-**/obj/
+/target/
 artifacts/
 publish/
 
@@ -8,7 +7,6 @@ publish/
 .vs/
 .idea/
 .vscode/
-.tools/
 *.user
 *.suo
 
@@ -23,11 +21,3 @@ logs/
 # Test results
 TestResults/
 coverage/
-
-# Packaging output
-installer/output/
-*.msix
-*.msixbundle
-*.appx
-*.appxbundle
-
