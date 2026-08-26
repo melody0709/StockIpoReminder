@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.2.2',
+    [string]$Version,
     [string]$SmokeReportPath,
+    [string]$SigningUpdateReportPath,
     [string]$OutputPath
 )
 
@@ -11,6 +11,16 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$cargoManifestPath = Join-Path $workspace 'Cargo.toml'
+$cargoText = Get-Content -Raw -Encoding UTF8 -LiteralPath $cargoManifestPath
+$configuredVersion = [regex]::Match(
+    $cargoText,
+    '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups['version'].Value
+if ([string]::IsNullOrWhiteSpace($Version)) { $Version = $configuredVersion }
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version: $Version" }
+if ($configuredVersion -ne $Version) {
+    throw "Version mismatch: Cargo.toml=$configuredVersion, requested=$Version"
+}
 $releaseDirectory = Join-Path $workspace "build\packages\$Version"
 $portablePath = Join-Path $releaseDirectory "StockIpoReminder-$Version-win-x64-portable.zip"
 $msiPath = Join-Path $releaseDirectory "StockIpoReminder-$Version-win-x64.msi"
@@ -24,6 +34,17 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 
 function Assert-Condition { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
+function Test-CredentialFreeHttpsUrl {
+    param([string]$Value)
+    try {
+        $uri = [Uri]$Value
+        return $uri.IsAbsoluteUri -and
+            $uri.Scheme -eq 'https' -and
+            -not [string]::IsNullOrWhiteSpace($uri.Host) -and
+            [string]::IsNullOrWhiteSpace($uri.UserInfo)
+    }
+    catch { return $false }
+}
 function Get-Sha256Hex {
     param([string]$Path)
     $stream = [System.IO.File]::OpenRead($Path)
@@ -98,6 +119,50 @@ try {
     Assert-Condition (Test-MsiSignature $msiPath) 'Installer is not a Windows Installer compound file.'
     Add-Check 'binary.formats' 'App is AMD64 PE and installer is an MSI compound file.'
 
+    if ([bool]$manifest.signed) {
+        Assert-Condition ([string]$manifest.signerSha256 -match '^[0-9a-fA-F]{64}$') 'Signed release manifest has no valid signer SHA-256.'
+        Assert-Condition (Test-CredentialFreeHttpsUrl ([string]$manifest.timestampUrl)) 'Signed release manifest has no credential-free HTTPS timestamp URL.'
+        Assert-Condition (Test-CredentialFreeHttpsUrl ([string]$manifest.updateFeedUrl)) 'Signed release manifest has no credential-free HTTPS update feed URL.'
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$manifest.updateManifest)) 'Signed release has no update manifest.'
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$manifest.updateManifestSignature)) 'Signed release has no detached update-manifest signature.'
+        $updateManifestPath = Join-Path $releaseDirectory ([string]$manifest.updateManifest)
+        $updateSignaturePath = Join-Path $releaseDirectory ([string]$manifest.updateManifestSignature)
+        Assert-Condition (Test-Path -LiteralPath $updateManifestPath -PathType Leaf) 'Signed update manifest is missing.'
+        Assert-Condition (Test-Path -LiteralPath $updateSignaturePath -PathType Leaf) 'Signed update manifest signature is missing.'
+        $signedUpdateReport = Join-Path $auditRoot 'signed-update-bundle.json'
+        $verifyProcess = Start-Process -FilePath $appPath -ArgumentList @(
+            '--update-bundle-self-test',
+            '--manifest', $updateManifestPath,
+            '--signature', $updateSignaturePath,
+            '--installer', $msiPath,
+            '--signer', ([string]$manifest.signerSha256),
+            '--report', $signedUpdateReport) -PassThru -Wait -WindowStyle Hidden
+        Assert-Condition ($verifyProcess.ExitCode -eq 0) 'Signed release update bundle failed application verification.'
+        $signedUpdateResult = Get-Content -Raw -Encoding UTF8 -LiteralPath $signedUpdateReport | ConvertFrom-Json
+        Assert-Condition ([bool]$signedUpdateResult.success) 'Signed release update bundle report failed.'
+        Add-Check 'release.signed-update-bundle' 'EXE/MSI signature metadata and detached-CMS update bundle were verified by the application.'
+    }
+    else {
+        Assert-Condition ([string]::IsNullOrWhiteSpace([string]$manifest.signerSha256)) 'Unsigned release unexpectedly declares a signer fingerprint.'
+        Assert-Condition ([string]::IsNullOrWhiteSpace([string]$manifest.updateManifest)) 'Unsigned release unexpectedly declares a signed update manifest.'
+        Add-Check 'release.unsigned-explicit' 'Release explicitly declares signed=false and does not publish a trusted update manifest.'
+    }
+
+    $crashReportUrl = [string]$manifest.crashReportUrl
+    $crashReportPrivacyUrl = [string]$manifest.crashReportPrivacyUrl
+    $crashReportingConfigured = -not [string]::IsNullOrWhiteSpace($crashReportUrl) -and -not [string]::IsNullOrWhiteSpace($crashReportPrivacyUrl)
+    Assert-Condition (
+        [string]::IsNullOrWhiteSpace($crashReportUrl) -eq [string]::IsNullOrWhiteSpace($crashReportPrivacyUrl)) `
+        'Release manifest must declare both crash-report and privacy-policy URLs or neither.'
+    if ($crashReportingConfigured) {
+        Assert-Condition (Test-CredentialFreeHttpsUrl $crashReportUrl) 'Crash-report receiver is not credential-free HTTPS.'
+        Assert-Condition (Test-CredentialFreeHttpsUrl $crashReportPrivacyUrl) 'Crash-report privacy policy is not credential-free HTTPS.'
+        Add-Check 'release.crash-reporting-explicit' 'Release declares HTTPS crash-report receiver and privacy-policy URLs.'
+    }
+    else {
+        Add-Check 'release.crash-reporting-explicit' 'Release explicitly leaves optional crash reporting unconfigured.'
+    }
+
     $cargoManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'Cargo.toml')
     Assert-Condition ($cargoManifest -match '(?m)^name\s*=\s*"stock-ipo-reminder"') 'Cargo package is not formal stock-ipo-reminder.'
     Assert-Condition ($cargoManifest -match ('(?m)^version\s*=\s*"' + [regex]::Escape($Version) + '"')) 'Cargo version mismatch.'
@@ -129,7 +194,31 @@ try {
     Assert-Condition ([string]$smoke.implementation -eq 'rust') 'Smoke report is not Rust.'
     Assert-Condition ([long]$smoke.memory.privateBytes -lt [long]$smoke.memory.limitBytes) 'Idle memory gate failed.'
     Assert-Condition ([bool]$smoke.checks.msiAdministrativeExtract -and [bool]$smoke.checks.msiPayloadSelfTest -and [bool]$smoke.checks.selectableInstallDirectoryAuthoring) 'MSI smoke gates failed.'
-    Add-Check 'evidence.windows-smoke' 'Rust UI, SQLite, MSI administrative extraction, selectable directory authoring, and sub-100MB idle memory smoke passed.'
+    Assert-Condition ([bool]$smoke.checks.reminderWindowVisibleNoFocusSteal) 'Dedicated reminder window smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.secondLaunchActivatesExistingInstance) 'Second-launch activation smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.explorerTrayReRegistration) 'Explorer tray re-registration smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.windowsRecoveryMessagesDebounced) 'Windows recovery-message debounce smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.windowsTimeServiceDiagnosed) 'Windows Time diagnostics smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.windowsToastDiagnosed) 'Windows Toast diagnostics smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.toastAumidAuthoring) 'Windows Toast AUMID authoring smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.safeMsiUninstallAuthoring) 'Safe MSI uninstall authoring smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.signedUpdateAuthoring) 'Signed update authoring smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.crashReportPrivacyAuthoring) 'Crash-report privacy authoring smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.secondaryNotificationAuthoring) 'Secondary-notification security and persistence authoring smoke gate failed.'
+
+    if ([string]::IsNullOrWhiteSpace($SigningUpdateReportPath)) {
+        $SigningUpdateReportPath = Get-ChildItem -LiteralPath (Join-Path $workspace 'build\artifacts\tests\signing-update') -Filter "signing-update-$Version-*.json" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($SigningUpdateReportPath)) 'Signing/update integration report was not found.'
+    $signingUpdate = Get-Content -Raw -Encoding UTF8 -LiteralPath $SigningUpdateReportPath | ConvertFrom-Json
+    Assert-Condition ([bool]$signingUpdate.success) 'Signing/update integration test failed.'
+    Assert-Condition ([bool]$signingUpdate.checks.authenticodeSignatureValidatedWithEphemeralRoot) 'Authenticode signature integration check failed.'
+    Assert-Condition ([bool]$signingUpdate.checks.productionSystemTrustStillRequired) 'Signing integration must not claim that the ephemeral test root is production-trusted.'
+    Assert-Condition ([bool]$signingUpdate.checks.detachedCmsAccepted) 'Detached-CMS integration check failed.'
+    Assert-Condition ([bool]$signingUpdate.checks.tamperedManifestRejected) 'Tampered update manifest was not rejected.'
+    Add-Check 'evidence.signing-update' 'Ephemeral code-signing integration verified the Authenticode signature, detached CMS, signer pinning, installer hash, and tamper rejection; production still requires a system-trusted CA certificate.'
+    Add-Check 'evidence.windows-smoke' 'Rust UI, SQLite, dedicated no-focus reminder window, second-launch activation, Explorer tray re-registration, debounced Windows recovery messages, Windows Time and Toast diagnostics, DPAPI-protected persistent secondary notifications, MSI AUMID, safe-uninstall and signed-update authoring, MSI administrative extraction, selectable directory authoring, and sub-100MB idle memory smoke passed.'
 
     $report = [ordered]@{
         schemaVersion = '2'
@@ -140,6 +229,7 @@ try {
         generatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
         releaseDirectory = "build/packages/$Version"
         smokeReport = Get-WorkspaceRelativePath $SmokeReportPath
+        signingUpdateReport = Get-WorkspaceRelativePath $SigningUpdateReportPath
         checks = @($checks)
     }
     $parent = Split-Path -Parent $OutputPath

@@ -4,7 +4,15 @@ param(
     [ValidateSet('Runtime', 'Portable', 'Msi', 'All')]
     [string]$PackageMode = 'All',
     [switch]$SkipTests,
-    [switch]$KeepStaging
+    [switch]$KeepStaging,
+    [switch]$Sign,
+    [string]$SigningPfxPath = $env:STOCK_IPO_SIGNING_PFX_PATH,
+    [string]$SigningCertificateThumbprint = $env:STOCK_IPO_SIGNING_CERTIFICATE_THUMBPRINT,
+    [string]$SigningPasswordEnvironmentVariable = 'STOCK_IPO_SIGNING_PFX_PASSWORD',
+    [string]$TimestampUrl = 'https://timestamp.digicert.com',
+    [string]$UpdateFeedUrl = $env:STOCK_IPO_UPDATE_FEED_URL,
+    [string]$CrashReportUrl = $env:STOCK_IPO_CRASH_REPORT_URL,
+    [string]$CrashReportPrivacyUrl = $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL
 )
 
 Set-StrictMode -Version Latest
@@ -57,6 +65,18 @@ function Get-Sha256Hex {
     finally { $sha256.Dispose(); $stream.Dispose() }
 }
 
+function Test-CredentialFreeHttpsUrl {
+    param([string]$Value)
+    try {
+        $uri = [Uri]$Value
+        return $uri.IsAbsoluteUri -and
+            $uri.Scheme -eq 'https' -and
+            -not [string]::IsNullOrWhiteSpace($uri.Host) -and
+            [string]::IsNullOrWhiteSpace($uri.UserInfo)
+    }
+    catch { return $false }
+}
+
 function New-ZipFromDirectory {
     param([string]$Source, [string]$Destination)
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
@@ -65,6 +85,136 @@ function New-ZipFromDirectory {
         $Destination,
         [System.IO.Compression.CompressionLevel]::Optimal,
         $false)
+}
+
+function Get-SignToolPath {
+    $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($null -ne $command) { return $command.Source }
+    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+    $candidate = Get-ChildItem -LiteralPath $kitsRoot -Filter signtool.exe -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if ($null -eq $candidate) { throw 'signtool.exe was not found in PATH or the Windows SDK.' }
+    $candidate.FullName
+}
+
+function Get-CertificateSha256 {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try { [System.BitConverter]::ToString($sha256.ComputeHash($Certificate.RawData)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha256.Dispose() }
+}
+
+function Get-CurrentUserStoreCertificate {
+    param([string]$Thumbprint)
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        'My',
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        @($store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Thumbprint,
+            $false) | Where-Object { $_.HasPrivateKey }) | Select-Object -First 1
+    }
+    finally {
+        $store.Close()
+        $store.Dispose()
+    }
+}
+
+function Add-CurrentUserSigningCertificate {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        'My',
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $existing = $store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Certificate.Thumbprint,
+            $false)
+        $store.Add($Certificate)
+        if ($existing.Count -eq 0) {
+            $script:importedSigningCertificates += $Certificate
+        }
+    }
+    finally {
+        $store.Close()
+        $store.Dispose()
+    }
+}
+
+function Remove-CurrentUserSigningCertificate {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        'My',
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        foreach ($match in @($store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Certificate.Thumbprint,
+            $false))) {
+            $store.Remove($match)
+        }
+    }
+    finally {
+        $store.Close()
+        $store.Dispose()
+    }
+}
+
+function Get-SigningCertificate {
+    if (-not [string]::IsNullOrWhiteSpace($SigningPfxPath)) {
+        $fullPfxPath = [System.IO.Path]::GetFullPath($SigningPfxPath)
+        if (-not (Test-Path -LiteralPath $fullPfxPath -PathType Leaf)) { throw "Signing PFX is missing: $fullPfxPath" }
+        $password = [Environment]::GetEnvironmentVariable($SigningPasswordEnvironmentVariable)
+        if ($null -eq $password) { throw "Signing password environment variable is missing: $SigningPasswordEnvironmentVariable" }
+        $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+        $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $collection.Import($fullPfxPath, $password, $flags)
+        $certificate = @($collection | Where-Object { $_.HasPrivateKey }) | Select-Object -First 1
+        if ($null -eq $certificate) { throw 'The imported signing PFX contains no certificate with a private key.' }
+        Add-CurrentUserSigningCertificate -Certificate $certificate
+        return $certificate
+    }
+    if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        throw 'Signing requires either -SigningPfxPath or -SigningCertificateThumbprint.'
+    }
+    $normalized = $SigningCertificateThumbprint.Replace(' ', '').ToUpperInvariant()
+    $certificate = Get-CurrentUserStoreCertificate -Thumbprint $normalized
+    if ($null -eq $certificate) { throw "Code-signing certificate with private key was not found: $normalized" }
+    $certificate
+}
+
+function Invoke-SignToolSign {
+    param([string]$Path)
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    $arguments.Add('sign')
+    $arguments.Add('/fd'); $arguments.Add('SHA256')
+    $arguments.Add('/tr'); $arguments.Add($TimestampUrl)
+    $arguments.Add('/td'); $arguments.Add('SHA256')
+    $arguments.Add('/sha1'); $arguments.Add($signingCertificate.Thumbprint)
+    $arguments.Add($Path)
+    & $signTool @arguments
+    if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $Path with exit code $LASTEXITCODE" }
+    & $signTool verify /pa /all $Path
+    if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $Path with exit code $LASTEXITCODE" }
+}
+
+function Write-DetachedCmsSignature {
+    param([string]$ContentPath, [string]$OutputPath)
+    Add-Type -AssemblyName System.Security
+    $content = [System.Security.Cryptography.Pkcs.ContentInfo]::new([System.IO.File]::ReadAllBytes($ContentPath))
+    $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new($content, $true)
+    $signer = [System.Security.Cryptography.Pkcs.CmsSigner]::new($signingCertificate)
+    $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+    $signer.DigestAlgorithm = [System.Security.Cryptography.Oid]::new('2.16.840.1.101.3.4.2.1')
+    $cms.ComputeSignature($signer, $false)
+    [System.IO.File]::WriteAllBytes($OutputPath, $cms.Encode())
 }
 
 $cargoText = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath
@@ -83,6 +233,54 @@ $portableDirectory = Join-Path $stagingDirectory 'portable'
 $generatedWixDirectory = Join-Path $stagingDirectory 'wix-generated'
 $msiOutputDirectory = Join-Path $stagingDirectory 'msi-output'
 $wixIntermediateDirectory = Join-Path $stagingDirectory 'wix-intermediate'
+$signTool = $null
+$signingCertificate = $null
+$importedSigningCertificates = @()
+$signerSha256 = $null
+$previousUpdateFeedUrl = $env:STOCK_IPO_UPDATE_FEED_URL
+$previousUpdateSignerSha256 = $env:STOCK_IPO_UPDATE_SIGNER_SHA256
+$previousCrashReportUrl = $env:STOCK_IPO_CRASH_REPORT_URL
+$previousCrashReportPrivacyUrl = $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL
+$crashReportConfigured = -not [string]::IsNullOrWhiteSpace($CrashReportUrl) -and -not [string]::IsNullOrWhiteSpace($CrashReportPrivacyUrl)
+if ([string]::IsNullOrWhiteSpace($CrashReportUrl) -ne [string]::IsNullOrWhiteSpace($CrashReportPrivacyUrl)) {
+    throw 'Crash reporting requires both STOCK_IPO_CRASH_REPORT_URL and STOCK_IPO_CRASH_REPORT_PRIVACY_URL.'
+}
+if ($crashReportConfigured) {
+    if (-not (Test-CredentialFreeHttpsUrl $CrashReportUrl) -or
+        -not (Test-CredentialFreeHttpsUrl $CrashReportPrivacyUrl)) {
+        throw 'Crash reporting requires credential-free HTTPS receiver and privacy-policy URLs.'
+    }
+    $env:STOCK_IPO_CRASH_REPORT_URL = $CrashReportUrl
+    $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL = $CrashReportPrivacyUrl
+}
+else {
+    Remove-Item Env:STOCK_IPO_CRASH_REPORT_URL -ErrorAction SilentlyContinue
+    Remove-Item Env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL -ErrorAction SilentlyContinue
+}
+
+if ($Sign) {
+    if (-not (Test-CredentialFreeHttpsUrl $TimestampUrl)) {
+        throw 'Signed releases require a credential-free HTTPS RFC3161 timestamp URL.'
+    }
+    if (-not (Test-CredentialFreeHttpsUrl $UpdateFeedUrl)) {
+        throw 'Signed releases require STOCK_IPO_UPDATE_FEED_URL or -UpdateFeedUrl with a credential-free HTTPS manifest URL.'
+    }
+    $signTool = Get-SignToolPath
+    $signingCertificate = Get-SigningCertificate
+    if (-not $signingCertificate.HasPrivateKey) { throw 'The signing certificate has no private key.' }
+    $codeSigningEku = @($signingCertificate.Extensions | Where-Object {
+        $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+        @($_.EnhancedKeyUsages | Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.3' }).Count -gt 0
+    })
+    if ($codeSigningEku.Count -eq 0) { throw 'The signing certificate is missing the Code Signing EKU.' }
+    $signerSha256 = Get-CertificateSha256 $signingCertificate
+    $env:STOCK_IPO_UPDATE_SIGNER_SHA256 = $signerSha256
+    $env:STOCK_IPO_UPDATE_FEED_URL = $UpdateFeedUrl
+}
+else {
+    Remove-Item Env:STOCK_IPO_UPDATE_SIGNER_SHA256 -ErrorAction SilentlyContinue
+    Remove-Item Env:STOCK_IPO_UPDATE_FEED_URL -ErrorAction SilentlyContinue
+}
 
 New-Item -ItemType Directory -Path `
     $cargoRoot, $testArtifactsRoot, $diagnosticArtifactsRoot, $logsRoot, $packagesRoot `
@@ -106,6 +304,9 @@ try {
     Copy-Item -LiteralPath $builtExecutable -Destination (Join-Path $runtimeDirectory 'StockIpoReminder.exe') -Force
     Copy-Item -LiteralPath (Join-Path $workspace 'README.md') -Destination $runtimeDirectory -Force
     Copy-Item -LiteralPath (Join-Path $workspace 'RELEASE_NOTES.md') -Destination $runtimeDirectory -Force
+    if ($Sign) {
+        Invoke-SignToolSign (Join-Path $runtimeDirectory 'StockIpoReminder.exe')
+    }
 
     $runtimeFiles = foreach ($name in @('StockIpoReminder.exe', 'README.md', 'RELEASE_NOTES.md')) {
         $path = Join-Path $runtimeDirectory $name
@@ -119,6 +320,8 @@ try {
         generatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
         implementation = 'rust'
         architecture = 'x64'
+        signed = [bool]$Sign
+        signerSha256 = $signerSha256
         files = @($runtimeFiles)
     }
     [System.IO.File]::WriteAllText(
@@ -178,6 +381,7 @@ try {
         if ($null -eq $builtMsi) { throw 'WiX MSI output is missing.' }
         $msiPath = Join-Path $releaseDirectory $msiName
         Copy-Item -LiteralPath $builtMsi.FullName -Destination $msiPath -Force
+        if ($Sign) { Invoke-SignToolSign $msiPath }
         $artifactPaths.Add($msiPath)
     }
 
@@ -187,6 +391,35 @@ try {
     $artifacts = foreach ($path in $artifactPaths) {
         $item = Get-Item -LiteralPath $path
         [ordered]@{ name = $item.Name; sizeBytes = $item.Length; sha256 = Get-Sha256Hex $path }
+    }
+    $updateManifestName = $null
+    $updateSignatureName = $null
+    if ($Sign -and $PackageMode -in @('Msi', 'All')) {
+        $installerArtifact = @($artifacts | Where-Object { $_.name -like '*.msi' }) | Select-Object -First 1
+        if ($null -eq $installerArtifact) { throw 'Signed update manifest requires an MSI artifact.' }
+        $updateManifestName = 'update-manifest.json'
+        $updateSignatureName = 'update-manifest.json.p7s'
+        $updateManifestPath = Join-Path $releaseDirectory $updateManifestName
+        $updateManifest = [ordered]@{
+            schemaVersion = 1
+            product = 'StockIpoReminder'
+            channel = 'stable'
+            version = $Version
+            publishedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
+            minimumWindowsBuild = 19041
+            releaseNotesUrl = 'RELEASE_NOTES.md'
+            installer = [ordered]@{
+                url = $installerArtifact.name
+                sha256 = $installerArtifact.sha256
+                sizeBytes = $installerArtifact.sizeBytes
+                signerSha256 = $signerSha256
+            }
+        }
+        [System.IO.File]::WriteAllText(
+            $updateManifestPath,
+            ($updateManifest | ConvertTo-Json -Depth 6),
+            [System.Text.UTF8Encoding]::new($false))
+        Write-DetachedCmsSignature -ContentPath $updateManifestPath -OutputPath (Join-Path $releaseDirectory $updateSignatureName)
     }
     $releaseManifest = [ordered]@{
         product = 'StockIpoReminder'
@@ -198,7 +431,14 @@ try {
         ui = 'Slint'
         dotnetRuntimeRequired = $false
         minimumWindowsBuild = 19041
-        signed = $false
+        signed = [bool]$Sign
+        signerSha256 = $signerSha256
+        timestampUrl = $(if ($Sign) { $TimestampUrl } else { $null })
+        updateFeedUrl = $(if ($Sign) { $UpdateFeedUrl } else { $null })
+        updateManifest = $updateManifestName
+        updateManifestSignature = $updateSignatureName
+        crashReportUrl = $(if ($crashReportConfigured) { $CrashReportUrl } else { $null })
+        crashReportPrivacyUrl = $(if ($crashReportConfigured) { $CrashReportPrivacyUrl } else { $null })
         testsExecuted = -not $SkipTests
         installer = 'msi-per-machine-selectable-directory'
         packageMode = $PackageMode
@@ -222,6 +462,17 @@ try {
     Write-Host "Rust packages created: $releaseDirectory"
 }
 finally {
+    if ($null -eq $previousUpdateFeedUrl) { Remove-Item Env:STOCK_IPO_UPDATE_FEED_URL -ErrorAction SilentlyContinue }
+    else { $env:STOCK_IPO_UPDATE_FEED_URL = $previousUpdateFeedUrl }
+    if ($null -eq $previousUpdateSignerSha256) { Remove-Item Env:STOCK_IPO_UPDATE_SIGNER_SHA256 -ErrorAction SilentlyContinue }
+    else { $env:STOCK_IPO_UPDATE_SIGNER_SHA256 = $previousUpdateSignerSha256 }
+    if ($null -eq $previousCrashReportUrl) { Remove-Item Env:STOCK_IPO_CRASH_REPORT_URL -ErrorAction SilentlyContinue }
+    else { $env:STOCK_IPO_CRASH_REPORT_URL = $previousCrashReportUrl }
+    if ($null -eq $previousCrashReportPrivacyUrl) { Remove-Item Env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL -ErrorAction SilentlyContinue }
+    else { $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL = $previousCrashReportPrivacyUrl }
+    foreach ($certificate in @($importedSigningCertificates)) {
+        Remove-CurrentUserSigningCertificate -Certificate $certificate
+    }
     if (-not $KeepStaging -and (Test-Path -LiteralPath $stagingDirectory)) {
         Assert-SafeDescendant -Path $stagingDirectory -Parent $stagingParent
         Remove-Item -LiteralPath $stagingDirectory -Recurse -Force

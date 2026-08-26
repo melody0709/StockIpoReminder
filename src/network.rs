@@ -1,11 +1,15 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    fmt,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{NaiveDate, TimeZone, Utc};
-use reqwest::blocking::{Client, ClientBuilder};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use reqwest::{
+    blocking::{Client, ClientBuilder, Response},
+    header::{RANGE, RETRY_AFTER},
+};
 use serde_json::Value;
 
 use crate::{core::*, model::*};
@@ -17,7 +21,61 @@ pub struct CollectorOutput {
     pub hash: String,
     pub schema: String,
     pub candidates: Vec<Candidate>,
+    pub audit: CollectorAudit,
 }
+
+#[derive(Debug, Clone)]
+pub struct CollectorAudit {
+    pub declared_count: Option<usize>,
+    pub detail_count: usize,
+    pub accepted_count: usize,
+    pub issues: Vec<String>,
+}
+
+impl CollectorAudit {
+    pub fn state(&self) -> HealthState {
+        if self.issues.is_empty() {
+            HealthState::Healthy
+        } else {
+            HealthState::Warning
+        }
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        (!self.issues.is_empty()).then(|| {
+            format!(
+                "采集计数/明细核验异常：declared={:?}, details={}, accepted={}；{}",
+                self.declared_count,
+                self.detail_count,
+                self.accepted_count,
+                self.issues.join("；")
+            )
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct HttpStatusError {
+    status: u16,
+    host: String,
+    retry_after: Option<ChinaDateTime>,
+}
+
+impl fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "HTTP {}：{}", self.status, self.host)?;
+        if let Some(retry_after) = self.retry_after {
+            write!(
+                formatter,
+                "；Retry-After={}",
+                retry_after.format("%Y-%m-%d %H:%M:%S %:z")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
 
 pub fn client() -> Result<Client> {
     Ok(ClientBuilder::new()
@@ -40,6 +98,28 @@ pub fn collect_all(client: &Client) -> Vec<Result<CollectorOutput>> {
         collect_cninfo(client),
         collect_bse(client),
     ]
+}
+
+pub fn probe_source(client: &Client, source: &str) -> Result<()> {
+    let url = source_probe_url(source).context("未知数据源，无法执行低频健康探测")?;
+    ensure_allowed(url, false)?;
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .timeout(Duration::from_secs(10))
+        .send()?;
+    let _ = checked_response(response, false)?;
+    Ok(())
+}
+
+fn source_probe_url(source: &str) -> Option<&'static str> {
+    match source {
+        "eastmoney" => Some("https://www.eastmoney.com/"),
+        "sse" | "sse-announcement" => Some("https://www.sse.com.cn/"),
+        "cninfo" | "cninfo-announcement" => Some("https://www.cninfo.com.cn/"),
+        "bse" | "bse-announcement" => Some("https://www.bseinfo.net/newshare/listofissues.html"),
+        _ => None,
+    }
 }
 
 pub fn collect_eastmoney(client: &Client) -> Result<CollectorOutput> {
@@ -75,8 +155,10 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
     let mut total = 1;
     let mut raws = Vec::new();
     let mut all = Vec::new();
+    let mut detail_count = 0usize;
+    let mut declared_count = None;
     while page < total && page < 50 {
-        let raw = client
+        let response = client
             .post("https://www.bseinfo.net/newShareController/infoResult.do?callback=ipoCb")
             .header(
                 "Referer",
@@ -89,17 +171,25 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
                 ("sortfield", "purchaseDate"),
                 ("sorttype", "desc"),
             ])
-            .send()?
-            .error_for_status()?
-            .text()?;
-        let (parsed, pages) = parse_bse_page(&raw, started)?;
-        all.extend(parsed);
+            .send()?;
+        let raw = response_text(response, false)?;
+        let parsed = parse_bse_page_with_meta(&raw, started)?;
+        detail_count += parsed.detail_count;
+        declared_count = parsed.declared_count.or(declared_count);
+        all.extend(parsed.candidates);
         raws.push(raw);
-        total = pages;
+        total = parsed.total_pages;
         page += 1;
     }
     let raw = raws.join("\n");
-    Ok(output("bse", started, raw, all))
+    Ok(output_with_counts(
+        "bse",
+        started,
+        raw,
+        all,
+        declared_count,
+        detail_count,
+    ))
 }
 
 fn output(
@@ -108,8 +198,29 @@ fn output(
     raw: String,
     candidates: Vec<Candidate>,
 ) -> CollectorOutput {
+    let (declared_count, detail_count) =
+        response_counts(source, &raw).unwrap_or((None, candidates.len()));
+    output_with_counts(
+        source,
+        started,
+        raw,
+        candidates,
+        declared_count,
+        detail_count,
+    )
+}
+
+fn output_with_counts(
+    source: &'static str,
+    started: ChinaDateTime,
+    raw: String,
+    candidates: Vec<Candidate>,
+    declared_count: Option<usize>,
+    detail_count: usize,
+) -> CollectorOutput {
     let schema = schema_fingerprint(&raw);
     let hash = sha256(raw.as_bytes());
+    let audit = collector_audit(declared_count, detail_count, candidates.len());
     CollectorOutput {
         source,
         started,
@@ -117,6 +228,54 @@ fn output(
         hash,
         schema,
         candidates,
+        audit,
+    }
+}
+
+fn response_counts(source: &str, raw: &str) -> Result<(Option<usize>, usize)> {
+    let root: Value = serde_json::from_str(raw)?;
+    let (declared_count, details) = match source {
+        "eastmoney" => (
+            root.pointer("/result/count").and_then(Value::as_u64),
+            root.pointer("/result/data").and_then(Value::as_array),
+        ),
+        "sse" => (
+            root.pointer("/pageHelp/total").and_then(Value::as_u64),
+            root.pointer("/pageHelp/data").and_then(Value::as_array),
+        ),
+        "cninfo" => (
+            root.get("count").and_then(Value::as_u64),
+            root.get("data").and_then(Value::as_array),
+        ),
+        _ => (None, None),
+    };
+    let details = details.context("采集响应缺少可计数的明细数组")?;
+    Ok((declared_count.map(|value| value as usize), details.len()))
+}
+
+fn collector_audit(
+    declared_count: Option<usize>,
+    detail_count: usize,
+    accepted_count: usize,
+) -> CollectorAudit {
+    let mut issues = Vec::new();
+    if let Some(declared_count) = declared_count
+        && declared_count != detail_count
+    {
+        issues.push(format!(
+            "上游声明 {declared_count} 条，但本轮取得 {detail_count} 条明细"
+        ));
+    }
+    if accepted_count != detail_count {
+        issues.push(format!(
+            "{detail_count} 条明细中仅 {accepted_count} 条通过身份和必填字段校验"
+        ));
+    }
+    CollectorAudit {
+        declared_count,
+        detail_count,
+        accepted_count,
+        issues,
     }
 }
 
@@ -268,7 +427,19 @@ pub fn parse_cninfo(raw: &str, fetched: ChinaDateTime) -> Result<Vec<Candidate>>
         .collect())
 }
 
+struct BsePage {
+    candidates: Vec<Candidate>,
+    total_pages: usize,
+    declared_count: Option<usize>,
+    detail_count: usize,
+}
+
 pub fn parse_bse_page(raw: &str, fetched: ChinaDateTime) -> Result<(Vec<Candidate>, usize)> {
+    let page = parse_bse_page_with_meta(raw, fetched)?;
+    Ok((page.candidates, page.total_pages))
+}
+
+fn parse_bse_page_with_meta(raw: &str, fetched: ChinaDateTime) -> Result<BsePage> {
     let json = unwrap_jsonp(raw)?;
     let root: Value = serde_json::from_str(json)?;
     let payload = root
@@ -280,6 +451,7 @@ pub fn parse_bse_page(raw: &str, fetched: ChinaDateTime) -> Result<(Vec<Candidat
         .get("content")
         .and_then(Value::as_array)
         .context("北交所响应缺少 listInfo.content")?;
+    let detail_count = data.len();
     let today = fetched.date_naive();
     let candidates = data
         .iter()
@@ -321,13 +493,19 @@ pub fn parse_bse_page(raw: &str, fetched: ChinaDateTime) -> Result<(Vec<Candidat
             })
         })
         .collect();
-    Ok((
+    Ok(BsePage {
         candidates,
-        info.get("totalPages")
+        total_pages: info
+            .get("totalPages")
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .max(1) as usize,
-    ))
+        declared_count: info
+            .get("totalElements")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        detail_count,
+    })
 }
 
 pub fn get_text(client: &Client, url: &str, referer: Option<&str>) -> Result<String> {
@@ -336,9 +514,50 @@ pub fn get_text(client: &Client, url: &str, referer: Option<&str>) -> Result<Str
     if let Some(referer) = referer {
         request = request.header("Referer", referer);
     }
-    let response = request.send()?.error_for_status()?;
-    ensure_allowed(response.url().as_str(), false)?;
-    Ok(response.text()?)
+    response_text(request.send()?, false)
+}
+
+pub fn checked_response(response: Response, announcement: bool) -> Result<Response> {
+    ensure_allowed(response.url().as_str(), announcement)?;
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status().as_u16();
+    let host = response.url().host_str().unwrap_or_default().to_owned();
+    let retry_after = if matches!(status, 429 | 503) {
+        parse_retry_after(response.headers().get(RETRY_AFTER), now_china())
+    } else {
+        None
+    };
+    Err(HttpStatusError {
+        status,
+        host,
+        retry_after,
+    }
+    .into())
+}
+
+pub fn retry_after_from_error(error: &anyhow::Error) -> Option<ChinaDateTime> {
+    error
+        .downcast_ref::<HttpStatusError>()
+        .and_then(|failure| failure.retry_after)
+}
+
+fn response_text(response: Response, announcement: bool) -> Result<String> {
+    Ok(checked_response(response, announcement)?.text()?)
+}
+
+fn parse_retry_after(
+    value: Option<&reqwest::header::HeaderValue>,
+    now: ChinaDateTime,
+) -> Option<ChinaDateTime> {
+    let value = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return (seconds >= 0).then(|| now + chrono::Duration::seconds(seconds));
+    }
+    DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|value| value.with_timezone(&china_offset()))
 }
 pub fn ensure_allowed(value: &str, announcement: bool) -> Result<()> {
     let url = url::Url::parse(value)?;
@@ -356,6 +575,7 @@ pub fn ensure_allowed(value: &str, announcement: bool) -> Result<()> {
     Ok(())
 }
 const DATA_HOSTS: &[&str] = &[
+    "www.eastmoney.com",
     "datacenter-web.eastmoney.com",
     "query.sse.com.cn",
     "www.sse.com.cn",
@@ -508,6 +728,28 @@ mod tests {
     }
 
     #[test]
+    fn collector_audit_detects_declared_detail_and_parser_count_mismatches() {
+        let raw = fixture("sse-20260824.json");
+        let fetched = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 24).unwrap(),
+            crate::model::time(12, 0),
+        );
+        let accepted = parse_sse(&raw, fetched).unwrap().len();
+        let (declared, details) = response_counts("sse", &raw).unwrap();
+        let healthy = collector_audit(declared, details, accepted);
+        assert_eq!(healthy.state(), HealthState::Healthy);
+        assert!(healthy.summary().is_none());
+
+        let truncated = collector_audit(Some(2), 1, 1);
+        assert_eq!(truncated.state(), HealthState::Warning);
+        assert!(truncated.summary().unwrap().contains("声明 2 条"));
+
+        let rejected = collector_audit(None, 2, 1);
+        assert_eq!(rejected.state(), HealthState::Warning);
+        assert!(rejected.summary().unwrap().contains("仅 1 条通过"));
+    }
+
+    #[test]
     fn rejects_html_and_non_allowlisted_hosts() {
         assert!(parse_sse("<html>WAF</html>", crate::core::now_china()).is_err());
         assert!(ensure_allowed("https://example.com/file.pdf", true).is_err());
@@ -515,5 +757,47 @@ mod tests {
         assert!(ensure_allowed("https://query.sse.com.cn/query", true).is_ok());
         assert!(ensure_allowed("https://static.sse.com.cn/file.pdf", true).is_ok());
         assert!(ensure_allowed("https://www.cninfo.com.cn/query", true).is_ok());
+    }
+
+    #[test]
+    fn parses_retry_after_delta_seconds_and_http_date() {
+        use reqwest::header::HeaderValue;
+
+        let now = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            crate::model::time(12, 0),
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("120")), now),
+            Some(now + chrono::Duration::minutes(2))
+        );
+        assert_eq!(
+            parse_retry_after(
+                Some(&HeaderValue::from_static("Wed, 26 Aug 2026 04:05:00 GMT")),
+                now,
+            ),
+            Some(now + chrono::Duration::minutes(5))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("-1")), now),
+            None
+        );
+    }
+
+    #[test]
+    fn low_frequency_probe_targets_are_allowlisted_and_source_specific() {
+        for source in [
+            "eastmoney",
+            "sse",
+            "cninfo",
+            "bse",
+            "sse-announcement",
+            "cninfo-announcement",
+            "bse-announcement",
+        ] {
+            let url = source_probe_url(source).unwrap();
+            assert!(ensure_allowed(url, false).is_ok(), "source={source}");
+        }
+        assert!(source_probe_url("unknown").is_none());
     }
 }

@@ -151,14 +151,15 @@ pub fn effective_cutoff(event: &IpoEvent, settings: &AppSettings) -> NaiveTime {
     )
 }
 
-pub fn plan_reminders(event: &IpoEvent, settings: &AppSettings) -> Vec<ReminderItem> {
+pub fn plan_reminders(
+    event: &IpoEvent,
+    settings: &AppSettings,
+    now: ChinaDateTime,
+) -> Vec<ReminderItem> {
     let Some(date) = event.apply_date else {
         return vec![];
     };
-    if event.is_terminal()
-        || event.lifecycle_status == LifecycleStatus::Acknowledged
-        || !settings.exchange_enabled(event.exchange)
-    {
+    if event.is_terminal() || !settings.exchange_enabled(event.exchange) {
         return vec![];
     }
     let mut sessions = if event.sessions.is_empty() {
@@ -180,66 +181,102 @@ pub fn plan_reminders(event: &IpoEvent, settings: &AppSettings) -> Vec<ReminderI
             due.insert(when, level);
         }
     };
-    add(
-        at(date - Duration::days(1), time(20, 0)),
-        ReminderLevel::Advance,
-    );
-    add(at(date, time(8, 30)), ReminderLevel::Morning);
-    let broker = match event.exchange {
-        Exchange::Shanghai => settings.shanghai_broker_accept_start,
-        Exchange::Shenzhen => settings.shenzhen_broker_accept_start,
-        Exchange::Beijing => settings.beijing_broker_accept_start,
-        _ => first.broker_accept_start.unwrap_or(first.official_start),
-    };
-    if (event.exchange != Exchange::Beijing || settings.beijing_reservation_supported)
-        && broker < first.official_start
-    {
-        add(at(date, broker), ReminderLevel::BrokerOpening);
-    }
-    add(
-        at(date, first.official_start - Duration::minutes(5)),
-        ReminderLevel::MarketOpening,
-    );
-    for session in &sessions {
-        let mut cursor = session.official_start;
-        while cursor < session.official_end {
-            if cursor < cutoff {
-                add(at(date, cursor), ReminderLevel::Hourly);
+    let today = now.date_naive();
+    if event.lifecycle_status != LifecycleStatus::Acknowledged && date >= today {
+        add(
+            at(date - Duration::days(1), time(20, 0)),
+            ReminderLevel::Advance,
+        );
+        add(at(date, time(8, 30)), ReminderLevel::Morning);
+        let broker = match event.exchange {
+            Exchange::Shanghai => settings.shanghai_broker_accept_start,
+            Exchange::Shenzhen => settings.shenzhen_broker_accept_start,
+            Exchange::Beijing => settings.beijing_broker_accept_start,
+            _ => first.broker_accept_start.unwrap_or(first.official_start),
+        };
+        if (event.exchange != Exchange::Beijing || settings.beijing_reservation_supported)
+            && broker < first.official_start
+        {
+            add(at(date, broker), ReminderLevel::BrokerOpening);
+        }
+        add(
+            at(date, first.official_start - Duration::minutes(5)),
+            ReminderLevel::MarketOpening,
+        );
+        for session in &sessions {
+            let mut cursor = session.official_start;
+            while cursor < session.official_end {
+                if cursor < cutoff {
+                    add(at(date, cursor), ReminderLevel::Hourly);
+                }
+                cursor += Duration::hours(1);
             }
-            cursor += Duration::hours(1);
+        }
+        if time(11, 20) < cutoff {
+            add(at(date, time(11, 20)), ReminderLevel::NoonBoundary);
+        }
+        if time(12, 55) < cutoff {
+            add(at(date, time(12, 55)), ReminderLevel::AfternoonOpening);
+        }
+        add_range(
+            &mut add,
+            date,
+            cutoff - Duration::minutes(60),
+            cutoff - Duration::minutes(30),
+            15,
+            ReminderLevel::FifteenMinutes,
+        );
+        add_range(
+            &mut add,
+            date,
+            cutoff - Duration::minutes(30),
+            cutoff - Duration::minutes(10),
+            5,
+            ReminderLevel::FiveMinutes,
+        );
+        add_range(
+            &mut add,
+            date,
+            cutoff - Duration::minutes(10),
+            cutoff,
+            2,
+            ReminderLevel::TwoMinutes,
+        );
+        add(at(date, cutoff), ReminderLevel::Final);
+    }
+
+    if matches!(
+        event.lifecycle_status,
+        LifecycleStatus::Acknowledged | LifecycleStatus::AcknowledgedNeedsReview
+    ) {
+        if settings.post_apply_reminders_enabled {
+            // These are prompts to check the broker, not inferred exchange deadlines.
+            if let Some(ballot_date) = event
+                .ballot_date
+                .filter(|value| *value >= date && *value >= today)
+            {
+                add(at(ballot_date, time(18, 0)), ReminderLevel::BallotCheck);
+            }
+            if let Some(payment_date) = event
+                .payment_date
+                .filter(|value| *value >= date && *value >= today)
+            {
+                add(at(payment_date, time(8, 30)), ReminderLevel::PaymentMorning);
+                add(
+                    at(payment_date, time(14, 0)),
+                    ReminderLevel::PaymentFollowUp,
+                );
+            }
+        }
+        if settings.listing_reminders_enabled {
+            if let Some(listing_date) = event
+                .listing_date
+                .filter(|value| *value >= date && *value >= today)
+            {
+                add(at(listing_date, time(8, 30)), ReminderLevel::ListingMorning);
+            }
         }
     }
-    if time(11, 20) < cutoff {
-        add(at(date, time(11, 20)), ReminderLevel::NoonBoundary);
-    }
-    if time(12, 55) < cutoff {
-        add(at(date, time(12, 55)), ReminderLevel::AfternoonOpening);
-    }
-    add_range(
-        &mut add,
-        date,
-        cutoff - Duration::minutes(60),
-        cutoff - Duration::minutes(30),
-        15,
-        ReminderLevel::FifteenMinutes,
-    );
-    add_range(
-        &mut add,
-        date,
-        cutoff - Duration::minutes(30),
-        cutoff - Duration::minutes(10),
-        5,
-        ReminderLevel::FiveMinutes,
-    );
-    add_range(
-        &mut add,
-        date,
-        cutoff - Duration::minutes(10),
-        cutoff,
-        2,
-        ReminderLevel::TwoMinutes,
-    );
-    add(at(date, cutoff), ReminderLevel::Final);
     due.into_iter()
         .map(|(when, level)| ReminderItem {
             event_id: event.id.clone(),
@@ -402,16 +439,99 @@ fn conflicts(items: &[&Candidate], selector: impl Fn(&Candidate) -> Option<Strin
 }
 
 pub fn event_hash(event: &IpoEvent) -> String {
-    sha256(format!(
-        "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+    sha256(critical_event_signature(event))
+}
+
+pub fn critical_change_reason(previous: &IpoEvent, current: &IpoEvent) -> Option<String> {
+    let mut fields = Vec::new();
+    if previous.apply_code != current.apply_code {
+        fields.push("申购代码");
+    }
+    if previous.apply_date != current.apply_date {
+        fields.push("申购日期");
+    }
+    if previous.issue_price != current.issue_price {
+        fields.push("发行价格");
+    }
+    if previous.max_apply_quantity != current.max_apply_quantity {
+        fields.push("申购上限");
+    }
+    if previous.lot_size != current.lot_size {
+        fields.push("申购单位");
+    }
+    if previous.required_market_value != current.required_market_value {
+        fields.push("所需市值");
+    }
+    if previous.required_cash != current.required_cash {
+        fields.push("所需资金");
+    }
+    if previous.status != current.status {
+        fields.push("发行状态");
+    }
+    if critical_session_signature(previous) != critical_session_signature(current) {
+        fields.push("官方申购时段或资金规则");
+    }
+    (!fields.is_empty()).then(|| format!("关键申购字段已变化：{}", fields.join("、")))
+}
+
+pub fn noncritical_change_reason(previous: &IpoEvent, current: &IpoEvent) -> Option<String> {
+    let mut fields = Vec::new();
+    if previous.name != current.name {
+        fields.push("证券简称");
+    }
+    if previous.legacy_code != current.legacy_code {
+        fields.push("历史证券代码");
+    }
+    if previous.ballot_date != current.ballot_date {
+        fields.push("中签结果日期");
+    }
+    if previous.payment_date != current.payment_date {
+        fields.push("缴款日期");
+    }
+    if previous.listing_date != current.listing_date {
+        fields.push("上市日期");
+    }
+    if previous.announcement_url != current.announcement_url {
+        fields.push("公告链接");
+    }
+    (!fields.is_empty()).then(|| format!("普通任务字段已变化：{}", fields.join("、")))
+}
+
+fn critical_event_signature(event: &IpoEvent) -> String {
+    format!(
+        "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         event.id,
         event.event_version,
         event.apply_code,
         event.apply_date,
         event.issue_price,
         event.max_apply_quantity,
-        event.status
-    ))
+        event.lot_size,
+        event.required_market_value,
+        event.required_cash,
+        event.status,
+        critical_session_signature(event)
+    )
+}
+
+fn critical_session_signature(
+    event: &IpoEvent,
+) -> Vec<(i32, NaiveTime, NaiveTime, FundingMode, bool)> {
+    let mut sessions = event
+        .sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_number,
+                session.official_start,
+                session.official_end,
+                session.funding_mode,
+                session.allocation_time_sensitive,
+            )
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by_key(|session| session.0);
+    sessions
 }
 
 pub fn group_candidates(candidates: Vec<Candidate>) -> HashMap<String, Vec<Candidate>> {
@@ -463,7 +583,11 @@ mod tests {
     #[test]
     fn reminder_plan_contains_final_cutoff_and_unique_keys() {
         let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
-        let reminders = plan_reminders(&event(date), &AppSettings::default());
+        let reminders = plan_reminders(
+            &event(date),
+            &AppSettings::default(),
+            at(date - Duration::days(1), time(8, 0)),
+        );
         assert!(
             reminders.iter().any(
                 |item| item.level == ReminderLevel::Final && item.due_at.time() == time(14, 55)
@@ -482,7 +606,165 @@ mod tests {
     fn acknowledged_event_has_no_reminders() {
         let mut value = event(NaiveDate::from_ymd_opt(2026, 8, 25).unwrap());
         value.lifecycle_status = LifecycleStatus::Acknowledged;
-        assert!(plan_reminders(&value, &AppSettings::default()).is_empty());
+        assert!(
+            plan_reminders(
+                &value,
+                &AppSettings::default(),
+                at(value.apply_date.unwrap(), time(10, 0))
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn acknowledged_event_plans_only_known_post_apply_prompts() {
+        let apply_date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let mut value = event(apply_date);
+        value.lifecycle_status = LifecycleStatus::Acknowledged;
+        value.ballot_date = Some(apply_date + Duration::days(1));
+        value.payment_date = Some(apply_date + Duration::days(2));
+        value.listing_date = Some(apply_date + Duration::days(8));
+
+        let reminders =
+            plan_reminders(&value, &AppSettings::default(), at(apply_date, time(10, 0)));
+        assert_eq!(reminders.len(), 4);
+        assert!(
+            reminders
+                .iter()
+                .any(|item| item.level == ReminderLevel::BallotCheck)
+        );
+        assert!(
+            reminders
+                .iter()
+                .any(|item| item.level == ReminderLevel::PaymentMorning)
+        );
+        assert!(
+            reminders
+                .iter()
+                .any(|item| item.level == ReminderLevel::PaymentFollowUp)
+        );
+        assert!(reminders.iter().any(|item| {
+            item.level == ReminderLevel::ListingMorning && item.due_at.time() == time(8, 30)
+        }));
+
+        let disabled = AppSettings {
+            post_apply_reminders_enabled: false,
+            listing_reminders_enabled: false,
+            ..AppSettings::default()
+        };
+        assert!(plan_reminders(&value, &disabled, at(apply_date, time(10, 0))).is_empty());
+
+        let listing_only = AppSettings {
+            post_apply_reminders_enabled: false,
+            ..AppSettings::default()
+        };
+        let reminders = plan_reminders(&value, &listing_only, at(apply_date, time(10, 0)));
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].level, ReminderLevel::ListingMorning);
+    }
+
+    #[test]
+    fn post_apply_plan_is_time_deterministic_and_skips_expired_dates() {
+        let apply_date = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let mut value = event(apply_date);
+        value.lifecycle_status = LifecycleStatus::Acknowledged;
+        value.ballot_date = Some(today - Duration::days(1));
+        value.payment_date = Some(today);
+        value.listing_date = Some(today + Duration::days(1));
+
+        let reminders = plan_reminders(&value, &AppSettings::default(), at(today, time(13, 0)));
+        assert_eq!(reminders.len(), 3);
+        assert!(
+            !reminders
+                .iter()
+                .any(|item| item.level == ReminderLevel::BallotCheck)
+        );
+        assert!(reminders.iter().any(|item| {
+            item.level == ReminderLevel::PaymentMorning && item.due_at == at(today, time(8, 30))
+        }));
+        assert!(reminders.iter().any(|item| {
+            item.level == ReminderLevel::PaymentFollowUp && item.due_at == at(today, time(14, 0))
+        }));
+        assert!(reminders.iter().any(|item| {
+            item.level == ReminderLevel::ListingMorning
+                && item.due_at == at(today + Duration::days(1), time(8, 30))
+        }));
+    }
+
+    #[test]
+    fn old_unconfirmed_or_review_event_does_not_recreate_expired_apply_reminders() {
+        let apply_date = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let mut unconfirmed = event(apply_date);
+        unconfirmed.lifecycle_status = LifecycleStatus::ActiveUnconfirmed;
+        unconfirmed.listing_date = Some(today + Duration::days(2));
+        assert!(
+            plan_reminders(&unconfirmed, &AppSettings::default(), at(today, time(9, 0)),)
+                .is_empty()
+        );
+
+        let mut needs_review = unconfirmed;
+        needs_review.lifecycle_status = LifecycleStatus::AcknowledgedNeedsReview;
+        let reminders = plan_reminders(
+            &needs_review,
+            &AppSettings::default(),
+            at(today, time(9, 0)),
+        );
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].level, ReminderLevel::ListingMorning);
+    }
+
+    #[test]
+    fn critical_change_detection_covers_subscription_limits_and_rules() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let mut original = event(date);
+        original.sessions = vec![SubscriptionSession {
+            session_number: 1,
+            official_start: time(9, 30),
+            official_end: time(15, 0),
+            broker_accept_start: Some(time(9, 15)),
+            safety_cutoff: Some(time(14, 55)),
+            funding_mode: FundingMode::MarketValue,
+            allocation_time_sensitive: false,
+            source: "fixture-a".into(),
+            source_published_at: Some(at(date, time(7, 30))),
+        }];
+
+        let mut changed = original.clone();
+        changed.max_apply_quantity = Some(20_000);
+        changed.lot_size = Some(1_000);
+        changed.sessions[0].official_start = time(9, 15);
+        changed.sessions[0].funding_mode = FundingMode::FullCash;
+        let reason = critical_change_reason(&original, &changed).unwrap();
+        assert!(reason.contains("申购上限"));
+        assert!(reason.contains("申购单位"));
+        assert!(reason.contains("官方申购时段或资金规则"));
+        assert_ne!(event_hash(&original), event_hash(&changed));
+
+        let mut metadata_only = original.clone();
+        metadata_only.sessions[0].broker_accept_start = Some(time(9, 0));
+        metadata_only.sessions[0].safety_cutoff = Some(time(14, 50));
+        metadata_only.sessions[0].source = "fixture-b".into();
+        metadata_only.sessions[0].source_published_at = Some(at(date, time(8, 0)));
+        assert!(critical_change_reason(&original, &metadata_only).is_none());
+        assert_eq!(event_hash(&original), event_hash(&metadata_only));
+    }
+
+    #[test]
+    fn noncritical_change_detection_excludes_subscription_conditions() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let original = event(date);
+        let mut changed = original.clone();
+        changed.name = "测试股份新简称".into();
+        changed.listing_date = Some(date + Duration::days(10));
+        let reason = noncritical_change_reason(&original, &changed).unwrap();
+        assert!(reason.contains("证券简称"));
+        assert!(reason.contains("上市日期"));
+
+        let mut critical_only = original.clone();
+        critical_only.issue_price = Some(11.0);
+        assert!(noncritical_change_reason(&original, &critical_only).is_none());
     }
 
     #[test]

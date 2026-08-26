@@ -3,10 +3,13 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, TimeZone, Utc};
@@ -17,10 +20,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    },
+};
+
 use crate::{
     core::{at, china_offset, now_china, parse_date, sha256},
     model::*,
-    network::{encode_query, ensure_allowed, text},
+    network::{checked_response, encode_query, ensure_allowed, text},
 };
 
 pub const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024;
@@ -29,7 +43,19 @@ const DOWNLOAD_PREFIX_BYTES: usize = 4 * 1024;
 pub const MAX_PDF_PAGES: usize = 20;
 pub const MAX_EXTRACTED_CHARACTERS: usize = 256_000;
 pub const PDF_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+pub const PDF_WORKER_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 const PARSER_VERSION: &str = "rust-announcement-v1";
+
+#[cfg(windows)]
+struct PdfWorkerJob(HANDLE);
+
+#[cfg(windows)]
+impl Drop for PdfWorkerJob {
+    fn drop(&mut self) {
+        // SAFETY: this type owns the handle returned by CreateJobObjectW.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +72,7 @@ struct PdfWorkerResponse {
     text: String,
     text_hash: Option<String>,
     page_count: usize,
+    failed_page_count: usize,
     truncated: bool,
     error: Option<String>,
 }
@@ -58,8 +85,17 @@ pub fn try_run_pdf_worker(arguments: &[String]) -> Result<Option<i32>> {
         .context("PDF Worker 缺少 --pdf-worker-response")?;
     let response = match (|| -> Result<PdfWorkerResponse> {
         let request: PdfWorkerRequest = serde_json::from_slice(&fs::read(&request_path)?)?;
-        if request.max_pages == 0 || request.max_pages > 100 || request.max_characters == 0 {
+        if request.max_pages == 0
+            || request.max_pages > MAX_PDF_PAGES
+            || request.max_characters == 0
+            || request.max_characters > MAX_EXTRACTED_CHARACTERS
+        {
             bail!("PDF Worker 参数超出允许范围");
+        }
+        let metadata = fs::metadata(&request.input_path)
+            .with_context(|| format!("无法读取 PDF 元数据：{}", request.input_path.display()))?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_DOWNLOAD_BYTES {
+            bail!("PDF Worker 输入文件为空、不是普通文件或超过 32 MiB 上限");
         }
         extract_pdf_text(&request)
     })() {
@@ -69,6 +105,7 @@ pub fn try_run_pdf_worker(arguments: &[String]) -> Result<Option<i32>> {
             text: String::new(),
             text_hash: None,
             page_count: 0,
+            failed_page_count: 0,
             truncated: false,
             error: Some(format!("{error:#}")),
         },
@@ -87,40 +124,98 @@ fn argument_value(arguments: &[String], name: &str) -> Option<PathBuf> {
 }
 
 fn extract_pdf_text(request: &PdfWorkerRequest) -> Result<PdfWorkerResponse> {
-    let document = lopdf::Document::load(&request.input_path)
+    let document = lopdf::Document::load_filtered(&request.input_path, pdf_text_object_filter)
         .with_context(|| format!("无法打开 PDF：{}", request.input_path.display()))?;
-    let pages: Vec<u32> = document
-        .get_pages()
-        .keys()
-        .copied()
-        .take(request.max_pages)
-        .collect();
-    let page_count = document.get_pages().len();
+    let all_pages = document.get_pages();
+    let pages: Vec<u32> = all_pages.keys().copied().take(request.max_pages).collect();
+    let page_count = all_pages.len();
     let mut combined = String::new();
+    let mut remaining_characters = request.max_characters;
+    let mut failed_page_count = 0usize;
+    let mut character_truncated = false;
     for page in &pages {
-        let page_text = document.extract_text(&[*page]).unwrap_or_default();
-        if combined.len() < request.max_characters {
-            combined.push_str(&page_text);
+        let page_text = match document.extract_text(&[*page]) {
+            Ok(value) => value,
+            Err(_) => {
+                failed_page_count += 1;
+                continue;
+            }
+        };
+        character_truncated |=
+            append_limited_characters(&mut combined, &page_text, &mut remaining_characters);
+        if remaining_characters > 0 {
             combined.push('\n');
+            remaining_characters -= 1;
+        } else if pages.last() != Some(page) {
+            character_truncated = true;
+        }
+        if character_truncated {
+            break;
         }
     }
-    let (text, character_truncated) = take_characters(&combined, request.max_characters);
+    if combined.trim().is_empty() && failed_page_count == pages.len() && !pages.is_empty() {
+        bail!("PDF 前 {} 页均无法提取文本", pages.len());
+    }
+    drop(document);
     let truncated = character_truncated || page_count > request.max_pages;
-    let text_hash = (!text.trim().is_empty()).then(|| sha256(text.as_bytes()));
+    let text_hash = (!combined.trim().is_empty()).then(|| sha256(combined.as_bytes()));
     Ok(PdfWorkerResponse {
         success: true,
-        text,
+        text: combined,
         text_hash,
         page_count,
+        failed_page_count,
         truncated,
         error: None,
     })
 }
 
-fn take_characters(value: &str, maximum: usize) -> (String, bool) {
-    let mut iterator = value.chars();
-    let text: String = iterator.by_ref().take(maximum).collect();
-    (text, iterator.next().is_some())
+fn pdf_text_object_filter(
+    object_id: (u32, u16),
+    object: &mut lopdf::Object,
+) -> Option<((u32, u16), lopdf::Object)> {
+    const IGNORED_TYPES: &[&[u8]] = &[b"Image", b"FontDescriptor", b"ExtGState", b"Annot"];
+    if IGNORED_TYPES.contains(&object.type_name().unwrap_or_default()) {
+        return None;
+    }
+    if let Ok(dictionary) = object.as_dict_mut() {
+        if dictionary
+            .get(b"Subtype")
+            .ok()
+            .and_then(|value| value.as_name().ok())
+            .is_some_and(|value| value == b"Image")
+        {
+            return None;
+        }
+        dictionary.remove(b"Producer");
+        dictionary.remove(b"ModDate");
+        dictionary.remove(b"Creator");
+        dictionary.remove(b"ProcSet");
+        dictionary.remove(b"Procset");
+        dictionary.remove(b"Annots");
+        if dictionary.is_empty() {
+            return None;
+        }
+    }
+    // lopdf ignores the callback's returned object for ordinary indirect objects,
+    // but uses it for objects unpacked from an object stream. PDF object streams
+    // cannot themselves contain stream objects, so avoid cloning potentially large
+    // page/content streams while still returning full values for packed dictionaries.
+    if matches!(object, lopdf::Object::Stream(_)) {
+        return Some((object_id, lopdf::Object::Null));
+    }
+    Some((object_id, object.to_owned()))
+}
+
+fn append_limited_characters(target: &mut String, value: &str, remaining: &mut usize) -> bool {
+    let mut characters = value.chars();
+    let mut appended = 0usize;
+    for character in characters.by_ref().take(*remaining) {
+        target.push(character);
+        appended += 1;
+    }
+    *remaining = remaining.saturating_sub(appended);
+    characters.next().is_some()
 }
 
 #[derive(Debug)]
@@ -224,12 +319,13 @@ fn search_sse_official(
         encode_query(&values)
     );
     ensure_allowed(&url, true)?;
-    let response = client
-        .get(url)
-        .header("Referer", "https://www.sse.com.cn/")
-        .send()?
-        .error_for_status()?;
-    ensure_allowed(response.url().as_str(), true)?;
+    let response = checked_response(
+        client
+            .get(url)
+            .header("Referer", "https://www.sse.com.cn/")
+            .send()?,
+        true,
+    )?;
     let raw = response.text()?;
     parse_sse_references(&raw)
 }
@@ -293,34 +389,34 @@ fn search_cninfo_market(
 ) -> Result<Vec<AnnouncementRef>> {
     let landing = "https://www.cninfo.com.cn/new/index";
     ensure_allowed(landing, true)?;
-    let landing_response = client.get(landing).send()?.error_for_status()?;
-    ensure_allowed(landing_response.url().as_str(), true)?;
+    let _landing_response = checked_response(client.get(landing).send()?, true)?;
     thread::sleep(Duration::from_millis(350));
     let url = "https://www.cninfo.com.cn/new/hisAnnouncement/query";
     ensure_allowed(url, true)?;
-    let response = client
-        .post(url)
-        .header("Referer", landing)
-        .form(&[
-            ("pageNum", "1"),
-            ("pageSize", "100"),
-            ("column", column),
-            ("tabName", "fulltext"),
-            ("searchkey", event.security_code.as_str()),
-            (
-                "seDate",
-                &format!("{}~{}", from.format("%Y-%m-%d"), to.format("%Y-%m-%d")),
-            ),
-            ("plate", ""),
-            ("stock", ""),
-            ("category", ""),
-            ("trade", ""),
-            ("sortName", ""),
-            ("sortType", ""),
-        ])
-        .send()?
-        .error_for_status()?;
-    ensure_allowed(response.url().as_str(), true)?;
+    let response = checked_response(
+        client
+            .post(url)
+            .header("Referer", landing)
+            .form(&[
+                ("pageNum", "1"),
+                ("pageSize", "100"),
+                ("column", column),
+                ("tabName", "fulltext"),
+                ("searchkey", event.security_code.as_str()),
+                (
+                    "seDate",
+                    &format!("{}~{}", from.format("%Y-%m-%d"), to.format("%Y-%m-%d")),
+                ),
+                ("plate", ""),
+                ("stock", ""),
+                ("category", ""),
+                ("trade", ""),
+                ("sortName", ""),
+                ("sortType", ""),
+            ])
+            .send()?,
+        true,
+    )?;
     let raw = response.text()?;
     parse_cninfo_references_for_event(&raw, Some(&event.security_code), provider)
 }
@@ -487,15 +583,16 @@ fn search_bse_pages(
         let url = format!("{endpoint}?{}", encode_query(&query));
         query.clear();
         ensure_allowed(&url, true)?;
-        let response = client
-            .get(url)
-            .header(
-                "Referer",
-                "https://www.bseinfo.net/newshare/listofissues.html",
-            )
-            .send()?
-            .error_for_status()?;
-        ensure_allowed(response.url().as_str(), true)?;
+        let response = checked_response(
+            client
+                .get(url)
+                .header(
+                    "Referer",
+                    "https://www.bseinfo.net/newshare/listofissues.html",
+                )
+                .send()?,
+            true,
+        )?;
         let raw = response.text()?;
         let (rows, pages) = parse_bse_references(&raw, event, from, to)?;
         result.extend(rows);
@@ -757,8 +854,7 @@ pub fn download_and_parse(
     if let Some(referer) = announcement_referer(&reference.url) {
         request = request.header("Referer", referer);
     }
-    let mut response = request.send()?.error_for_status()?;
-    ensure_allowed(response.url().as_str(), true)?;
+    let mut response = checked_response(request.send()?, true)?;
     let final_host = response.url().host_str().unwrap_or_default().to_owned();
     if response
         .content_length()
@@ -820,8 +916,12 @@ pub fn download_and_parse(
     if !response.success {
         bail!("PDF Worker 失败：{}", response.error.unwrap_or_default());
     }
-    let (extracted_text, text_hash, truncated) =
-        (response.text, response.text_hash, response.truncated);
+    let (extracted_text, text_hash, truncated, failed_page_count) = (
+        response.text,
+        response.text_hash,
+        response.truncated,
+        response.failed_page_count,
+    );
     let fields = parse_fields(&extracted_text, &reference.title)?;
     let status = if extracted_text.trim().is_empty() {
         ExtractionStatus::Failed
@@ -839,8 +939,13 @@ pub fn download_and_parse(
         text_hash,
         status,
         parser_version: format!(
-            "{PARSER_VERSION}{}",
-            if truncated { "+truncated" } else { "" }
+            "{PARSER_VERSION}{}{}",
+            if truncated { "+truncated" } else { "" },
+            if failed_page_count > 0 {
+                "+partial"
+            } else {
+                ""
+            }
         ),
         fields,
         downloaded_at: now_china(),
@@ -917,6 +1022,15 @@ fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorke
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
+    let _worker_job = match constrain_pdf_worker(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_worker_files(&request_path, &response_path);
+            return Err(error);
+        }
+    };
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -934,7 +1048,9 @@ fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorke
         .ok()
         .and_then(|bytes| serde_json::from_slice::<PdfWorkerResponse>(&bytes).ok());
     cleanup_worker_files(&request_path, &response_path);
-    let response = response.context("PDF Worker 未生成有效响应")?;
+    let response = response.with_context(|| {
+        format!("PDF Worker 未生成有效响应（退出状态 {status}；可能崩溃或触发 512 MiB 内存上限）")
+    })?;
     if !status.success() || !response.success {
         bail!(
             "PDF Worker 失败：{}",
@@ -942,6 +1058,29 @@ fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorke
         );
     }
     Ok(response)
+}
+
+#[cfg(windows)]
+fn constrain_pdf_worker(child: &Child) -> Result<PdfWorkerJob> {
+    // SAFETY: the returned handle is owned by PdfWorkerJob; all pointers below
+    // reference initialized values for the duration of each Windows API call.
+    unsafe {
+        let job = CreateJobObjectW(None, None)?;
+        let owned_job = PdfWorkerJob(job);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT(
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY.0 | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0,
+        );
+        limits.ProcessMemoryLimit = PDF_WORKER_MEMORY_LIMIT_BYTES;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )?;
+        AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()))?;
+        Ok(owned_job)
+    }
 }
 
 fn cleanup_worker_files(request: &Path, response: &Path) {
@@ -1015,7 +1154,13 @@ pub fn parse_fields(text_value: &str, title: &str) -> Result<Vec<ParsedField>> {
         &mut fields,
         &compact,
         "BallotDate",
-        r"(?:中签率公告日|摇号抽签日)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
+        r"(?:中签率公告日|中签结果公告日|摇号抽签日)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
+    )?;
+    capture_date(
+        &mut fields,
+        &compact,
+        "PaymentDate",
+        r"(?:网上投资者缴款日|网上缴款日(?:及截止时间)?|缴款日期)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
     )?;
     let session_regex = Regex::new(r"(\d{1,2}:\d{2})\s*[-—至]\s*(\d{1,2}:\d{2})")?;
     for (index, capture) in session_regex.captures_iter(&compact).take(4).enumerate() {
@@ -1169,7 +1314,7 @@ pub fn candidate_from_document(
         required_market_value: None,
         required_cash: None,
         ballot_date: values.get("BallotDate").and_then(|v| parse_date(v)),
-        payment_date: None,
+        payment_date: values.get("PaymentDate").and_then(|v| parse_date(v)),
         listing_date: None,
         status: values
             .get("IssueStatus")
@@ -1199,6 +1344,7 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     fn fixture(path: &str) -> String {
         fs::read_to_string(
@@ -1236,6 +1382,59 @@ mod tests {
             mirror[0].url,
             "https://static.cninfo.com.cn/finalpage/2026-08-25/1225499048.PDF"
         );
+    }
+
+    #[test]
+    fn pdf_text_accumulator_never_exceeds_character_budget() {
+        let mut target = String::new();
+        let mut remaining = 5usize;
+        assert!(append_limited_characters(
+            &mut target,
+            "新股公告文本",
+            &mut remaining
+        ));
+        assert_eq!(target.chars().count(), 5);
+        assert_eq!(remaining, 0);
+
+        let mut target = String::new();
+        let mut remaining = 10usize;
+        assert!(!append_limited_characters(
+            &mut target,
+            "三字文",
+            &mut remaining
+        ));
+        assert_eq!(target, "三字文");
+        assert_eq!(remaining, 7);
+    }
+
+    #[test]
+    fn pdf_filter_discards_image_objects_but_preserves_page_dictionaries() {
+        let mut image = lopdf::Object::Dictionary(lopdf::dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+        });
+        assert!(pdf_text_object_filter((1, 0), &mut image).is_none());
+
+        let mut page = lopdf::Object::Dictionary(lopdf::dictionary! {
+            "Type" => "Page",
+            "Contents" => lopdf::Object::Reference((2, 0)),
+            "Resources" => lopdf::Object::Dictionary(lopdf::dictionary! {
+                "Font" => lopdf::Object::Dictionary(lopdf::Dictionary::new()),
+                "XObject" => lopdf::Object::Dictionary(lopdf::Dictionary::new()),
+            }),
+        });
+        let filtered = pdf_text_object_filter((3, 0), &mut page).unwrap().1;
+        let page = filtered.as_dict().unwrap();
+        assert!(page.has(b"Contents"));
+        assert!(page.has(b"Resources"));
+
+        let mut content = lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::dictionary! { "Length" => 6 },
+            b"BT ET\n".to_vec(),
+        ));
+        let returned = pdf_text_object_filter((4, 0), &mut content).unwrap().1;
+        assert!(matches!(returned, lopdf::Object::Null));
+        assert!(matches!(content, lopdf::Object::Stream(_)));
     }
 
     #[test]
@@ -1315,5 +1514,21 @@ mod tests {
         assert!(fields.iter().any(|field| field.name == "ApplyCode"));
         assert!(fields.iter().any(|field| field.name == "IssuePrice"));
         assert!(!fields.iter().any(|field| field.name == "IssueStatus"));
+
+        let dates = parse_fields(
+            "中签结果公告日：2026年8月27日；网上缴款日及截止时间：2026年8月28日日终。",
+            "发行公告",
+        )
+        .unwrap();
+        assert!(
+            dates
+                .iter()
+                .any(|field| { field.name == "BallotDate" && field.value == "2026-08-27" })
+        );
+        assert!(
+            dates
+                .iter()
+                .any(|field| { field.name == "PaymentDate" && field.value == "2026-08-28" })
+        );
     }
 }

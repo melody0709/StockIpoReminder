@@ -99,7 +99,7 @@ if (Test-Path -LiteralPath $artifactsRoot -PathType Container) {
     $testsRoot = Join-Path $artifactsRoot 'tests'
     if (Test-Path -LiteralPath $testsRoot -PathType Container) {
         foreach ($entry in Get-ChildItem -LiteralPath $testsRoot -Force) {
-            if ($entry.Name -notin @('smoke', 'audit') -or -not $entry.PSIsContainer -or (Test-ReparsePoint $entry)) {
+            if ($entry.Name -notin @('smoke', 'audit', 'watchdog', 'signing-update') -or -not $entry.PSIsContainer -or (Test-ReparsePoint $entry)) {
                 $issues.Add("Unexpected test artifact entry: $($entry.FullName)")
             }
         }
@@ -128,6 +128,8 @@ if (Test-Path -LiteralPath $packagesRoot -PathType Container) {
             'README.md',
             'RELEASE_NOTES.md',
             'release-manifest.json',
+            'update-manifest.json',
+            'update-manifest.json.p7s',
             'SHA256SUMS.txt'
         )
         foreach ($entry in Get-ChildItem -LiteralPath $versionDirectory.FullName -Force) {

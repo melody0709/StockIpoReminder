@@ -23,10 +23,12 @@ numeric_enum!(IssueStatus { Unknown = 0, Upcoming = 1, Active = 2, Postponed = 3
 numeric_enum!(LifecycleStatus { Unknown = -1, Discovered = 0, Scheduled = 1, ActiveUnconfirmed = 2, Acknowledged = 3, AcknowledgedNeedsReview = 4, SuspendedOrCancelled = 5, Superseded = 6, ExpiredUnconfirmed = 7 });
 numeric_enum!(DataQualityStatus { Unknown = -1, SingleSource = 0, MultiSourceVerified = 1, AnnouncementVerified = 2, DataConflict = 3, Stale = 4, ManualReviewRequired = 5 });
 numeric_enum!(FundingMode { Unknown = -1, MarketValue = 0, FullCash = 1 });
-numeric_enum!(ReminderLevel { Unknown = -1, Advance = 0, Morning = 10, BrokerOpening = 15, MarketOpening = 20, Hourly = 30, NoonBoundary = 40, AfternoonOpening = 45, FifteenMinutes = 50, FiveMinutes = 60, TwoMinutes = 70, Final = 80, DataChanged = 90, HealthWarning = 100 });
+numeric_enum!(ReminderLevel { Unknown = -1, Advance = 0, Morning = 10, BrokerOpening = 15, MarketOpening = 20, Hourly = 30, NoonBoundary = 40, AfternoonOpening = 45, FifteenMinutes = 50, FiveMinutes = 60, TwoMinutes = 70, Final = 80, DataChanged = 90, HealthWarning = 100, BallotCheck = 110, PaymentMorning = 120, PaymentFollowUp = 130, ListingMorning = 140 });
 numeric_enum!(DeliveryState { Unknown = -1, Pending = 0, Leased = 1, Delivered = 2, Collapsed = 3, Cancelled = 4, Failed = 5 });
+numeric_enum!(SecondaryNotificationProvider { Unknown = -1, Disabled = 0, WeCom = 1, DingTalk = 2, Feishu = 3, PushPlus = 4 });
 numeric_enum!(HealthState { Unknown = 0, Healthy = 1, Warning = 2, Failed = 3 });
 numeric_enum!(ExtractionStatus { Unknown = -1, Pending = 0, Extracted = 1, LowConfidence = 2, Failed = 3, Unsupported = 4 });
+numeric_enum!(SyncConclusionKind { Unknown = 0, HealthyNonempty = 1, HealthyEmpty = 2, DegradedCached = 3 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,10 +160,21 @@ pub struct AppSettings {
     pub flash_taskbar: bool,
     pub toast_enabled: bool,
     pub daily_health_summary_enabled: bool,
+    pub post_apply_reminders_enabled: bool,
+    pub listing_reminders_enabled: bool,
+    pub automatic_updates_enabled: bool,
+    pub crash_report_upload_enabled: bool,
+    pub secondary_notification_enabled: bool,
+    pub secondary_notification_provider: SecondaryNotificationProvider,
     pub auto_start_enabled: bool,
     pub normal_sync_minutes: i32,
     pub active_day_sync_minutes: i32,
     pub notification_self_test_completed: bool,
+    pub notification_window_test_passed: Option<bool>,
+    pub notification_toast_test_passed: Option<bool>,
+    pub notification_balloon_test_passed: Option<bool>,
+    pub notification_sound_test_passed: Option<bool>,
+    pub notification_flash_test_passed: Option<bool>,
     pub onboarding_completed: bool,
 }
 
@@ -180,10 +193,21 @@ impl Default for AppSettings {
             flash_taskbar: true,
             toast_enabled: true,
             daily_health_summary_enabled: true,
+            post_apply_reminders_enabled: true,
+            listing_reminders_enabled: true,
+            automatic_updates_enabled: true,
+            crash_report_upload_enabled: false,
+            secondary_notification_enabled: false,
+            secondary_notification_provider: SecondaryNotificationProvider::Disabled,
             auto_start_enabled: true,
-            normal_sync_minutes: 1440,
-            active_day_sync_minutes: 1440,
+            normal_sync_minutes: 30,
+            active_day_sync_minutes: 10,
             notification_self_test_completed: false,
+            notification_window_test_passed: None,
+            notification_toast_test_passed: None,
+            notification_balloon_test_passed: None,
+            notification_sound_test_passed: None,
+            notification_flash_test_passed: None,
             onboarding_completed: false,
         }
     }
@@ -197,6 +221,23 @@ impl AppSettings {
             Exchange::Beijing => self.beijing_enabled,
             _ => false,
         }
+    }
+
+    pub fn notification_tests_complete(&self) -> bool {
+        self.notification_window_test_passed == Some(true)
+            && (!self.toast_enabled
+                || self.notification_toast_test_passed == Some(true)
+                || self.notification_balloon_test_passed == Some(true))
+            && (!self.sound_enabled || self.notification_sound_test_passed == Some(true))
+            && (!self.flash_taskbar || self.notification_flash_test_passed == Some(true))
+    }
+
+    pub fn notification_tests_started(&self) -> bool {
+        self.notification_window_test_passed.is_some()
+            || self.notification_toast_test_passed.is_some()
+            || self.notification_balloon_test_passed.is_some()
+            || self.notification_sound_test_passed.is_some()
+            || self.notification_flash_test_passed.is_some()
     }
 }
 
@@ -217,6 +258,34 @@ pub struct ReminderDelivery {
     pub level: ReminderLevel,
     pub dedupe_key: String,
     pub attempt_count: i32,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecondaryNotificationDelivery {
+    pub id: i64,
+    pub reminder_outbox_id: i64,
+    pub request_attempt_id: i64,
+    pub provider: SecondaryNotificationProvider,
+    pub event: IpoEvent,
+    pub due_at: ChinaDateTime,
+    pub level: ReminderLevel,
+    pub attempt_count: i32,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecondaryNotificationSummary {
+    pub pending: i64,
+    pub leased: i64,
+    pub delivered: i64,
+    pub retrying: i64,
+    pub exhausted: i64,
+    pub cancelled: i64,
+    pub requests_last_hour: i64,
+    pub latest_success_at: Option<ChinaDateTime>,
+    pub latest_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,7 +347,8 @@ pub struct ManualOverrideEntry {
     pub revoked_at: Option<ChinaDateTime>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceHealthEntry {
     pub source: String,
     pub state: HealthState,
@@ -288,16 +358,96 @@ pub struct SourceHealthEntry {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationHealthEntry {
+    pub component: String,
+    pub state: HealthState,
+    pub last_attempt_at: Option<ChinaDateTime>,
+    pub last_success_at: Option<ChinaDateTime>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthDetails {
     pub overall_state: HealthState,
     pub today_task_count: usize,
     pub pending_confirmation_count: usize,
     pub conflict_count: usize,
     pub manual_review_count: usize,
+    pub delivery_retry_count: usize,
+    pub oldest_delivery_retry_at: Option<ChinaDateTime>,
+    pub latest_delivery_error: Option<String>,
     pub scheduler_heartbeat: Option<ChinaDateTime>,
     pub delivery_heartbeat: Option<ChinaDateTime>,
     pub sources: Vec<SourceHealthEntry>,
+    pub operations: Vec<OperationHealthEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncRunSummary {
+    pub source: String,
+    pub started_at: ChinaDateTime,
+    pub finished_at: ChinaDateTime,
+    pub success: bool,
+    pub record_count: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderLogSummary {
+    pub event_id: String,
+    pub scheduled_at: ChinaDateTime,
+    pub shown_at: ChinaDateTime,
+    pub reminder_level: ReminderLevel,
+    pub delivery_channel: String,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderStateSummary {
+    pub pending: i64,
+    pub leased: i64,
+    pub delivered: i64,
+    pub collapsed: i64,
+    pub cancelled: i64,
+    pub failed: i64,
+    pub oldest_failed_at: Option<ChinaDateTime>,
+    pub latest_error: Option<String>,
+    pub shown_last_seven_days: i64,
+    pub latest_shown_at: Option<ChinaDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConclusion {
+    pub kind: SyncConclusionKind,
+    pub started_at: ChinaDateTime,
+    pub finished_at: ChinaDateTime,
+    pub today_count: usize,
+    pub event_count: usize,
+    pub announcement_count: usize,
+    pub successful_sources: Vec<String>,
+    pub missing_sources: Vec<String>,
+    pub summary: String,
+}
+
+impl SyncConclusionKind {
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::HealthyNonempty | Self::HealthyEmpty)
+    }
+
+    pub fn health_state(self) -> HealthState {
+        match self {
+            Self::HealthyNonempty | Self::HealthyEmpty => HealthState::Healthy,
+            Self::DegradedCached => HealthState::Warning,
+            Self::Unknown => HealthState::Failed,
+        }
+    }
 }
 
 pub fn exchange_name(exchange: Exchange) -> &'static str {

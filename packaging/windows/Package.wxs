@@ -70,7 +70,11 @@
               Id="StockIpoReminderStartMenuShortcut"
               Name="A 股新股申购提醒"
               Target="[INSTALLFOLDER]StockIpoReminder.exe"
-              WorkingDirectory="INSTALLFOLDER" />
+              WorkingDirectory="INSTALLFOLDER">
+            <ShortcutProperty
+                Key="System.AppUserModel.ID"
+                Value="StockIpoReminder.Desktop" />
+          </Shortcut>
           <RemoveFolder Id="RemoveStockIpoReminderProgramMenuFolder" On="uninstall" />
           <RegistryValue
               Root="HKCU"

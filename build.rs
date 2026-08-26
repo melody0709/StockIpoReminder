@@ -2,6 +2,10 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/StockIpoReminder.ico");
+    println!("cargo:rerun-if-env-changed=STOCK_IPO_UPDATE_FEED_URL");
+    println!("cargo:rerun-if-env-changed=STOCK_IPO_UPDATE_SIGNER_SHA256");
+    println!("cargo:rerun-if-env-changed=STOCK_IPO_CRASH_REPORT_URL");
+    println!("cargo:rerun-if-env-changed=STOCK_IPO_CRASH_REPORT_PRIVACY_URL");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         compile_windows_resources();
     }

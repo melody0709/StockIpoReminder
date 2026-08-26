@@ -1,28 +1,38 @@
 use std::{
+    cell::Cell,
     fs,
     mem::size_of,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 use crate::core::sha256;
 
 #[cfg(windows)]
-use std::os::windows::{ffi::OsStrExt, process::CommandExt};
+use std::os::windows::{
+    ffi::{OsStrExt, OsStringExt},
+    process::CommandExt,
+};
 #[cfg(windows)]
 use windows::{
+    Data::Xml::Dom::XmlDocument,
+    UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager},
     Win32::{
         Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError,
-            GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, RECT, WPARAM,
+            GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, PROPERTYKEY, RECT, WPARAM,
         },
         Graphics::Gdi::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
         },
         Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW},
         System::{
+            Com::StructuredStorage::{PropVariantClear, PropVariantToString},
+            Com::{CoTaskMemFree, IBindCtx},
             DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
             Diagnostics::Debug::MessageBeep,
             LibraryLoader::GetModuleHandleW,
@@ -32,24 +42,344 @@ use windows::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
             },
+            Services::{
+                CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+                SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+            },
             Threading::{CreateMutexW, GetCurrentProcess},
+            WinRT::{RO_INIT_SINGLETHREADED, RoInitialize},
         },
         UI::{
-            Shell::ShellExecuteW,
+            Shell::{
+                FOLDERID_CommonPrograms, KF_FLAG_DEFAULT,
+                PropertiesSystem::{
+                    GPS_DEFAULT, IPropertyStore, SHGetPropertyStoreFromParsingName,
+                },
+                QUNS_ACCEPTS_NOTIFICATIONS, QUNS_APP, QUNS_BUSY, QUNS_NOT_PRESENT,
+                QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME, QUNS_RUNNING_D3D_FULL_SCREEN,
+                SHGetKnownFolderPath, SHQueryUserNotificationState,
+                SetCurrentProcessExplicitAppUserModelID, ShellExecuteW,
+            },
             WindowsAndMessaging::{
-                FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GetClientRect,
-                GetWindowRect, HICON, ICON_BIG, ICON_SMALL, LoadIconW, MB_ICONEXCLAMATION,
-                SW_SHOWNORMAL, SendMessageW, WM_SETICON,
+                FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GWL_EXSTYLE,
+                GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HICON,
+                HWND_BROADCAST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IsIconic, IsWindowVisible,
+                LoadIconW, MB_ICONEXCLAMATION, PostMessageW, RegisterWindowMessageW, SW_SHOWNORMAL,
+                SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+                WM_SETICON, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             },
         },
     },
-    core::PCWSTR,
+    core::{GUID, HSTRING, PCWSTR, w},
 };
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 pub const APP_ICON_RESOURCE_ID: u16 = 1;
+pub const APP_USER_MODEL_ID: &str = "StockIpoReminder.Desktop";
+
+#[cfg(windows)]
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+    pid: 5,
+};
+
+#[cfg(windows)]
+static PROCESS_APP_IDENTITY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
+#[cfg(windows)]
+thread_local! {
+    static WINRT_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToastDiagnostics {
+    pub supported: bool,
+    pub app_user_model_id: String,
+    pub process_identity_set: bool,
+    pub notifier_created: bool,
+    pub notification_setting: Option<String>,
+    pub notifications_enabled: bool,
+    pub common_start_menu_shortcut_present: bool,
+    pub shortcut_aumid_matches: bool,
+    pub user_notification_state: Option<String>,
+    pub accepts_notifications_now: Option<bool>,
+    pub error: Option<String>,
+    pub shortcut_error: Option<String>,
+}
+
+impl Default for ToastDiagnostics {
+    fn default() -> Self {
+        Self {
+            supported: cfg!(windows),
+            app_user_model_id: APP_USER_MODEL_ID.to_owned(),
+            process_identity_set: false,
+            notifier_created: false,
+            notification_setting: None,
+            notifications_enabled: false,
+            common_start_menu_shortcut_present: false,
+            shortcut_aumid_matches: false,
+            user_notification_state: None,
+            accepts_notifications_now: None,
+            error: None,
+            shortcut_error: None,
+        }
+    }
+}
+
+pub fn initialize_notification_platform() -> Result<()> {
+    #[cfg(windows)]
+    {
+        ensure_process_app_identity()?;
+        ensure_winrt_for_current_thread()?;
+    }
+    Ok(())
+}
+
+pub fn show_windows_toast(title: &str, body: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        initialize_notification_platform()?;
+        let notifier =
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_USER_MODEL_ID))
+                .context("无法创建 Windows Toast 通知器；开始菜单快捷方式可能尚未注册 AUMID")?;
+        let setting = notifier
+            .Setting()
+            .context("无法读取 Windows Toast 权限状态")?;
+        if setting != NotificationSetting::Enabled {
+            bail!(
+                "Windows Toast 当前不可用：{}",
+                notification_setting_name(setting)
+            );
+        }
+
+        let document = XmlDocument::new().context("无法创建 Windows Toast XML 文档")?;
+        document
+            .LoadXml(&HSTRING::from(toast_xml(title, body)))
+            .context("无法解析 Windows Toast 内容")?;
+        let notification = ToastNotification::CreateToastNotification(&document)
+            .context("无法创建 Windows Toast 通知")?;
+        notifier
+            .Show(&notification)
+            .context("Windows 拒绝显示 Toast 通知")?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, body);
+        bail!("当前平台不支持 Windows Toast")
+    }
+}
+
+pub fn toast_diagnostics() -> ToastDiagnostics {
+    let mut diagnostics = ToastDiagnostics::default();
+    #[cfg(windows)]
+    {
+        match initialize_notification_platform() {
+            Ok(()) => diagnostics.process_identity_set = true,
+            Err(error) => diagnostics.error = Some(format!("{error:#}")),
+        }
+
+        match common_start_menu_shortcut_registration() {
+            Ok((present, matches)) => {
+                diagnostics.common_start_menu_shortcut_present = present;
+                diagnostics.shortcut_aumid_matches = matches;
+            }
+            Err(error) => diagnostics.shortcut_error = Some(format!("{error:#}")),
+        }
+
+        match unsafe { SHQueryUserNotificationState() } {
+            Ok(state) => {
+                diagnostics.user_notification_state = Some(user_notification_state_name(state));
+                diagnostics.accepts_notifications_now = Some(state == QUNS_ACCEPTS_NOTIFICATIONS);
+            }
+            Err(error) => {
+                if diagnostics.error.is_none() {
+                    diagnostics.error = Some(format!("无法读取 Windows 当前通知呈现状态：{error}"));
+                }
+            }
+        }
+
+        if diagnostics.process_identity_set {
+            match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+                APP_USER_MODEL_ID,
+            )) {
+                Ok(notifier) => {
+                    diagnostics.notifier_created = true;
+                    match notifier.Setting() {
+                        Ok(setting) => {
+                            diagnostics.notification_setting =
+                                Some(notification_setting_name(setting).to_owned());
+                            diagnostics.notifications_enabled =
+                                setting == NotificationSetting::Enabled;
+                        }
+                        Err(error) => {
+                            diagnostics.error =
+                                Some(format!("无法读取 Windows Toast 权限状态：{error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    diagnostics.error = Some(format!(
+                        "无法创建 Windows Toast 通知器；安装快捷方式可能尚未注册：{error}"
+                    ));
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+#[cfg(windows)]
+fn ensure_process_app_identity() -> Result<()> {
+    match PROCESS_APP_IDENTITY.get_or_init(|| {
+        let app_id = wide_null(APP_USER_MODEL_ID);
+        unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) }
+            .map_err(|error| format!("无法设置进程 AppUserModelID：{error}"))
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => bail!(error.clone()),
+    }
+}
+
+#[cfg(windows)]
+fn ensure_winrt_for_current_thread() -> Result<()> {
+    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+    WINRT_INITIALIZED.with(|initialized| {
+        if initialized.get() {
+            return Ok(());
+        }
+        match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
+            Ok(()) => initialized.set(true),
+            Err(error) if error.code().0 == RPC_E_CHANGED_MODE => {
+                // The UI host already selected a COM apartment; WinRT remains available in it.
+                initialized.set(true);
+            }
+            Err(error) => return Err(error).context("无法初始化 Windows Runtime 通知线程"),
+        }
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn common_start_menu_shortcut_registration() -> Result<(bool, bool)> {
+    ensure_winrt_for_current_thread()?;
+    let common_programs =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_CommonPrograms, KF_FLAG_DEFAULT, None) }
+            .context("无法定位公共开始菜单")?;
+    let common_programs_path = unsafe { path_buf_from_allocated_wide(common_programs.0) }?;
+    let shortcut = common_programs_path
+        .join("A 股新股申购提醒")
+        .join("A 股新股申购提醒.lnk");
+    if !shortcut.is_file() {
+        return Ok((false, false));
+    }
+
+    let wide = wide_null(&shortcut.to_string_lossy());
+    let store: IPropertyStore = unsafe {
+        SHGetPropertyStoreFromParsingName::<_, Option<&IBindCtx>, IPropertyStore>(
+            PCWSTR(wide.as_ptr()),
+            None,
+            GPS_DEFAULT,
+        )
+    }
+    .context("无法读取开始菜单快捷方式属性")?;
+    let mut value = unsafe { store.GetValue(&PKEY_APP_USER_MODEL_ID) }
+        .context("无法读取开始菜单快捷方式 AppUserModelID")?;
+    let mut text = [0u16; 129];
+    let conversion = unsafe { PropVariantToString(&value, &mut text) };
+    let clear = unsafe { PropVariantClear(&mut value) };
+    conversion.context("开始菜单快捷方式 AppUserModelID 格式无效")?;
+    clear.context("无法释放开始菜单快捷方式属性")?;
+    let end = text
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(text.len());
+    Ok((
+        true,
+        String::from_utf16_lossy(&text[..end]) == APP_USER_MODEL_ID,
+    ))
+}
+
+#[cfg(windows)]
+unsafe fn path_buf_from_allocated_wide(pointer: *mut u16) -> Result<PathBuf> {
+    if pointer.is_null() {
+        bail!("Windows 返回了空的已知文件夹路径");
+    }
+    let mut length = 0usize;
+    while unsafe { *pointer.add(length) } != 0 {
+        length += 1;
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(pointer, length)
+    }));
+    unsafe { CoTaskMemFree(Some(pointer.cast())) };
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn notification_setting_name(setting: NotificationSetting) -> &'static str {
+    match setting {
+        NotificationSetting::Enabled => "enabled",
+        NotificationSetting::DisabledForApplication => "disabledForApplication",
+        NotificationSetting::DisabledForUser => "disabledForUser",
+        NotificationSetting::DisabledByGroupPolicy => "disabledByGroupPolicy",
+        NotificationSetting::DisabledByManifest => "disabledByManifestOrRegistration",
+        _ => "unknown",
+    }
+}
+
+#[cfg(windows)]
+fn user_notification_state_name(
+    state: windows::Win32::UI::Shell::QUERY_USER_NOTIFICATION_STATE,
+) -> String {
+    match state {
+        QUNS_NOT_PRESENT => "notPresent",
+        QUNS_BUSY => "busy",
+        QUNS_RUNNING_D3D_FULL_SCREEN => "fullScreen",
+        QUNS_PRESENTATION_MODE => "presentationMode",
+        QUNS_ACCEPTS_NOTIFICATIONS => "acceptsNotifications",
+        QUNS_QUIET_TIME => "quietTime",
+        QUNS_APP => "app",
+        _ => "unknown",
+    }
+    .to_owned()
+}
+
+fn toast_xml(title: &str, body: &str) -> String {
+    format!(
+        "<toast duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+        xml_escape(&truncate_chars(title.trim(), 96)),
+        xml_escape(&truncate_chars(body.trim(), 512)),
+    )
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    let mut characters = value.chars();
+    let prefix: String = characters.by_ref().take(maximum).collect();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
 
 pub struct SingleInstance {
     #[cfg(windows)]
@@ -58,13 +388,25 @@ pub struct SingleInstance {
 
 impl SingleInstance {
     pub fn acquire(data_root: &Path) -> Result<Self> {
+        Self::acquire_named(data_root, "")
+    }
+
+    pub fn acquire_supervisor(data_root: &Path) -> Result<Self> {
+        Self::acquire_named(data_root, "-Watchdog")
+    }
+
+    pub fn try_acquire_supervisor(data_root: &Path) -> Result<Option<Self>> {
+        Self::try_acquire_named(data_root, "-Watchdog")
+    }
+
+    fn acquire_named(data_root: &Path, suffix: &str) -> Result<Self> {
+        Self::try_acquire_named(data_root, suffix)?.context("同一数据目录已有一个实例正在运行")
+    }
+
+    fn try_acquire_named(data_root: &Path, suffix: &str) -> Result<Option<Self>> {
         #[cfg(windows)]
         {
-            let identity = data_root.to_string_lossy().to_ascii_lowercase();
-            let name = format!(
-                "Local\\StockIpoReminder-{}",
-                &sha256(identity.as_bytes())[..20]
-            );
+            let name = instance_mutex_name(data_root, suffix);
             let wide: Vec<u16> = std::ffi::OsStr::new(&name)
                 .encode_wide()
                 .chain(Some(0))
@@ -75,15 +417,74 @@ impl SingleInstance {
                 unsafe {
                     let _ = CloseHandle(handle);
                 }
-                bail!("同一数据目录已有一个实例正在运行");
+                return Ok(None);
             }
-            return Ok(Self { handle });
+            return Ok(Some(Self { handle }));
         }
         #[cfg(not(windows))]
         {
-            let _ = data_root;
-            Ok(Self {})
+            let _ = (data_root, suffix);
+            Ok(Some(Self {}))
         }
+    }
+}
+
+fn instance_mutex_name(data_root: &Path, suffix: &str) -> String {
+    let identity = data_root.to_string_lossy().to_ascii_lowercase();
+    format!(
+        "Local\\StockIpoReminder-{}{}",
+        &sha256(identity.as_bytes())[..20],
+        suffix
+    )
+}
+
+pub fn activation_message_name(data_root: &Path) -> String {
+    let identity = data_root.to_string_lossy().to_ascii_lowercase();
+    format!(
+        "StockIpoReminder.Activate.{}",
+        &sha256(identity.as_bytes())[..20]
+    )
+}
+
+pub fn request_activate_existing(data_root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let name = wide_null(&activation_message_name(data_root));
+        let message = unsafe { RegisterWindowMessageW(PCWSTR(name.as_ptr())) };
+        if message == 0 {
+            bail!("无法注册现有实例唤醒消息");
+        }
+        unsafe { PostMessageW(Some(HWND_BROADCAST), message, WPARAM(0), LPARAM(0)) }
+            .context("无法广播现有实例唤醒消息")?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = data_root;
+        Ok(())
+    }
+}
+
+pub fn application_instance_running(data_root: &Path) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let name = instance_mutex_name(data_root, "");
+        let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+            .context("无法探测主程序单实例 Mutex")?;
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Ok(existed);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = data_root;
+        Ok(false)
     }
 }
 
@@ -107,6 +508,35 @@ pub fn play_alert() {
     #[cfg(windows)]
     unsafe {
         let _ = MessageBeep(MB_ICONEXCLAMATION);
+    }
+}
+
+pub fn windows_time_service_running() -> Result<Option<bool>> {
+    #[cfg(windows)]
+    {
+        let manager = unsafe { OpenSCManagerW(None, None, SC_MANAGER_CONNECT) }
+            .context("无法打开 Windows 服务控制管理器")?;
+        let service = match unsafe { OpenServiceW(manager, w!("W32Time"), SERVICE_QUERY_STATUS) } {
+            Ok(service) => service,
+            Err(error) => {
+                unsafe {
+                    let _ = CloseServiceHandle(manager);
+                }
+                return Err(error).context("无法打开 Windows Time 服务");
+            }
+        };
+        let mut status = SERVICE_STATUS::default();
+        let query = unsafe { QueryServiceStatus(service, &mut status) };
+        unsafe {
+            let _ = CloseServiceHandle(service);
+            let _ = CloseServiceHandle(manager);
+        }
+        query.context("无法读取 Windows Time 服务状态")?;
+        return Ok(Some(status.dwCurrentState == SERVICE_RUNNING));
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
     }
 }
 
@@ -212,6 +642,135 @@ pub fn fit_window_to_work_area(window: &slint::Window) -> Result<()> {
     {
         let _ = window;
         Ok(())
+    }
+}
+
+pub fn show_reminder_window(window: &slint::Window) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = match handle.window_handle() {
+            Ok(raw) => raw,
+            Err(_) => {
+                window.show().context("无法创建专用提醒窗口")?;
+                handle.window_handle().context("无法读取提醒窗口句柄")?
+            }
+        };
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            bail!("当前提醒窗口不是 Win32 窗口");
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        let existing_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        let no_activate_style =
+            existing_style | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, no_activate_style);
+        }
+        window.show().context("无法显示专用提醒窗口")?;
+
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut monitor_info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            bail!("无法读取提醒窗口所在显示器工作区");
+        }
+        let size = window.size();
+        let margin = (16.0 * window.scale_factor()).round().max(1.0) as i32;
+        let width = size.width.max(1) as i32;
+        let height = size.height.max(1) as i32;
+        let x = (monitor_info.rcWork.right - width - margin).max(monitor_info.rcWork.left);
+        let y = (monitor_info.rcWork.bottom - height - margin).max(monitor_info.rcWork.top);
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        }
+        .context("无法无激活显示专用提醒窗口")?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        window.show().context("无法显示专用提醒窗口")?;
+        Ok(())
+    }
+}
+
+pub fn confirm_window_visible(window: &slint::Window) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = handle.window_handle().context("无法读取窗口句柄")?;
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            bail!("当前窗口不是 Win32 窗口");
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            bail!("窗口尚未进入可见状态");
+        }
+        if unsafe { IsIconic(hwnd) }.as_bool() {
+            bail!("窗口处于最小化状态");
+        }
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) }.context("无法读取窗口位置")?;
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            bail!("窗口外框尺寸无效");
+        }
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut monitor_info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            bail!("无法读取窗口所在显示器工作区");
+        }
+        let intersects = rect.left < monitor_info.rcWork.right
+            && rect.right > monitor_info.rcWork.left
+            && rect.top < monitor_info.rcWork.bottom
+            && rect.bottom > monitor_info.rcWork.top;
+        if !intersects {
+            bail!("窗口未与可用工作区相交");
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        if window.is_visible() {
+            Ok(())
+        } else {
+            bail!("窗口尚未进入可见状态")
+        }
+    }
+}
+
+pub fn window_is_foreground(window: &slint::Window) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = handle.window_handle().context("无法读取窗口句柄")?;
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            bail!("当前窗口不是 Win32 窗口");
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        return Ok(unsafe { GetForegroundWindow() } == hwnd);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Ok(false)
     }
 }
 
@@ -493,5 +1052,30 @@ pub fn delete_after_reboot(path: &Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_message_is_stable_and_scoped_to_the_data_root() {
+        let first = activation_message_name(Path::new("C:\\Data\\StockIpoReminder"));
+        let same = activation_message_name(Path::new("c:\\data\\stockiporeminder"));
+        let other = activation_message_name(Path::new("D:\\Data\\StockIpoReminder"));
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert!(!first.contains("C:\\Data"));
+    }
+
+    #[test]
+    fn toast_xml_escapes_untrusted_text_and_limits_payload_size() {
+        let xml = toast_xml("A&B <测试>", &format!("'\"{}", "字".repeat(600)));
+        assert!(xml.contains("A&amp;B &lt;测试&gt;"));
+        assert!(xml.contains("&apos;&quot;"));
+        assert!(!xml.contains("A&B"));
+        assert!(xml.chars().count() < 800);
+        assert!(xml.contains('…'));
     }
 }

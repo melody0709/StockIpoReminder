@@ -1,4 +1,4 @@
-import { ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { ComboBox, HorizontalBox, LineEdit, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct TaskRow {
     event-id: string,
@@ -104,6 +104,7 @@ component NavButton inherits Rectangle {
 component Toggle inherits Rectangle {
     in-out property <bool> checked: false;
     in property <string> label;
+    in property <bool> enabled: true;
     min-width: 174px;
     min-height: 34px;
     max-height: 34px;
@@ -115,8 +116,8 @@ component Toggle inherits Rectangle {
             height: 22px;
             border-radius: 5px;
             border-width: 1px;
-            border-color: root.checked ? #60a5fa : #52647d;
-            background: root.checked ? #2563eb : #0f172a;
+            border-color: !root.enabled ? #334155 : root.checked ? #60a5fa : #52647d;
+            background: !root.enabled ? #172033 : root.checked ? #2563eb : #0f172a;
             Text {
                 text: root.checked ? "✓" : "";
                 color: white;
@@ -127,12 +128,15 @@ component Toggle inherits Rectangle {
         }
         Text {
             text: root.label;
-            color: #e2e8f0;
+            color: root.enabled ? #e2e8f0 : #64748b;
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
     }
-    touch := TouchArea { clicked => { root.checked = !root.checked; } }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { if (root.enabled) { root.checked = !root.checked; } }
+    }
 }
 
 component StatCard inherits Rectangle {
@@ -182,7 +186,7 @@ export component MainWindow inherits Window {
     background: Math.mod(root.repaint-token, 2) == 0 ? #0b1220 : #0b1221;
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 14px;
-    always-on-top: root.show-reminder || root.show-notification-confirmation || root.show-confirmation || root.show-override-confirmation || root.show-exit-confirmation;
+    always-on-top: root.show-reminder || root.show-notification-confirmation || root.show-confirmation || root.show-override-confirmation || root.show-uninstall-confirmation || root.show-exit-confirmation;
 
     in-out property <int> active-page: 0;
     in-out property <int> repaint-token: 0;
@@ -205,6 +209,12 @@ export component MainWindow inherits Window {
     in-out property <int> issue-count: 0;
     in-out property <[TaskRow]> today-tasks: [];
     in-out property <[TaskRow]> future-tasks: [];
+    in-out property <string> task-filter-text: "";
+    in-out property <int> task-market-filter-index: 0;
+    in-out property <int> task-status-filter-index: 0;
+    in-out property <int> today-visible-count: 0;
+    in-out property <int> future-count: 0;
+    in-out property <int> future-visible-count: 0;
 
     in-out property <string> health-title: "健康状态尚未建立";
     in-out property <string> health-summary: "";
@@ -225,11 +235,51 @@ export component MainWindow inherits Window {
     in-out property <bool> flash-taskbar: true;
     in-out property <bool> toast-enabled: true;
     in-out property <bool> health-summary-enabled: true;
+    in-out property <bool> post-apply-reminders-enabled: true;
+    in-out property <bool> listing-reminders-enabled: true;
     in-out property <bool> notification-test-completed: false;
     in-out property <bool> onboarding-completed: false;
     in-out property <string> notification-test-status: "尚未完成提醒通道测试";
-    in-out property <string> sync-interval-value: "24";
-    in-out property <int> sync-interval-unit-index: 1;
+    in-out property <string> notification-platform-status: "Windows Toast：正在诊断";
+    in-out property <string> notification-window-test-status: "未测试";
+    in-out property <string> notification-toast-test-status: "未测试";
+    in-out property <string> notification-balloon-test-status: "未测试";
+    in-out property <string> notification-sound-test-status: "未测试";
+    in-out property <string> notification-flash-test-status: "未测试";
+    in-out property <int> notification-window-test-level: 0;
+    in-out property <int> notification-platform-level: 0;
+    in-out property <int> notification-toast-test-level: 0;
+    in-out property <int> notification-balloon-test-level: 0;
+    in-out property <int> notification-sound-test-level: 0;
+    in-out property <int> notification-flash-test-level: 0;
+    in-out property <int> notification-test-channel: -1;
+    in-out property <string> notification-test-title: "确认提醒通道测试";
+    in-out property <string> notification-test-question: "你是否观察到刚才的测试？";
+    in-out property <string> normal-sync-interval-value: "30";
+    in-out property <int> normal-sync-interval-unit-index: 0;
+    in-out property <string> active-sync-interval-value: "10";
+    in-out property <int> active-sync-interval-unit-index: 0;
+    in-out property <bool> automatic-updates-enabled: true;
+    in-out property <bool> update-configured: false;
+    in-out property <bool> update-available: false;
+    in-out property <string> update-version: "";
+    in-out property <string> update-status: "正在读取安全更新配置…";
+    in-out property <bool> crash-upload-enabled: false;
+    in-out property <bool> crash-upload-configured: false;
+    in-out property <bool> crash-upload-busy: false;
+    in-out property <string> crash-upload-status: "正在读取崩溃报告共享配置…";
+    in-out property <string> crash-upload-privacy-url: "";
+    in-out property <bool> secondary-notification-enabled: false;
+    in-out property <int> secondary-notification-provider-index: 0;
+    in-out property <string> secondary-notification-secret-entry: "";
+    in-out property <bool> secondary-notification-configured: false;
+    in-out property <bool> secondary-notification-busy: false;
+    in-out property <string> secondary-notification-status: "正在读取第二通知通道配置…";
+    in-out property <bool> uninstall-available: false;
+    in-out property <string> uninstall-status: "正在检查 MSI 安装状态…";
+    in-out property <bool> show-uninstall-confirmation: false;
+    in-out property <bool> uninstall-purge-data: false;
+    in-out property <string> uninstall-confirmation-text: "";
 
     in-out property <bool> show-details: false;
     in-out property <string> selected-event-id: "";
@@ -285,8 +335,15 @@ export component MainWindow inherits Window {
     callback create-diagnostics();
     callback open-data-folder();
     callback copy-diagnostics();
-    callback test-notifications();
-    callback complete-notification-test(bool);
+    callback test-notification-channel(int);
+    callback complete-notification-test(int, bool);
+    callback check-for-updates();
+    callback install-update();
+    callback upload-crash-report();
+    callback open-crash-upload-privacy();
+    callback test-secondary-notification();
+    callback clear-secondary-notification-secret();
+    callback request-uninstall(bool, string);
     callback hide-to-tray();
     callback exit-app();
 
@@ -363,6 +420,46 @@ export component MainWindow inherits Window {
             if !root.compact-width : Text { text: root.health-text; color: #94a3b8; font-size: 12px; vertical-alignment: center; }
         }
 
+        if root.active-page == 0 || root.active-page == 1 : HorizontalBox {
+            min-height: 34px;
+            max-height: 34px;
+            spacing: root.compact-width ? 6px : 10px;
+            Text { text: "筛选"; color: #cbd5e1; vertical-alignment: center; }
+            LineEdit {
+                width: root.compact-width ? 180px : 280px;
+                text <=> root.task-filter-text;
+                placeholder-text: "简称、股票代码或申购代码";
+            }
+            ComboBox {
+                width: root.compact-width ? 100px : 120px;
+                model: ["全部市场", "沪市", "深市", "北交所"];
+                current-index <=> root.task-market-filter-index;
+            }
+            ComboBox {
+                width: root.compact-width ? 100px : 120px;
+                model: ["全部状态", "待确认", "已确认", "需核验"];
+                current-index <=> root.task-status-filter-index;
+            }
+            Text {
+                text: root.active-page == 0
+                    ? "显示 " + root.today-visible-count + " / " + root.today-count
+                    : "显示 " + root.future-visible-count + " / " + root.future-count;
+                color: #94a3b8;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                horizontal-alignment: right;
+            }
+            ActionButton {
+                label: "清除";
+                compact: root.compact-width;
+                clicked => {
+                    root.task-filter-text = "";
+                    root.task-market-filter-index = 0;
+                    root.task-status-filter-index = 0;
+                }
+            }
+        }
+
         if root.active-page == 0 : VerticalBox {
             spacing: root.compact-layout ? 8px : 12px;
             HorizontalBox {
@@ -378,21 +475,12 @@ export component MainWindow inherits Window {
                 border-width: 1px;
                 border-color: #26334a;
                 background: #111b2e;
-                ScrollView {
-                    VerticalBox {
-                        padding: 12px;
-                        spacing: 10px;
-                        if root.today-tasks.length == 0 : Text {
-                            text: "今天暂未发现新股申购任务。请同时确认同步状态和数据源健康正常。";
-                            color: #94a3b8;
-                            font-size: 16px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            height: root.compact-height ? 180px : 320px;
-                            wrap: word-wrap;
-                        }
+                ListView {
+                    visible: root.today-tasks.length > 0;
                         for task in root.today-tasks : Rectangle {
                             height: root.compact-width ? (task.warning == "" ? 156px : 184px) : (task.warning == "" ? 132px : 158px);
+                            accessible-role: list-item;
+                            accessible-label: task.name + "，" + task.market-and-codes + "，" + task.status + "，" + task.quality;
                             border-radius: 10px;
                             border-width: 1px;
                             border-color: task.needs-review ? #d97706 : #26334a;
@@ -436,7 +524,7 @@ export component MainWindow inherits Window {
                                             root.confirmation-event-id = task.event-id;
                                             root.confirmation-event-version = task.event-version;
                                             root.confirmation-title = "二次确认：已经提交申购委托？";
-                                            root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后，本申购日内停止该股票的重复提醒。";
+                                            root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后停止申购日重复提醒，并按已启用设置安排中签、缴款和上市日提示。";
                                             root.show-confirmation = true;
                                         }
                                     }
@@ -456,7 +544,16 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                    }
+                }
+                if root.today-tasks.length == 0 : Text {
+                    text: root.today-count == 0
+                        ? "今天暂未发现新股申购任务。请同时确认同步状态和数据源健康正常。"
+                        : "没有符合当前筛选条件的今日任务。";
+                    color: #94a3b8;
+                    font-size: 16px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
                 }
             }
         }
@@ -467,20 +564,12 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-color: #26334a;
             background: #111b2e;
-            ScrollView {
-                VerticalBox {
-                    padding: 12px;
-                    spacing: 10px;
-                    if root.future-tasks.length == 0 : Text {
-                        text: "未来 60 天暂未发现可展示的申购任务。";
-                        color: #94a3b8;
-                        font-size: 16px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        height: root.compact-height ? 200px : 380px;
-                    }
+            ListView {
+                visible: root.future-tasks.length > 0;
                     for task in root.future-tasks : Rectangle {
                         height: root.compact-width ? (task.warning == "" ? 156px : 184px) : (task.warning == "" ? 132px : 158px);
+                        accessible-role: list-item;
+                        accessible-label: task.name + "，" + task.market-and-codes + "，" + task.status + "，" + task.quality;
                         border-radius: 10px;
                         border-width: 1px;
                         border-color: task.needs-review ? #d97706 : #26334a;
@@ -522,7 +611,7 @@ export component MainWindow inherits Window {
                                         root.confirmation-event-id = task.event-id;
                                         root.confirmation-event-version = task.event-version;
                                         root.confirmation-title = "二次确认：已经提交申购委托？";
-                                        root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后，本申购日内停止该股票的重复提醒。";
+                                        root.confirmation-body = "请确认你已经在券商客户端提交了 " + task.name + " 的申购委托。\n\n本程序不会检查委托是否受理或成功；确认后停止申购日重复提醒，并按已启用设置安排中签、缴款和上市日提示。";
                                         root.show-confirmation = true;
                                     }
                                 }
@@ -542,7 +631,15 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                }
+            }
+            if root.future-tasks.length == 0 : Text {
+                text: root.future-count == 0
+                    ? "未来 60 天暂未发现可展示的申购任务。"
+                    : "没有符合当前筛选条件的未来任务。";
+                color: #94a3b8;
+                font-size: 16px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
         }
 
@@ -703,8 +800,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        min-height: 188px;
-                        max-height: 188px;
+                        min-height: 378px;
+                        max-height: 378px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -717,23 +814,117 @@ export component MainWindow inherits Window {
                                 spacing: 10px;
                                 Toggle { label: "声音"; checked <=> root.sound-enabled; }
                                 Toggle { label: "临近截止闪烁任务栏"; checked <=> root.flash-taskbar; }
-                                Toggle { label: "Windows 通知 / 托盘气泡"; checked <=> root.toast-enabled; }
+                                Toggle { label: "系统通知（Toast，失败时回退气泡）"; checked <=> root.toast-enabled; }
                             }
                             HorizontalBox {
                                 spacing: 10px;
                                 Toggle { label: "每日 08:00 健康摘要"; checked <=> root.health-summary-enabled; }
-                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
+                                Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; }
                             }
                             HorizontalBox {
                                 spacing: 10px;
-                                ActionButton { label: "测试所有提醒通道"; compact: root.compact-width; clicked => { root.test-notifications(); } }
-                                Text { text: root.notification-test-status; color: root.notification-test-completed ? #86efac : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                                Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; }
+                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
+                                Text { text: "后续提醒仅在你确认已申购后安排；程序不会读取账户、持仓或判断中签"; color: #64748b; font-size: 12px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                            }
+                            Text {
+                                text: root.notification-platform-status;
+                                color: root.notification-platform-level == 1 ? #86efac : root.notification-platform-level == 2 ? #fca5a5 : #fcd34d;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalBox {
+                                spacing: 10px;
+                                ActionButton { label: "测试置顶提醒窗"; compact: root.compact-width; clicked => { root.test-notification-channel(0); } }
+                                Text { text: root.notification-window-test-status; color: root.notification-window-test-level == 1 ? #86efac : root.notification-window-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
+                                ActionButton { label: "测试 Windows Toast"; compact: root.compact-width; clicked => { root.test-notification-channel(1); } }
+                                Text { text: root.notification-toast-test-status; color: root.notification-toast-test-level == 1 ? #86efac : root.notification-toast-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
+                            }
+                            HorizontalBox {
+                                spacing: 10px;
+                                ActionButton { label: "测试气泡回退"; compact: root.compact-width; clicked => { root.test-notification-channel(2); } }
+                                Text { text: root.notification-balloon-test-status; color: root.notification-balloon-test-level == 1 ? #86efac : root.notification-balloon-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
+                                ActionButton { label: "测试声音"; compact: root.compact-width; clicked => { root.test-notification-channel(3); } }
+                                Text { text: root.notification-sound-test-status; color: root.notification-sound-test-level == 1 ? #86efac : root.notification-sound-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
+                            }
+                            HorizontalBox {
+                                spacing: 10px;
+                                ActionButton { label: "测试任务栏闪烁"; compact: root.compact-width; clicked => { root.test-notification-channel(4); } }
+                                Text { text: root.notification-flash-test-status; color: root.notification-flash-test-level == 1 ? #86efac : root.notification-flash-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
+                                Text { text: "Toast 与气泡回退任一通过即可满足系统通知测试"; color: #64748b; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                            }
+                            Text {
+                                text: root.notification-test-status;
+                                color: root.notification-test-completed ? #86efac : #fcd34d;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
                             }
                         }
                     }
                     Rectangle {
-                        min-height: 122px;
-                        max-height: 122px;
+                        min-height: root.compact-width ? 264px : 220px;
+                        max-height: root.compact-width ? 264px : 220px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "第二通知通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text {
+                                text: root.secondary-notification-status;
+                                color: root.secondary-notification-configured ? #86efac : #fcd34d;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                            }
+                            HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
+                                ComboBox {
+                                    width: root.compact-width ? 170px : 200px;
+                                    model: ["不启用", "企业微信机器人", "钉钉机器人", "飞书机器人", "PushPlus"];
+                                    current-index <=> root.secondary-notification-provider-index;
+                                }
+                                Toggle {
+                                    label: "同时发送到第二通道";
+                                    checked <=> root.secondary-notification-enabled;
+                                    enabled: root.secondary-notification-provider-index > 0;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                ActionButton {
+                                    label: root.secondary-notification-busy ? "正在测试…" : "发送测试";
+                                    compact: root.compact-width;
+                                    primary: true;
+                                    enabled: root.secondary-notification-configured && !root.secondary-notification-busy;
+                                    clicked => { root.test-secondary-notification(); }
+                                }
+                                ActionButton {
+                                    label: "清除凭据";
+                                    compact: root.compact-width;
+                                    danger: true;
+                                    enabled: root.secondary-notification-configured && !root.secondary-notification-busy;
+                                    clicked => { root.clear-secondary-notification-secret(); }
+                                }
+                            }
+                            LineEdit {
+                                text <=> root.secondary-notification-secret-entry;
+                                input-type: InputType.password;
+                                placeholder-text: root.secondary-notification-provider-index == 4 ? "输入 PushPlus token；留空表示保留已加密凭据" : "输入官方机器人 Webhook URL；留空表示保留已加密凭据";
+                                enabled: root.secondary-notification-provider-index > 0;
+                            }
+                            Text {
+                                text: "仅允许企业微信、钉钉、飞书官方 HTTPS Webhook 或 PushPlus token。凭据由 Windows DPAPI 绑定当前用户加密，不写入数据库、日志、诊断 ZIP 或命令行。发送请求禁止重定向，最多重试 5 次，并限制为每小时 20 个批次。";
+                                color: #64748b;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        min-height: 176px;
+                        max-height: 176px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -745,12 +936,119 @@ export component MainWindow inherits Window {
                             HorizontalBox {
                                 height: 34px;
                                 spacing: 10px;
-                                Text { text: "自动同步间隔"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.sync-interval-value; placeholder-text: "24"; }
-                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.sync-interval-unit-index; }
-                                Text { text: "可设置 5 分钟至 7 天"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                                Text { width: root.compact-width ? 150px : 190px; text: "普通日期"; color: #cbd5e1; vertical-alignment: center; }
+                                LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
+                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
+                                Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
                             }
-                            Text { text: "程序启动时同步一次，之后按上述间隔自动同步；也可以随时手动立即同步。"; color: #94a3b8; font-size: 12px; }
+                            HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
+                                Text { width: root.compact-width ? 150px : 190px; text: "当日有未确认任务"; color: #cbd5e1; vertical-alignment: center; }
+                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "10"; }
+                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
+                                Text { text: "默认 10 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                            }
+                            Text { text: "程序启动时同步一次；普通日期和申购日分别按上述间隔自动同步，均可设置为 5 分钟至 7 天，也可以随时手动同步。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        min-height: 148px;
+                        max-height: 148px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #fcd34d; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            HorizontalBox {
+                                spacing: 10px;
+                                Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; }
+                                Rectangle { horizontal-stretch: 1; }
+                                ActionButton {
+                                    label: "检查更新";
+                                    compact: root.compact-width;
+                                    enabled: root.update-configured;
+                                    clicked => { root.check-for-updates(); }
+                                }
+                                ActionButton {
+                                    label: root.update-version == "" ? "下载并安装" : "安装 " + root.update-version;
+                                    compact: root.compact-width;
+                                    primary: true;
+                                    enabled: root.update-available;
+                                    clicked => { root.install-update(); }
+                                }
+                            }
+                            Text { text: "只接受 HTTPS、固定证书签名的 CMS 清单，以及哈希和 Authenticode 证书均匹配的 MSI；安装仍需你明确点击。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        min-height: 172px;
+                        max-height: 172px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "脱敏崩溃报告"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.crash-upload-status; color: root.crash-upload-configured ? #cbd5e1 : #fcd34d; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            HorizontalBox {
+                                spacing: 10px;
+                                Toggle {
+                                    label: "异常退出后自动发送下一份报告";
+                                    checked <=> root.crash-upload-enabled;
+                                    enabled: root.crash-upload-configured;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                ActionButton {
+                                    label: root.crash-upload-busy ? "正在发送…" : "发送最近报告";
+                                    compact: root.compact-width;
+                                    primary: true;
+                                    enabled: root.crash-upload-configured && !root.crash-upload-busy;
+                                    clicked => { root.upload-crash-report(); }
+                                }
+                                ActionButton {
+                                    label: "隐私政策";
+                                    compact: root.compact-width;
+                                    enabled: root.crash-upload-configured;
+                                    clicked => { root.open-crash-upload-privacy(); }
+                                }
+                            }
+                            Text { text: "仅发送 Watchdog 生成的 JSON；不发送数据库、日志、公告正文、命令行、路径、用户名、设备标识、账户、持仓或凭据。过去 24 小时最多尝试 3 次。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        min-height: 126px;
+                        max-height: 126px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #7f1d1d;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "安装与卸载"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.uninstall-status; color: root.uninstall-available ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            HorizontalBox {
+                                spacing: 10px;
+                                Text { text: "默认卸载只移除程序并保留数据库、设置、公告缓存和备份。"; color: #94a3b8; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                                ActionButton {
+                                    label: "卸载程序";
+                                    compact: root.compact-width;
+                                    danger: true;
+                                    enabled: root.uninstall-available;
+                                    clicked => {
+                                        root.uninstall-purge-data = false;
+                                        root.uninstall-confirmation-text = "";
+                                        root.show-uninstall-confirmation = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     HorizontalBox {
@@ -1123,7 +1421,7 @@ export component MainWindow inherits Window {
                             root.confirmation-event-id = root.reminder-event-id;
                             root.confirmation-event-version = root.reminder-event-version;
                             root.confirmation-title = "二次确认：已经提交申购委托？";
-                            root.confirmation-body = "请确认已经在券商客户端提交申购委托。本程序不会检查委托是否受理或成功。";
+                            root.confirmation-body = "请确认已经在券商客户端提交申购委托。本程序不会检查委托是否受理或成功；确认后停止申购日重复提醒，并按已启用设置安排中签、缴款和上市日提示。";
                             root.show-reminder = false;
                             root.show-confirmation = true;
                         }
@@ -1148,13 +1446,64 @@ export component MainWindow inherits Window {
             VerticalBox {
                 padding: 22px;
                 spacing: 14px;
-                Text { text: "确认提醒通道测试"; color: #f8fafc; font-size: 21px; font-weight: 700; }
-                Text { text: "刚才已触发应用内提醒、托盘气泡、声音以及任务栏闪烁。你是否已经看到并听到当前启用的提醒通道？"; color: #cbd5e1; wrap: word-wrap; vertical-stretch: 1; }
+                Text { text: root.notification-test-title; color: #f8fafc; font-size: 21px; font-weight: 700; }
+                Text { text: root.notification-test-question; color: #cbd5e1; wrap: word-wrap; vertical-stretch: 1; }
                 HorizontalBox {
                     spacing: 10px;
                     Rectangle { horizontal-stretch: 1; }
-                    ActionButton { label: "未通过"; danger: true; clicked => { root.complete-notification-test(false); root.show-notification-confirmation = false; } }
-                    ActionButton { label: "已通过"; primary: true; clicked => { root.complete-notification-test(true); root.show-notification-confirmation = false; } }
+                    ActionButton { label: "未观察到"; danger: true; clicked => { root.complete-notification-test(root.notification-test-channel, false); root.show-notification-confirmation = false; } }
+                    ActionButton { label: "已观察到"; primary: true; clicked => { root.complete-notification-test(root.notification-test-channel, true); root.show-notification-confirmation = false; } }
+                }
+            }
+        }
+    }
+
+    if root.show-uninstall-confirmation : Rectangle {
+        background: #c0020617;
+        Rectangle {
+            width: 620px;
+            height: root.uninstall-purge-data ? 390px : 310px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 12px;
+            border-width: 2px;
+            border-color: #dc2626;
+            background: #111b2e;
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: "确认卸载 A 股新股申购提醒"; color: #f8fafc; font-size: 21px; font-weight: 700; wrap: word-wrap; }
+                Text {
+                    text: "程序将退出并调用 Windows Installer。默认保留当前用户的数据，方便以后重新安装后继续使用。";
+                    color: #cbd5e1;
+                    wrap: word-wrap;
+                }
+                Toggle { label: "MSI 卸载成功后，同时删除当前用户数据"; checked <=> root.uninstall-purge-data; }
+                if root.uninstall-purge-data : VerticalBox {
+                    spacing: 8px;
+                    Text {
+                        text: "此操作会永久删除 %LocalAppData%\\StockIpoReminder 中的数据库、设置、公告缓存、日志和备份，且不会删除其他 Windows 用户的数据。请输入：删除当前用户数据";
+                        color: #fca5a5;
+                        wrap: word-wrap;
+                    }
+                    LineEdit {
+                        text <=> root.uninstall-confirmation-text;
+                        placeholder-text: "删除当前用户数据";
+                    }
+                }
+                Text { text: "Windows 可能显示管理员权限确认。只有 MSI 成功卸载后，助手才会执行已确认的数据清理。"; color: #fcd34d; font-size: 12px; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalBox {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "取消"; clicked => { root.show-uninstall-confirmation = false; } }
+                    ActionButton {
+                        label: root.uninstall-purge-data ? "卸载并删除数据" : "卸载并保留数据";
+                        danger: true;
+                        enabled: !root.uninstall-purge-data || root.uninstall-confirmation-text == "删除当前用户数据";
+                        clicked => {
+                            root.request-uninstall(root.uninstall-purge-data, root.uninstall-confirmation-text);
+                        }
+                    }
                 }
             }
         }
@@ -1187,6 +1536,82 @@ export component MainWindow inherits Window {
                     ActionButton { label: "取消"; clicked => { root.show-exit-confirmation = false; } }
                     ActionButton { label: "仍然退出"; danger: true; clicked => { root.exit-app(); } }
                 }
+            }
+        }
+    }
+}
+
+export component ReminderWindow inherits Window {
+    title: root.batch-count > 1 ? "A 股打新提醒（" + root.batch-count + " 条）" : "A 股打新提醒";
+    preferred-width: 560px;
+    preferred-height: 360px;
+    min-width: 460px;
+    min-height: 300px;
+    background: #3a2510;
+    default-font-family: "Microsoft YaHei UI";
+    default-font-size: 14px;
+    always-on-top: true;
+
+    in-out property <string> reminder-title: "打新提醒";
+    in-out property <string> reminder-body: "";
+    in-out property <string> reminder-event-id: "";
+    in-out property <int> reminder-event-version: 0;
+    in-out property <int> batch-count: 1;
+    in-out property <bool> can-acknowledge: false;
+
+    callback open-details(string);
+    callback request-acknowledgement(string, int);
+    callback dismiss();
+
+    Rectangle {
+        border-width: 2px;
+        border-color: #e7a52d;
+        background: #3a2510;
+        VerticalBox {
+            padding: 20px;
+            spacing: 14px;
+            Text {
+                text: root.reminder-title;
+                color: #fcd34d;
+                font-size: 23px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: #694817;
+                background: #24190d;
+                vertical-stretch: 1;
+                ScrollView {
+                    Text {
+                        text: root.reminder-body;
+                        color: #f8fafc;
+                        wrap: word-wrap;
+                        x: 12px;
+                        y: 12px;
+                        width: parent.width - 24px;
+                    }
+                }
+            }
+            HorizontalBox {
+                spacing: 10px;
+                ActionButton {
+                    label: root.reminder-event-id == "" ? "打开今日任务" : "打开详情";
+                    clicked => { root.open-details(root.reminder-event-id); }
+                }
+                if root.can-acknowledge : ActionButton {
+                    label: "确认已申购";
+                    primary: true;
+                    clicked => {
+                        root.request-acknowledgement(
+                            root.reminder-event-id,
+                            root.reminder-event-version
+                        );
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                ActionButton { label: "稍后处理"; clicked => { root.dismiss(); } }
             }
         }
     }

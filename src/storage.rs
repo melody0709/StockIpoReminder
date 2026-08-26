@@ -10,9 +10,25 @@ use chrono::{DateTime, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::{
-    core::{event_hash, now_china, plan_reminders},
+    core::{
+        critical_change_reason, event_hash, noncritical_change_reason, now_china, plan_reminders,
+        sha256,
+    },
     model::*,
 };
+
+const SECONDARY_PENDING: i32 = 0;
+const SECONDARY_LEASED: i32 = 1;
+const SECONDARY_DELIVERED: i32 = 2;
+const SECONDARY_RETRYING: i32 = 3;
+const SECONDARY_EXHAUSTED: i32 = 4;
+const SECONDARY_CANCELLED: i32 = 5;
+const SECONDARY_MAX_ATTEMPTS: i32 = 5;
+const SECONDARY_REQUESTS_PER_HOUR: i64 = 20;
+const SECONDARY_ATTEMPT_RETENTION_DAYS: i64 = 30;
+const SECONDARY_OUTBOX_RETENTION_DAYS: i64 = 90;
+const SECONDARY_MAX_ATTEMPT_RECORDS: i64 = 2000;
+const LOCAL_DELIVERY_PERSISTENT_FAILURE_MINUTES: i64 = 15;
 
 #[derive(Clone)]
 pub struct Database {
@@ -41,8 +57,23 @@ impl Database {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        self.open()?.execute_batch(MIGRATION_SQL)?;
+        let connection = self.open()?;
+        connection.execute_batch(MIGRATION_SQL)?;
+        migrate_sync_schedule_v3(&connection)?;
+        migrate_sync_conclusions_v4(&connection)?;
+        migrate_operation_health_v5(&connection)?;
+        migrate_source_probes_v6(&connection)?;
+        migrate_outbox_messages_v7(&connection)?;
+        migrate_secondary_notifications_v8(&connection)?;
         Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.open()?.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn integrity_check(&self) -> Result<()> {
@@ -73,7 +104,34 @@ impl Database {
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let json = serde_json::to_string(settings)?;
-        self.open()?.execute("INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET json_value=excluded.json_value,updated_at=excluded.updated_at", params![json, format_dt(now_china())])?;
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let previous: AppSettings = transaction
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        transaction.execute("INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET json_value=excluded.json_value,updated_at=excluded.updated_at", params![json, format_dt(now)])?;
+        if !settings.secondary_notification_enabled
+            || settings.secondary_notification_provider != previous.secondary_notification_provider
+        {
+            transaction.execute(
+                "UPDATE secondary_notification_outbox SET state=?1,lease_until=NULL,updated_at=?2 WHERE state IN (?3,?4,?5)",
+                params![
+                    SECONDARY_CANCELLED,
+                    format_dt(now),
+                    SECONDARY_PENDING,
+                    SECONDARY_LEASED,
+                    SECONDARY_RETRYING,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -116,6 +174,7 @@ impl Database {
     pub fn upsert_event(&self, mut event: IpoEvent) -> Result<IpoEvent> {
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
+        let mut change_notification = None::<(bool, String, ChinaDateTime)>;
         let existing = transaction
             .query_row(
                 "SELECT * FROM ipo_events WHERE id=?1",
@@ -124,15 +183,19 @@ impl Database {
             )
             .optional()?;
         if let Some(previous) = &existing {
-            let critical_changed = previous.apply_code != event.apply_code
-                || previous.apply_date != event.apply_date
-                || previous.issue_price != event.issue_price
-                || previous.status != event.status;
+            retain_known_optional_fields(previous, &mut event);
+            let critical_reason = critical_change_reason(previous, &event);
+            let noncritical_reason = noncritical_change_reason(previous, &event);
+            let critical_changed = critical_reason.is_some();
             event.event_version = previous.event_version + i32::from(critical_changed);
             event.first_seen_at = previous.first_seen_at;
+            change_notification = critical_reason
+                .as_ref()
+                .map(|reason| (true, reason.clone(), previous.updated_at))
+                .or_else(|| noncritical_reason.map(|reason| (false, reason, previous.updated_at)));
             if critical_changed && previous.lifecycle_status == LifecycleStatus::Acknowledged {
                 event.lifecycle_status = LifecycleStatus::AcknowledgedNeedsReview;
-                transaction.execute("UPDATE acknowledgements SET needs_review_at=?1,review_reason='关键申购字段已变化' WHERE ipo_event_id=?2 AND event_version=?3 AND revoked_at IS NULL", params![format_dt(event.updated_at), event.id, previous.event_version])?;
+                transaction.execute("UPDATE acknowledgements SET needs_review_at=?1,review_reason=?2 WHERE ipo_event_id=?3 AND event_version=?4 AND revoked_at IS NULL", params![format_dt(event.updated_at), critical_reason.as_deref(), event.id, previous.event_version])?;
             } else if previous.lifecycle_status == LifecycleStatus::Acknowledged {
                 event.lifecycle_status = LifecycleStatus::Acknowledged;
             }
@@ -175,7 +238,28 @@ impl Database {
             .optional()?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
+        transaction.execute(
+            "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE ipo_event_id=?3 AND event_version<>?4 AND delivery_state IN (?5,?6,?7)",
+            params![
+                DeliveryState::Cancelled as i32,
+                format_dt(event.updated_at),
+                event.id,
+                event.event_version,
+                DeliveryState::Pending as i32,
+                DeliveryState::Leased as i32,
+                DeliveryState::Failed as i32,
+            ],
+        )?;
         reconcile_schedule_tx(&transaction, &event, &settings, now_china())?;
+        if let Some((critical, reason, previous_updated_at)) = change_notification {
+            enqueue_change_notification_tx(
+                &transaction,
+                &event,
+                critical,
+                &reason,
+                previous_updated_at,
+            )?;
+        }
         transaction.commit()?;
         Ok(event)
     }
@@ -184,7 +268,7 @@ impl Database {
         let settings = self.settings()?;
         let now = now_china();
         for event in self.events(
-            now.date_naive() - chrono::Duration::days(1),
+            now.date_naive() - chrono::Duration::days(60),
             now.date_naive() + chrono::Duration::days(60),
         )? {
             self.reconcile_schedule(&event, &settings, now)?;
@@ -209,7 +293,7 @@ impl Database {
     }
 
     fn acknowledge_at(&self, event_id: &str, version: i32, now: ChinaDateTime) -> Result<()> {
-        let event = self.event(event_id)?.context("申购任务不存在")?;
+        let mut event = self.event(event_id)?.context("申购任务不存在")?;
         if event.event_version != version {
             bail!("申购数据已更新，请刷新后确认")
         }
@@ -233,6 +317,18 @@ impl Database {
         tx.execute("INSERT INTO acknowledgements(ipo_event_id,event_version,confirmed_at,confirmed_data_hash) VALUES(?1,?2,?3,?4) ON CONFLICT(ipo_event_id,event_version) DO UPDATE SET confirmed_at=excluded.confirmed_at,confirmed_data_hash=excluded.confirmed_data_hash,reconfirmed_at=excluded.confirmed_at,revoked_at=NULL,needs_review_at=NULL,review_reason=NULL",params![event_id,version,format_dt(now),event_hash(&event)])?;
         tx.execute("UPDATE ipo_events SET lifecycle_status=?1,updated_at=?2 WHERE id=?3 AND event_version=?4",params![LifecycleStatus::Acknowledged as i32,format_dt(now),event_id,version])?;
         tx.execute("UPDATE reminder_outbox SET delivery_state=?1,acknowledged_at=?2,updated_at=?2 WHERE ipo_event_id=?3 AND event_version=?4 AND delivery_state IN (0,1,5)",params![DeliveryState::Cancelled as i32,format_dt(now),event_id,version])?;
+        event.lifecycle_status = LifecycleStatus::Acknowledged;
+        event.updated_at = now;
+        let settings: AppSettings = tx
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        reconcile_schedule_tx(&tx, &event, &settings, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -326,14 +422,43 @@ impl Database {
     }
 
     pub fn claim_due(&self, limit: usize) -> Result<Vec<ReminderDelivery>> {
-        let now = now_china();
+        self.claim_due_at(limit, now_china())
+    }
+
+    fn claim_due_at(&self, limit: usize, now: ChinaDateTime) -> Result<Vec<ReminderDelivery>> {
         let lease = now + chrono::Duration::minutes(2);
         let mut connection = self.open()?;
         let tx = connection.transaction()?;
-        tx.execute("UPDATE reminder_outbox SET delivery_state=0,lease_until=NULL,updated_at=?1 WHERE delivery_state=1 AND lease_until<?1",[format_dt(now)])?;
+        let formatted_now = format_dt(now);
+        tx.execute("UPDATE reminder_outbox SET delivery_state=0,lease_until=NULL,updated_at=?1 WHERE delivery_state=1 AND lease_until<=?1",[&formatted_now])?;
+        tx.execute(
+            "UPDATE reminder_outbox AS stale
+             SET delivery_state=?1,lease_until=NULL,updated_at=?2
+             WHERE stale.delivery_state IN (?3,?4)
+               AND stale.due_at<=?2
+               AND stale.reminder_level BETWEEN ?5 AND ?6
+               AND EXISTS(
+                   SELECT 1 FROM reminder_outbox AS newer
+                   WHERE newer.ipo_event_id=stale.ipo_event_id
+                     AND newer.event_version=stale.event_version
+                     AND newer.delivery_state IN (?3,?4,?7)
+                     AND newer.due_at<=?2
+                     AND newer.reminder_level BETWEEN ?5 AND ?6
+                     AND (newer.due_at>stale.due_at OR (newer.due_at=stale.due_at AND newer.reminder_level>stale.reminder_level))
+               )",
+            params![
+                DeliveryState::Collapsed as i32,
+                formatted_now,
+                DeliveryState::Pending as i32,
+                DeliveryState::Failed as i32,
+                ReminderLevel::Advance as i32,
+                ReminderLevel::Final as i32,
+                DeliveryState::Delivered as i32,
+            ],
+        )?;
         let ids: Vec<i64> = {
-            let mut s=tx.prepare("SELECT id FROM reminder_outbox WHERE delivery_state IN (0,5) AND due_at<=?1 AND (lease_until IS NULL OR lease_until<?1) ORDER BY due_at,id LIMIT ?2")?;
-            s.query_map(params![format_dt(now), limit as i64], |r| r.get(0))?
+            let mut s=tx.prepare("SELECT o.id FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.delivery_state IN (0,5) AND o.due_at<=?1 AND (o.lease_until IS NULL OR o.lease_until<=?1) ORDER BY o.due_at,o.id LIMIT ?2")?;
+            s.query_map(params![formatted_now, limit as i64], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
         for id in &ids {
@@ -341,7 +466,34 @@ impl Database {
         }
         let mut deliveries = Vec::new();
         for id in ids {
-            deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,e.* FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id WHERE o.id=?1",[id],map_delivery)?);
+            deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.* FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?);
+        }
+        let settings: AppSettings = tx
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        if settings.secondary_notification_enabled
+            && !matches!(
+                settings.secondary_notification_provider,
+                SecondaryNotificationProvider::Disabled | SecondaryNotificationProvider::Unknown
+            )
+        {
+            for delivery in &deliveries {
+                tx.execute(
+                    "INSERT OR IGNORE INTO secondary_notification_outbox(reminder_outbox_id,provider,state,attempt_count,next_attempt_at,created_at,updated_at) VALUES(?1,?2,?3,0,?4,?4,?4)",
+                    params![
+                        delivery.outbox_id,
+                        settings.secondary_notification_provider as i32,
+                        SECONDARY_PENDING,
+                        format_dt(now),
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(deliveries)
@@ -351,14 +503,302 @@ impl Database {
         let now = now_china();
         let mut c = self.open()?;
         let tx = c.transaction()?;
-        tx.execute("UPDATE reminder_outbox SET delivery_state=2,delivered_at=?1,lease_until=NULL,updated_at=?1 WHERE id=?2 AND delivery_state=1",params![format_dt(now),delivery.outbox_id])?;
+        let changed = tx.execute("UPDATE reminder_outbox SET delivery_state=2,delivered_at=?1,lease_until=NULL,updated_at=?1 WHERE id=?2 AND delivery_state=1",params![format_dt(now),delivery.outbox_id])?;
+        if changed != 1 {
+            bail!("提醒投递租约已失效或已完成")
+        }
         tx.execute("INSERT INTO reminder_log(ipo_event_id,scheduled_at,shown_at,reminder_level,delivery_channel,dedupe_key,result) VALUES(?1,?2,?3,?4,?5,?6,'shown')",params![delivery.event.id,format_dt(delivery.due_at),format_dt(now),delivery.level as i32,channel,delivery.dedupe_key])?;
         tx.commit()?;
         Ok(())
     }
     pub fn fail_delivery(&self, id: i64, error: &str) -> Result<()> {
-        let retry = now_china() + chrono::Duration::minutes(1);
-        self.open()?.execute("UPDATE reminder_outbox SET delivery_state=5,lease_until=?1,last_error=?2,updated_at=?3 WHERE id=?4",params![format_dt(retry),limit(error,1000),format_dt(now_china()),id])?;
+        self.fail_delivery_at(id, error, now_china())
+    }
+
+    fn fail_delivery_at(&self, id: i64, error: &str, now: ChinaDateTime) -> Result<()> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let attempt_count: i32 = transaction
+            .query_row(
+                "SELECT attempt_count FROM reminder_outbox WHERE id=?1 AND delivery_state=?2",
+                params![id, DeliveryState::Leased as i32],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("提醒投递租约已失效或已完成")?;
+        let retry = now + chrono::Duration::minutes(local_delivery_retry_minutes(attempt_count));
+        let changed = transaction.execute("UPDATE reminder_outbox SET delivery_state=?1,lease_until=?2,last_error=?3,updated_at=?4 WHERE id=?5 AND delivery_state=?6",params![DeliveryState::Failed as i32,format_dt(retry),limit(error,1000),format_dt(now),id,DeliveryState::Leased as i32])?;
+        if changed != 1 {
+            bail!("提醒投递租约已失效或已完成")
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn claim_secondary_due(&self, limit: usize) -> Result<Vec<SecondaryNotificationDelivery>> {
+        self.claim_secondary_due_at(limit, now_china())
+    }
+
+    fn claim_secondary_due_at(
+        &self,
+        limit: usize,
+        now: ChinaDateTime,
+    ) -> Result<Vec<SecondaryNotificationDelivery>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        prune_secondary_notification_history(&transaction, now)?;
+        let formatted_now = format_dt(now);
+        transaction.execute(
+            "UPDATE secondary_notification_outbox SET state=?1,lease_until=NULL,next_attempt_at=?2,updated_at=?2 WHERE state=?3 AND lease_until<=?2",
+            params![SECONDARY_RETRYING, formatted_now, SECONDARY_LEASED],
+        )?;
+        transaction.execute(
+            "UPDATE secondary_notification_outbox SET state=?1,lease_until=NULL,updated_at=?2 WHERE state IN (?3,?4) AND NOT EXISTS(SELECT 1 FROM reminder_outbox r JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE r.id=secondary_notification_outbox.reminder_outbox_id AND r.delivery_state NOT IN (?5,?6))",
+            params![
+                SECONDARY_CANCELLED,
+                formatted_now,
+                SECONDARY_PENDING,
+                SECONDARY_RETRYING,
+                DeliveryState::Cancelled as i32,
+                DeliveryState::Collapsed as i32,
+            ],
+        )?;
+        let requests_last_hour: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM secondary_notification_attempts WHERE attempted_at>=?1",
+            [format_dt(now - chrono::Duration::hours(1))],
+            |row| row.get(0),
+        )?;
+        if requests_last_hour >= SECONDARY_REQUESTS_PER_HOUR {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
+        let provider: Option<i32> = transaction
+            .query_row(
+                "SELECT provider FROM secondary_notification_outbox WHERE state IN (?1,?2) AND attempt_count<?3 AND next_attempt_at<=?4 ORDER BY next_attempt_at,id LIMIT 1",
+                params![SECONDARY_PENDING, SECONDARY_RETRYING, SECONDARY_MAX_ATTEMPTS, formatted_now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(provider) = provider else {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        };
+        let ids: Vec<i64> = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM secondary_notification_outbox WHERE provider=?1 AND state IN (?2,?3) AND attempt_count<?4 AND next_attempt_at<=?5 ORDER BY next_attempt_at,id LIMIT ?6",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        provider,
+                        SECONDARY_PENDING,
+                        SECONDARY_RETRYING,
+                        SECONDARY_MAX_ATTEMPTS,
+                        formatted_now,
+                        limit.max(1) as i64,
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        transaction.execute(
+            "INSERT INTO secondary_notification_attempts(attempted_at,provider,success,batch_size,error) VALUES(?1,?2,-1,?3,NULL)",
+            params![formatted_now, provider, ids.len() as i64],
+        )?;
+        let request_attempt_id = transaction.last_insert_rowid();
+        let lease = format_dt(now + chrono::Duration::minutes(2));
+        for id in &ids {
+            transaction.execute(
+                "UPDATE secondary_notification_outbox SET state=?1,lease_until=?2,attempt_count=attempt_count+1,updated_at=?3 WHERE id=?4 AND state IN (?5,?6)",
+                params![
+                    SECONDARY_LEASED,
+                    lease,
+                    formatted_now,
+                    id,
+                    SECONDARY_PENDING,
+                    SECONDARY_RETRYING,
+                ],
+            )?;
+        }
+        let mut deliveries = Vec::new();
+        for id in ids {
+            let mut delivery = transaction.query_row(
+                "SELECT s.id,s.reminder_outbox_id,s.provider,r.due_at,r.reminder_level,s.attempt_count,r.message,e.* FROM secondary_notification_outbox s JOIN reminder_outbox r ON r.id=s.reminder_outbox_id JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE s.id=?1 AND s.state=?2",
+                params![id, SECONDARY_LEASED],
+                map_secondary_delivery,
+            )?;
+            delivery.request_attempt_id = request_attempt_id;
+            deliveries.push(delivery);
+        }
+        transaction.commit()?;
+        Ok(deliveries)
+    }
+
+    pub fn complete_secondary_deliveries(
+        &self,
+        deliveries: &[SecondaryNotificationDelivery],
+        channel: &str,
+    ) -> Result<()> {
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        prune_secondary_notification_history(&transaction, now)?;
+        for delivery in deliveries {
+            let changed = transaction.execute(
+                "UPDATE secondary_notification_outbox SET state=?1,delivered_at=?2,lease_until=NULL,last_error=NULL,updated_at=?2 WHERE id=?3 AND state=?4",
+                params![SECONDARY_DELIVERED, format_dt(now), delivery.id, SECONDARY_LEASED],
+            )?;
+            if changed != 1 {
+                bail!("第二通知通道租约已失效或已完成");
+            }
+            transaction.execute(
+                "INSERT INTO reminder_log(ipo_event_id,scheduled_at,shown_at,reminder_level,delivery_channel,dedupe_key,result) SELECT ipo_event_id,due_at,?1,reminder_level,?2,dedupe_key,'sent' FROM reminder_outbox WHERE id=?3",
+                params![format_dt(now), channel, delivery.reminder_outbox_id],
+            )?;
+        }
+        let attempt_id = common_secondary_attempt_id(deliveries)?;
+        let changed = transaction.execute(
+            "UPDATE secondary_notification_attempts SET success=1,error=NULL WHERE id=?1 AND success=-1",
+            [attempt_id],
+        )?;
+        if changed != 1 {
+            bail!("第二通知通道批次配额记录已失效");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fail_secondary_deliveries(
+        &self,
+        deliveries: &[SecondaryNotificationDelivery],
+        error: &str,
+    ) -> Result<()> {
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        for delivery in deliveries {
+            let exhausted = delivery.attempt_count >= SECONDARY_MAX_ATTEMPTS;
+            let delay_minutes = match delivery.attempt_count {
+                0 | 1 => 1,
+                2 => 5,
+                3 => 15,
+                _ => 30,
+            };
+            let changed = transaction.execute(
+                "UPDATE secondary_notification_outbox SET state=?1,next_attempt_at=?2,lease_until=NULL,last_error=?3,updated_at=?4 WHERE id=?5 AND state=?6",
+                params![
+                    if exhausted { SECONDARY_EXHAUSTED } else { SECONDARY_RETRYING },
+                    format_dt(now + chrono::Duration::minutes(delay_minutes)),
+                    limit(error, 1000),
+                    format_dt(now),
+                    delivery.id,
+                    SECONDARY_LEASED,
+                ],
+            )?;
+            if changed != 1 {
+                bail!("第二通知通道失败记录的租约已失效");
+            }
+        }
+        let attempt_id = common_secondary_attempt_id(deliveries)?;
+        let changed = transaction.execute(
+            "UPDATE secondary_notification_attempts SET success=0,error=?1 WHERE id=?2 AND success=-1",
+            params![limit(error, 1000), attempt_id],
+        )?;
+        if changed != 1 {
+            bail!("第二通知通道批次失败配额记录已失效");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn secondary_notification_summary(&self) -> Result<SecondaryNotificationSummary> {
+        let connection = self.open()?;
+        let count = |state: i32| -> Result<i64> {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM secondary_notification_outbox WHERE state=?1",
+                [state],
+                |row| row.get(0),
+            )?)
+        };
+        let requests_last_hour = connection.query_row(
+            "SELECT COUNT(*) FROM secondary_notification_attempts WHERE attempted_at>=?1",
+            [format_dt(now_china() - chrono::Duration::hours(1))],
+            |row| row.get(0),
+        )?;
+        let latest_success_at = connection
+            .query_row(
+                "SELECT MAX(attempted_at) FROM secondary_notification_attempts WHERE success=1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .and_then(|value| parse_dt(&value).ok());
+        let latest_error = connection
+            .query_row(
+                "SELECT error FROM secondary_notification_attempts WHERE success=0 ORDER BY attempted_at DESC,id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(SecondaryNotificationSummary {
+            pending: count(SECONDARY_PENDING)?,
+            leased: count(SECONDARY_LEASED)?,
+            delivered: count(SECONDARY_DELIVERED)?,
+            retrying: count(SECONDARY_RETRYING)?,
+            exhausted: count(SECONDARY_EXHAUSTED)?,
+            cancelled: count(SECONDARY_CANCELLED)?,
+            requests_last_hour,
+            latest_success_at,
+            latest_error,
+        })
+    }
+
+    pub fn reserve_secondary_notification_test(
+        &self,
+        provider: SecondaryNotificationProvider,
+    ) -> Result<Option<i64>> {
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM secondary_notification_attempts WHERE attempted_at>=?1",
+            [format_dt(now - chrono::Duration::hours(1))],
+            |row| row.get(0),
+        )?;
+        if count >= SECONDARY_REQUESTS_PER_HOUR {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO secondary_notification_attempts(attempted_at,provider,success,batch_size,error) VALUES(?1,?2,-1,0,NULL)",
+            params![format_dt(now), provider as i32],
+        )?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(Some(id))
+    }
+
+    pub fn finish_secondary_notification_test(
+        &self,
+        attempt_id: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.open()?.execute(
+            "UPDATE secondary_notification_attempts SET success=?1,error=?2 WHERE id=?3 AND success=-1",
+            params![
+                i32::from(error.is_none()),
+                error.map(|value| limit(value, 1000)),
+                attempt_id,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("第二通知通道测试配额记录已失效");
+        }
         Ok(())
     }
 
@@ -372,6 +812,24 @@ impl Database {
         hash: Option<&str>,
         schema: Option<&str>,
         error: Option<&str>,
+    ) -> Result<Option<ChinaDateTime>> {
+        self.save_source_run_with_retry_after(
+            source, started, state, count, raw, hash, schema, error, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_source_run_with_retry_after(
+        &self,
+        source: &str,
+        started: ChinaDateTime,
+        state: HealthState,
+        count: usize,
+        raw: Option<&str>,
+        hash: Option<&str>,
+        schema: Option<&str>,
+        error: Option<&str>,
+        retry_after: Option<ChinaDateTime>,
     ) -> Result<Option<ChinaDateTime>> {
         if !matches!(
             state,
@@ -407,29 +865,239 @@ impl Database {
                 .optional()?
                 .unwrap_or(0)
                 + 1;
-            let minutes = match failures {
-                1 => 1,
-                2 => 2,
-                3 => 4,
-                4 => 8,
-                5 => 15,
-                _ => 30,
-            };
-            let next = now + chrono::Duration::minutes(minutes);
+            let retry_after = retry_after
+                .filter(|value| *value > now)
+                .map(|value| value.min(now + chrono::Duration::hours(24)));
+            let next =
+                retry_after.unwrap_or_else(|| now + source_backoff_delay(source, failures, now));
+            let next_probe = source_probe_time(now, next);
             transaction.execute(
-                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_failure_at,last_error) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(source) DO UPDATE SET failure_count=excluded.failure_count,next_attempt_at=excluded.next_attempt_at,last_failure_at=excluded.last_failure_at,last_error=excluded.last_error",
-                params![source, failures, format_dt(next), format_dt(now), limited_error],
+                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_failure_at,last_error,next_probe_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(source) DO UPDATE SET failure_count=excluded.failure_count,next_attempt_at=excluded.next_attempt_at,last_failure_at=excluded.last_failure_at,last_error=excluded.last_error,next_probe_at=excluded.next_probe_at",
+                params![source, failures, format_dt(next), format_dt(now), limited_error, format_dt(next_probe)],
             )?;
             Some(next)
         } else {
             transaction.execute(
-                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_success_at,last_error) VALUES(?1,0,NULL,?2,NULL) ON CONFLICT(source) DO UPDATE SET failure_count=0,next_attempt_at=NULL,last_success_at=excluded.last_success_at,last_error=NULL",
+                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_success_at,last_error,next_probe_at) VALUES(?1,0,NULL,?2,NULL,NULL) ON CONFLICT(source) DO UPDATE SET failure_count=0,next_attempt_at=NULL,last_success_at=excluded.last_success_at,last_error=NULL,next_probe_at=NULL",
                 params![source, format_dt(now)],
             )?;
             None
         };
         transaction.commit()?;
         Ok(next_attempt)
+    }
+
+    pub fn save_sync_conclusion(&self, conclusion: &SyncConclusion) -> Result<()> {
+        let success = conclusion.kind.is_healthy();
+        let error = (!success).then(|| limit(&conclusion.summary, 2000));
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO sync_conclusions(started_at,finished_at,conclusion_kind,today_count,event_count,announcement_count,successful_sources_json,missing_sources_json,summary) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                format_dt(conclusion.started_at),
+                format_dt(conclusion.finished_at),
+                conclusion.kind as i32,
+                conclusion.today_count as i64,
+                conclusion.event_count as i64,
+                conclusion.announcement_count as i64,
+                serde_json::to_string(&conclusion.successful_sources)?,
+                serde_json::to_string(&conclusion.missing_sources)?,
+                limit(&conclusion.summary, 2000),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_runs(source,started_at,finished_at,success,record_count,error) VALUES('sync-conclusion',?1,?2,?3,?4,?5)",
+            params![
+                format_dt(conclusion.started_at),
+                format_dt(conclusion.finished_at),
+                i32::from(success),
+                conclusion.today_count as i64,
+                error
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_sync_conclusion(&self) -> Result<Option<SyncConclusion>> {
+        self.open()?
+            .query_row(
+                "SELECT conclusion_kind,started_at,finished_at,today_count,event_count,announcement_count,successful_sources_json,missing_sources_json,summary FROM sync_conclusions ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    let successful_sources: String = row.get(6)?;
+                    let missing_sources: String = row.get(7)?;
+                    Ok(SyncConclusion {
+                        kind: SyncConclusionKind::from_i32(row.get(0)?),
+                        started_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                        finished_at: parse_dt(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
+                        today_count: row.get::<_, i64>(3)? as usize,
+                        event_count: row.get::<_, i64>(4)? as usize,
+                        announcement_count: row.get::<_, i64>(5)? as usize,
+                        successful_sources: serde_json::from_str(&successful_sources)
+                            .map_err(|error| to_sql_error(error.into()))?,
+                        missing_sources: serde_json::from_str(&missing_sources)
+                            .map_err(|error| to_sql_error(error.into()))?,
+                        summary: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn recent_sync_runs(&self, limit: usize) -> Result<Vec<SyncRunSummary>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT source,started_at,finished_at,success,record_count,error FROM sync_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 200) as i64], |row| {
+            Ok(SyncRunSummary {
+                source: row.get(0)?,
+                started_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                finished_at: parse_dt(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
+                success: row.get::<_, i32>(3)? != 0,
+                record_count: row.get(4)?,
+                error: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn recent_reminder_log(&self, limit: usize) -> Result<Vec<ReminderLogSummary>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT ipo_event_id,scheduled_at,shown_at,reminder_level,delivery_channel,result FROM reminder_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.clamp(1, 200) as i64], |row| {
+            Ok(ReminderLogSummary {
+                event_id: row.get(0)?,
+                scheduled_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                shown_at: parse_dt(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
+                reminder_level: ReminderLevel::from_i32(row.get(3)?),
+                delivery_channel: row.get(4)?,
+                result: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn reminder_state_summary(&self) -> Result<ReminderStateSummary> {
+        let connection = self.open()?;
+        let (pending, leased, delivered, collapsed, cancelled, failed) = connection.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN delivery_state=0 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN delivery_state=1 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN delivery_state=2 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN delivery_state=3 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN delivery_state=4 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN delivery_state=5 THEN 1 ELSE 0 END),0)
+             FROM reminder_outbox",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let shown_last_seven_days = connection.query_row(
+            "SELECT COUNT(*) FROM reminder_log WHERE shown_at>=?1",
+            [format_dt(now_china() - chrono::Duration::days(7))],
+            |row| row.get(0),
+        )?;
+        let latest_shown: Option<String> = connection
+            .query_row(
+                "SELECT shown_at FROM reminder_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let oldest_failed: Option<String> = connection.query_row(
+            "SELECT MIN(updated_at) FROM reminder_outbox WHERE delivery_state=?1",
+            [DeliveryState::Failed as i32],
+            |row| row.get(0),
+        )?;
+        let latest_error: Option<String> = connection
+            .query_row(
+                "SELECT last_error FROM reminder_outbox WHERE delivery_state=?1 AND last_error IS NOT NULL ORDER BY updated_at DESC,id DESC LIMIT 1",
+                [DeliveryState::Failed as i32],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ReminderStateSummary {
+            pending,
+            leased,
+            delivered,
+            collapsed,
+            cancelled,
+            failed,
+            oldest_failed_at: oldest_failed
+                .as_deref()
+                .and_then(|value| parse_dt(value).ok()),
+            latest_error,
+            shown_last_seven_days,
+            latest_shown_at: latest_shown
+                .as_deref()
+                .and_then(|value| parse_dt(value).ok()),
+        })
+    }
+
+    pub fn save_operation_health(
+        &self,
+        component: &str,
+        state: HealthState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            state,
+            HealthState::Healthy | HealthState::Warning | HealthState::Failed
+        ) {
+            bail!("运维组件状态无效：{state:?}");
+        }
+        let now = now_china();
+        let limited_error = error.map(|value| limit(value, 2000));
+        self.open()?.execute(
+            "INSERT INTO operation_health(component,last_attempt_at,last_success_at,health_state,last_error) VALUES(?1,?2,CASE WHEN ?3<>3 THEN ?2 END,?3,?4)
+             ON CONFLICT(component) DO UPDATE SET
+               last_attempt_at=excluded.last_attempt_at,
+               last_success_at=CASE WHEN excluded.health_state<>3 THEN excluded.last_attempt_at ELSE operation_health.last_success_at END,
+               health_state=excluded.health_state,
+               last_error=excluded.last_error",
+            params![component, format_dt(now), state as i32, limited_error],
+        )?;
+        Ok(())
+    }
+
+    pub fn operation_health(&self) -> Result<Vec<OperationHealthEntry>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT component,last_attempt_at,last_success_at,health_state,last_error FROM operation_health ORDER BY component",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let last_attempt: Option<String> = row.get(1)?;
+            let last_success: Option<String> = row.get(2)?;
+            Ok(OperationHealthEntry {
+                component: row.get(0)?,
+                state: HealthState::from_i32(row.get(3)?),
+                last_attempt_at: last_attempt
+                    .as_deref()
+                    .and_then(|value| parse_dt(value).ok()),
+                last_success_at: last_success
+                    .as_deref()
+                    .and_then(|value| parse_dt(value).ok()),
+                last_error: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn save_announcement(&self, document: &AnnouncementDocument) -> Result<()> {
@@ -510,6 +1178,67 @@ impl Database {
         Ok((next.is_none_or(|value| value <= now), next))
     }
 
+    pub fn try_claim_source_probe(&self, source: &str, now: ChinaDateTime) -> Result<bool> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let values: Option<(Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT next_attempt_at,next_probe_at FROM source_backoff WHERE source=?1",
+                [source],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((next_attempt, next_probe)) = values else {
+            return Ok(false);
+        };
+        let next_attempt = next_attempt
+            .as_deref()
+            .and_then(|value| parse_dt(value).ok());
+        let next_probe = next_probe.as_deref().and_then(|value| parse_dt(value).ok());
+        let Some(next_attempt) = next_attempt.filter(|value| *value > now) else {
+            return Ok(false);
+        };
+        if next_probe.is_none_or(|value| value > now) {
+            return Ok(false);
+        }
+        let following_probe = (now + chrono::Duration::minutes(30)).min(next_attempt);
+        let changed = transaction.execute(
+            "UPDATE source_backoff SET next_probe_at=?1 WHERE source=?2 AND next_attempt_at>?3 AND next_probe_at<=?3",
+            params![format_dt(following_probe), source, format_dt(now)],
+        )?;
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn save_source_probe_run(
+        &self,
+        source: &str,
+        started_at: ChinaDateTime,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let finished_at = now_china();
+        let error = error.map(|value| limit(value, 2000));
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO sync_runs(source,started_at,finished_at,success,record_count,error) VALUES(?1,?2,?3,?4,0,?5)",
+            params![
+                format!("health-probe:{source}"),
+                format_dt(started_at),
+                format_dt(finished_at),
+                i32::from(success),
+                error,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE source_backoff SET last_probe_at=?1,last_probe_success=?2,last_probe_error=?3 WHERE source=?4",
+            params![format_dt(finished_at), i32::from(success), error, source],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn pending_count(&self) -> Result<i64> {
         Ok(self.open()?.query_row(
             "SELECT COUNT(*) FROM ipo_events WHERE apply_date=?1 AND lifecycle_status IN (?2,?3)",
@@ -534,6 +1263,16 @@ impl Database {
             .iter()
             .filter(|source| source.state == HealthState::Warning)
             .count();
+        let operation_failed = details
+            .operations
+            .iter()
+            .filter(|operation| operation.state == HealthState::Failed)
+            .count();
+        let operation_warning = details
+            .operations
+            .iter()
+            .filter(|operation| operation.state == HealthState::Warning)
+            .count();
         let latest = details
             .sources
             .iter()
@@ -543,7 +1282,9 @@ impl Database {
             .unwrap_or_else(|| "尚无成功同步".into());
         Ok((
             details.overall_state,
-            format!("数据源失败 {failed} 个，警告 {warning} 个；最近成功：{latest}"),
+            format!(
+                "数据源失败 {failed} 个，警告 {warning} 个；运维失败 {operation_failed} 项，警告 {operation_warning} 项；最近成功：{latest}"
+            ),
         ))
     }
 
@@ -555,8 +1296,20 @@ impl Database {
             .into_iter()
             .filter(|event| settings.exchange_enabled(event.exchange))
             .collect();
-        let active_window = !events.is_empty();
-        let sync_minutes = settings.normal_sync_minutes.clamp(5, 7 * 24 * 60) as i64;
+        let active_window = events.iter().any(|event| {
+            matches!(
+                event.lifecycle_status,
+                LifecycleStatus::Scheduled
+                    | LifecycleStatus::ActiveUnconfirmed
+                    | LifecycleStatus::AcknowledgedNeedsReview
+            )
+        });
+        let sync_minutes = if active_window {
+            settings.active_day_sync_minutes
+        } else {
+            settings.normal_sync_minutes
+        }
+        .clamp(5, 7 * 24 * 60) as i64;
         let minimum_stale = chrono::Duration::hours(if active_window { 1 } else { 2 });
         let minimum_failed = chrono::Duration::hours(if active_window { 2 } else { 6 });
         let scheduled_stale = chrono::Duration::minutes(sync_minutes + 15);
@@ -656,7 +1409,13 @@ impl Database {
         };
         let scheduler_heartbeat = heartbeat("scheduler")?;
         let delivery_heartbeat = heartbeat("delivery")?;
+        let operations = self.operation_health()?;
+        let reminder_state = self.reminder_state_summary()?;
         let heartbeat_limit = now - chrono::Duration::minutes(3);
+        let persistent_delivery_failure = reminder_state.failed > 0
+            && reminder_state.oldest_failed_at.is_some_and(|value| {
+                value <= now - chrono::Duration::minutes(LOCAL_DELIVERY_PERSISTENT_FAILURE_MINUTES)
+            });
         let quality_warning = events.iter().any(|event| {
             matches!(
                 event.data_quality_status,
@@ -670,6 +1429,10 @@ impl Database {
                 .iter()
                 .all(|source| source.state == HealthState::Failed)
             || scheduler_heartbeat.is_none_or(|value| value < heartbeat_limit)
+            || operations
+                .iter()
+                .any(|operation| operation.state == HealthState::Failed)
+            || persistent_delivery_failure
         {
             HealthState::Failed
         } else if sources
@@ -677,6 +1440,10 @@ impl Database {
             .any(|source| source.state != HealthState::Healthy)
             || delivery_heartbeat.is_none_or(|value| value < heartbeat_limit)
             || quality_warning
+            || reminder_state.failed > 0
+            || operations
+                .iter()
+                .any(|operation| operation.state == HealthState::Warning)
         {
             HealthState::Warning
         } else {
@@ -706,9 +1473,13 @@ impl Database {
                     event.data_quality_status == DataQualityStatus::ManualReviewRequired
                 })
                 .count(),
+            delivery_retry_count: reminder_state.failed.max(0) as usize,
+            oldest_delivery_retry_at: reminder_state.oldest_failed_at,
+            latest_delivery_error: reminder_state.latest_error,
             scheduler_heartbeat,
             delivery_heartbeat,
             sources,
+            operations,
         })
     }
 
@@ -721,6 +1492,13 @@ impl Database {
             "INSERT OR IGNORE INTO health_summary_log(summary_date,sent_at) VALUES(?1,?2)",
             params![format_date(date), format_dt(now)],
         )? == 1)
+    }
+
+    pub fn try_mark_health_summary_due(&self, now: ChinaDateTime) -> Result<bool> {
+        if now.time() < crate::model::time(8, 0) {
+            return Ok(false);
+        }
+        self.try_mark_health_summary_sent(now.date_naive(), now)
     }
 
     pub fn announcement_titles(&self, event_id: &str) -> Result<Vec<String>> {
@@ -920,23 +1698,371 @@ impl Database {
     }
 
     pub fn backup(&self, backup_dir: &Path) -> Result<PathBuf> {
+        self.backup_with_commit_hook(backup_dir, |_| Ok(()))
+    }
+
+    fn backup_with_commit_hook(
+        &self,
+        backup_dir: &Path,
+        before_commit: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<PathBuf> {
         fs::create_dir_all(backup_dir)?;
+        let timestamp = now_china();
         let target = backup_dir.join(format!(
             "stock-ipo-reminder-{}.db",
-            now_china().format("%Y%m%d-%H%M%S")
+            timestamp.format("%Y%m%d-%H%M%S-%3f")
+        ));
+        let temporary = backup_dir.join(format!(
+            ".stock-ipo-reminder-backup-{}.tmp",
+            uuid::Uuid::new_v4().simple()
         ));
         let source = self.open()?;
-        let mut destination = Connection::open(&target)?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-            backup.run_to_completion(128, StdDuration::from_millis(50), None)?;
+        let result = (|| -> Result<()> {
+            let mut destination = Connection::open(&temporary)?;
+            {
+                let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+                backup.run_to_completion(128, StdDuration::from_millis(50), None)?;
+            }
+            let integrity: String =
+                destination.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            if integrity != "ok" {
+                bail!("备份完整性检查失败：{integrity}")
+            }
+            drop(destination);
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&temporary)?
+                .sync_all()?;
+            before_commit(&temporary)?;
+            fs::rename(&temporary, &target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
         }
-        let result: String = destination.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-        if result != "ok" {
-            bail!("备份完整性检查失败：{result}")
-        }
+        result?;
         Ok(target)
     }
+}
+
+fn retain_known_optional_fields(previous: &IpoEvent, current: &mut IpoEvent) {
+    if current.apply_code.is_none() {
+        current.apply_code.clone_from(&previous.apply_code);
+    }
+    if current.legacy_code.is_none() {
+        current.legacy_code.clone_from(&previous.legacy_code);
+    }
+    if current.apply_date.is_none() {
+        current.apply_date = previous.apply_date;
+    }
+    if current.issue_price.is_none() {
+        current.issue_price = previous.issue_price;
+    }
+    if current.lot_size.is_none() {
+        current.lot_size = previous.lot_size;
+    }
+    if current.max_apply_quantity.is_none() {
+        current.max_apply_quantity = previous.max_apply_quantity;
+    }
+    if current.required_market_value.is_none() {
+        current.required_market_value = previous.required_market_value;
+    }
+    if current.required_cash.is_none() {
+        current.required_cash = previous.required_cash;
+    }
+    if current.ballot_date.is_none() {
+        current.ballot_date = previous.ballot_date;
+    }
+    if current.payment_date.is_none() {
+        current.payment_date = previous.payment_date;
+    }
+    if current.listing_date.is_none() {
+        current.listing_date = previous.listing_date;
+    }
+    if current.announcement_url.is_none() {
+        current
+            .announcement_url
+            .clone_from(&previous.announcement_url);
+    }
+}
+
+fn migrate_sync_schedule_v3(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT json_value FROM app_settings WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json) = json {
+        if let Ok(mut settings) = serde_json::from_str::<AppSettings>(&json) {
+            let original_normal = settings.normal_sync_minutes;
+            let original_active = settings.active_day_sync_minutes;
+            if original_normal == 1440 && original_active == 1440 {
+                settings.normal_sync_minutes = 30;
+                settings.active_day_sync_minutes = 10;
+            } else if original_active == original_normal {
+                settings.active_day_sync_minutes = original_normal.clamp(5, 10);
+            }
+            settings.normal_sync_minutes = settings.normal_sync_minutes.clamp(5, 7 * 24 * 60);
+            settings.active_day_sync_minutes = settings
+                .active_day_sync_minutes
+                .clamp(5, settings.normal_sync_minutes);
+            connection.execute(
+                "UPDATE app_settings SET json_value=?1,updated_at=?2 WHERE id=1",
+                params![serde_json::to_string(&settings)?, format_dt(now_china())],
+            )?;
+        }
+    }
+    connection.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?1)",
+        [format_dt(now_china())],
+    )?;
+    Ok(())
+}
+
+fn migrate_sync_conclusions_v4(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_conclusions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            conclusion_kind INTEGER NOT NULL,
+            today_count INTEGER NOT NULL,
+            event_count INTEGER NOT NULL,
+            announcement_count INTEGER NOT NULL,
+            successful_sources_json TEXT NOT NULL,
+            missing_sources_json TEXT NOT NULL,
+            summary TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_sync_conclusions_finished_at
+            ON sync_conclusions(finished_at DESC);",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_operation_health_v5(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operation_health(
+            component TEXT PRIMARY KEY,
+            last_attempt_at TEXT NOT NULL,
+            last_success_at TEXT NULL,
+            health_state INTEGER NOT NULL,
+            last_error TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_operation_health_state
+            ON operation_health(health_state,last_attempt_at DESC);",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_source_probes_v6(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE source_backoff ADD COLUMN next_probe_at TEXT NULL;
+         ALTER TABLE source_backoff ADD COLUMN last_probe_at TEXT NULL;
+         ALTER TABLE source_backoff ADD COLUMN last_probe_success INTEGER NULL;
+         ALTER TABLE source_backoff ADD COLUMN last_probe_error TEXT NULL;",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(6,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_outbox_messages_v7(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch("ALTER TABLE reminder_outbox ADD COLUMN message TEXT NULL;")?;
+    transaction.execute(
+        "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE delivery_state IN (?3,?4,?5) AND NOT EXISTS(SELECT 1 FROM ipo_events e WHERE e.id=reminder_outbox.ipo_event_id AND e.event_version=reminder_outbox.event_version)",
+        params![
+            DeliveryState::Cancelled as i32,
+            format_dt(now_china()),
+            DeliveryState::Pending as i32,
+            DeliveryState::Leased as i32,
+            DeliveryState::Failed as i32,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_secondary_notifications_v8(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=8)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS secondary_notification_outbox(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reminder_outbox_id INTEGER NOT NULL UNIQUE REFERENCES reminder_outbox(id) ON DELETE CASCADE,
+            provider INTEGER NOT NULL,
+            state INTEGER NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            lease_until TEXT NULL,
+            last_error TEXT NULL,
+            delivered_at TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_secondary_notification_due ON secondary_notification_outbox(state,next_attempt_at,provider);
+        CREATE TABLE IF NOT EXISTS secondary_notification_attempts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempted_at TEXT NOT NULL,
+            provider INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            batch_size INTEGER NOT NULL,
+            error TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_secondary_notification_attempts_time ON secondary_notification_attempts(attempted_at DESC);",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn source_backoff_delay(source: &str, failures: i32, now: ChinaDateTime) -> chrono::Duration {
+    let base_minutes = match failures {
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        5 => 15,
+        _ => 30,
+    };
+    let base_seconds = base_minutes * 60;
+    let maximum_jitter = base_seconds / 10;
+    let digest = sha256(format!("{source}|{failures}|{}", now.timestamp_millis()));
+    let seed = u64::from_str_radix(&digest[..8], 16).unwrap_or_default();
+    let jitter = (seed % (maximum_jitter as u64 + 1)) as i64;
+    chrono::Duration::seconds(base_seconds as i64 + jitter)
+}
+
+fn local_delivery_retry_minutes(attempt_count: i32) -> i64 {
+    match attempt_count {
+        i32::MIN..=1 => 1,
+        2 => 5,
+        3 => 15,
+        _ => 30,
+    }
+}
+
+fn source_probe_time(now: ChinaDateTime, next_attempt: ChinaDateTime) -> ChinaDateTime {
+    (now + chrono::Duration::minutes(10)).min(next_attempt)
+}
+
+fn enqueue_change_notification_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &IpoEvent,
+    critical: bool,
+    reason: &str,
+    previous_updated_at: ChinaDateTime,
+) -> Result<()> {
+    let message = if critical {
+        format!("{reason}。请重新核对任务详情；若此前已确认，必须重新确认。")
+    } else {
+        format!("{reason}。关键申购条件未变化，本次变更仅提醒一次。")
+    };
+    let fingerprint = sha256(format!(
+        "{}|{}|{}|{}|{}",
+        event.id,
+        event.event_version,
+        previous_updated_at.timestamp_micros(),
+        event.updated_at.timestamp_micros(),
+        reason
+    ));
+    let dedupe_key = format!(
+        "{}:{}:change:{}",
+        event.id,
+        event.event_version,
+        &fingerprint[..24]
+    );
+    transaction.execute(
+        "INSERT OR IGNORE INTO reminder_outbox(ipo_event_id,event_version,due_at,reminder_level,dedupe_key,delivery_state,message,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?3,?3)",
+        params![
+            event.id,
+            event.event_version,
+            format_dt(event.updated_at),
+            ReminderLevel::DataChanged as i32,
+            dedupe_key,
+            DeliveryState::Pending as i32,
+            limit(&message, 1000),
+        ],
+    )?;
+    Ok(())
 }
 
 fn reconcile_schedule_tx(
@@ -945,8 +2071,8 @@ fn reconcile_schedule_tx(
     settings: &AppSettings,
     now: ChinaDateTime,
 ) -> Result<()> {
-    let planned = plan_reminders(event, settings);
-    tx.execute("UPDATE reminder_outbox SET delivery_state=4,updated_at=?1 WHERE ipo_event_id=?2 AND event_version=?3 AND delivery_state IN (0,1,5)",params![format_dt(now),event.id,event.event_version])?;
+    let planned = plan_reminders(event, settings, now);
+    tx.execute("UPDATE reminder_outbox SET delivery_state=4,updated_at=?1 WHERE ipo_event_id=?2 AND event_version=?3 AND reminder_level<>?4 AND delivery_state IN (0,1,5)",params![format_dt(now),event.id,event.event_version,ReminderLevel::DataChanged as i32])?;
     for item in planned {
         tx.execute("INSERT INTO reminder_outbox(ipo_event_id,event_version,due_at,reminder_level,dedupe_key,delivery_state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,0,?6,?6) ON CONFLICT(dedupe_key) DO UPDATE SET delivery_state=CASE WHEN reminder_outbox.delivery_state IN (2,3) THEN reminder_outbox.delivery_state ELSE 0 END,due_at=excluded.due_at,reminder_level=excluded.reminder_level,updated_at=excluded.updated_at",params![item.event_id,item.event_version,format_dt(item.due_at),item.level as i32,item.dedupe_key,format_dt(now)])?;
     }
@@ -985,15 +2111,69 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
     })
 }
 fn map_delivery(row: &Row<'_>) -> rusqlite::Result<ReminderDelivery> {
-    let event = map_event_offset(row, 5)?;
+    let event = map_event_offset(row, 6)?;
     Ok(ReminderDelivery {
         outbox_id: row.get(0)?,
         due_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
         level: ReminderLevel::from_i32(row.get(2)?),
         dedupe_key: row.get(3)?,
         attempt_count: row.get(4)?,
+        message: row.get(5)?,
         event,
     })
+}
+
+fn map_secondary_delivery(row: &Row<'_>) -> rusqlite::Result<SecondaryNotificationDelivery> {
+    let event = map_event_offset(row, 7)?;
+    Ok(SecondaryNotificationDelivery {
+        id: row.get(0)?,
+        reminder_outbox_id: row.get(1)?,
+        request_attempt_id: 0,
+        provider: SecondaryNotificationProvider::from_i32(row.get(2)?),
+        due_at: parse_dt(&row.get::<_, String>(3)?).map_err(to_sql_error)?,
+        level: ReminderLevel::from_i32(row.get(4)?),
+        attempt_count: row.get(5)?,
+        message: row.get(6)?,
+        event,
+    })
+}
+
+fn common_secondary_attempt_id(deliveries: &[SecondaryNotificationDelivery]) -> Result<i64> {
+    let first = deliveries
+        .first()
+        .context("第二通知通道批次为空")?
+        .request_attempt_id;
+    if first <= 0
+        || deliveries
+            .iter()
+            .any(|delivery| delivery.request_attempt_id != first)
+    {
+        bail!("第二通知通道批次配额记录不一致");
+    }
+    Ok(first)
+}
+
+fn prune_secondary_notification_history(connection: &Connection, now: ChinaDateTime) -> Result<()> {
+    connection.execute(
+        "DELETE FROM secondary_notification_attempts WHERE attempted_at<?1",
+        [format_dt(
+            now - chrono::Duration::days(SECONDARY_ATTEMPT_RETENTION_DAYS),
+        )],
+    )?;
+    connection.execute(
+        "DELETE FROM secondary_notification_attempts WHERE id NOT IN (SELECT id FROM secondary_notification_attempts ORDER BY attempted_at DESC,id DESC LIMIT ?1)",
+        [SECONDARY_MAX_ATTEMPT_RECORDS],
+    )?;
+    connection.execute(
+        "DELETE FROM secondary_notification_outbox WHERE state IN (?1,?2,?3) AND updated_at<?4",
+        params![
+            SECONDARY_DELIVERED,
+            SECONDARY_EXHAUSTED,
+            SECONDARY_CANCELLED,
+            format_dt(now - chrono::Duration::days(SECONDARY_OUTBOX_RETENTION_DAYS)),
+        ],
+    )?;
+    Ok(())
 }
 fn map_event_offset(row: &Row<'_>, offset: usize) -> rusqlite::Result<IpoEvent> {
     let sessions: String = row.get(offset + 22)?;
@@ -1234,7 +2414,7 @@ mod tests {
                 apply_code: Some("780001".into()),
                 legacy_code: None,
                 name: "测试股份".into(),
-                apply_date: Some(now.date_naive() - chrono::Duration::days(1)),
+                apply_date: Some(now.date_naive()),
                 issue_price: Some(10.0),
                 lot_size: Some(500),
                 max_apply_quantity: Some(10_000),
@@ -1267,6 +2447,131 @@ mod tests {
         let test = TestDatabase::new();
         test.database.integrity_check().unwrap();
         assert!(test.database.path().exists());
+    }
+
+    #[test]
+    fn secondary_notification_outbox_retries_independently_and_completes_as_a_batch() {
+        let test = TestDatabase::new();
+        let mut settings = test.database.settings().unwrap_or_default();
+        settings.secondary_notification_enabled = true;
+        settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
+        test.database.save_settings(&settings).unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+
+        let now = now_china();
+        let local = test.database.claim_due_at(50, now).unwrap();
+        assert!(!local.is_empty());
+        let first = test.database.claim_secondary_due_at(50, now).unwrap();
+        assert!(!first.is_empty());
+        assert!(
+            first
+                .iter()
+                .all(|delivery| delivery.provider == SecondaryNotificationProvider::PushPlus)
+        );
+        test.database
+            .fail_secondary_deliveries(&first, "fixture unavailable")
+            .unwrap();
+        assert!(
+            test.database
+                .claim_secondary_due_at(50, now + chrono::Duration::seconds(30))
+                .unwrap()
+                .is_empty()
+        );
+
+        let retry = test
+            .database
+            .claim_secondary_due_at(50, now + chrono::Duration::minutes(2))
+            .unwrap();
+        assert_eq!(retry.len(), first.len());
+        test.database
+            .complete_secondary_deliveries(&retry, "pushplus-test")
+            .unwrap();
+        let summary = test.database.secondary_notification_summary().unwrap();
+        assert_eq!(summary.delivered, retry.len() as i64);
+        assert_eq!(summary.retrying, 0);
+        assert_eq!(summary.requests_last_hour, 2);
+        assert!(summary.latest_success_at.is_some());
+    }
+
+    #[test]
+    fn secondary_notification_enforces_hourly_request_quota() {
+        let test = TestDatabase::new();
+        let mut settings = test.database.settings().unwrap_or_default();
+        settings.secondary_notification_enabled = true;
+        settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
+        test.database.save_settings(&settings).unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+        let now = now_china();
+        assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
+        let connection = test.database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO secondary_notification_attempts(attempted_at,provider,success,batch_size,error) VALUES(?1,?2,0,1,'old-fixture')",
+                params![
+                    format_dt(now - chrono::Duration::days(31)),
+                    SecondaryNotificationProvider::PushPlus as i32
+                ],
+            )
+            .unwrap();
+        for _ in 0..SECONDARY_REQUESTS_PER_HOUR {
+            connection
+                .execute(
+                    "INSERT INTO secondary_notification_attempts(attempted_at,provider,success,batch_size,error) VALUES(?1,?2,0,1,'fixture')",
+                    params![format_dt(now), SecondaryNotificationProvider::PushPlus as i32],
+                )
+                .unwrap();
+        }
+        assert!(
+            test.database
+                .claim_secondary_due_at(50, now + chrono::Duration::minutes(1))
+                .unwrap()
+                .is_empty()
+        );
+        let old_records: i64 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM secondary_notification_attempts WHERE error='old-fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_records, 0);
+    }
+
+    #[test]
+    fn secondary_notification_stops_after_five_failed_attempts() {
+        let test = TestDatabase::new();
+        let mut settings = test.database.settings().unwrap_or_default();
+        settings.secondary_notification_enabled = true;
+        settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
+        test.database.save_settings(&settings).unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+        let mut now = now_china();
+        assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
+
+        for advance_minutes in [0, 2, 8, 24, 55] {
+            let attempt_at = now + chrono::Duration::minutes(advance_minutes);
+            let deliveries = test
+                .database
+                .claim_secondary_due_at(50, attempt_at)
+                .unwrap();
+            assert!(!deliveries.is_empty());
+            test.database
+                .fail_secondary_deliveries(&deliveries, "fixture unavailable")
+                .unwrap();
+        }
+        now += chrono::Duration::minutes(120);
+        assert!(
+            test.database
+                .claim_secondary_due_at(50, now)
+                .unwrap()
+                .is_empty()
+        );
+        let summary = test.database.secondary_notification_summary().unwrap();
+        assert!(summary.exhausted > 0);
+        assert_eq!(summary.retrying, 0);
     }
 
     #[test]
@@ -1358,6 +2663,223 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_event_requires_review_after_limits_or_sessions_change() {
+        let test = TestDatabase::new();
+        let now = now_china();
+        let mut input = test.event();
+        input.apply_date = Some(now.date_naive());
+        input.sessions = vec![SubscriptionSession {
+            session_number: 1,
+            official_start: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            official_end: NaiveTime::from_hms_opt(15, 0, 0).unwrap(),
+            broker_accept_start: Some(NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            safety_cutoff: Some(NaiveTime::from_hms_opt(14, 55, 0).unwrap()),
+            funding_mode: FundingMode::MarketValue,
+            allocation_time_sensitive: false,
+            source: "fixture-a".into(),
+            source_published_at: Some(now),
+        }];
+        let event = test.database.upsert_event(input).unwrap();
+        test.database
+            .acknowledge(&event.id, event.event_version)
+            .unwrap();
+
+        let mut changed = test.database.event(&event.id).unwrap().unwrap();
+        changed.max_apply_quantity = Some(20_000);
+        changed.sessions[0].official_end = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+        changed.updated_at = now_china();
+        let changed = test.database.upsert_event(changed).unwrap();
+        assert_eq!(changed.event_version, event.event_version + 1);
+        assert_eq!(
+            changed.lifecycle_status,
+            LifecycleStatus::AcknowledgedNeedsReview
+        );
+
+        let (needs_review_at, review_reason): (Option<String>, Option<String>) = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT needs_review_at,review_reason FROM acknowledgements WHERE ipo_event_id=?1 AND event_version=?2",
+                params![event.id, event.event_version],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(needs_review_at.is_some());
+        let review_reason = review_reason.unwrap();
+        assert!(review_reason.contains("申购上限"));
+        assert!(review_reason.contains("官方申购时段或资金规则"));
+    }
+
+    #[test]
+    fn missing_optional_fields_retain_known_values_without_false_review() {
+        let test = TestDatabase::new();
+        let now = now_china();
+        let mut input = test.event();
+        input.apply_date = Some(now.date_naive());
+        input.required_market_value = Some(100_000.0);
+        input.required_cash = Some(50_000.0);
+        let event = test.database.upsert_event(input).unwrap();
+        test.database
+            .acknowledge(&event.id, event.event_version)
+            .unwrap();
+
+        let mut partial = test.database.event(&event.id).unwrap().unwrap();
+        partial.apply_code = None;
+        partial.apply_date = None;
+        partial.issue_price = None;
+        partial.lot_size = None;
+        partial.max_apply_quantity = None;
+        partial.required_market_value = None;
+        partial.required_cash = None;
+        partial.updated_at = now_china();
+        let saved = test.database.upsert_event(partial).unwrap();
+
+        assert_eq!(saved.event_version, event.event_version);
+        assert_eq!(saved.lifecycle_status, LifecycleStatus::Acknowledged);
+        assert_eq!(saved.apply_code.as_deref(), Some("780001"));
+        assert_eq!(saved.apply_date, Some(now.date_naive()));
+        assert_eq!(saved.issue_price, Some(10.0));
+        assert_eq!(saved.lot_size, Some(500));
+        assert_eq!(saved.max_apply_quantity, Some(10_000));
+        assert_eq!(saved.required_market_value, Some(100_000.0));
+        assert_eq!(saved.required_cash, Some(50_000.0));
+    }
+
+    #[test]
+    fn sync_schedule_v3_migrates_legacy_defaults() {
+        let test = TestDatabase::new();
+        let legacy = AppSettings {
+            normal_sync_minutes: 1440,
+            active_day_sync_minutes: 1440,
+            ..AppSettings::default()
+        };
+        test.database.save_settings(&legacy).unwrap();
+        test.database
+            .open()
+            .unwrap()
+            .execute("DELETE FROM schema_migrations WHERE version=3", [])
+            .unwrap();
+
+        test.database.initialize().unwrap();
+
+        let migrated = test.database.settings().unwrap();
+        assert_eq!(migrated.normal_sync_minutes, 30);
+        assert_eq!(migrated.active_day_sync_minutes, 10);
+        let applied: i32 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn retry_after_takes_priority_and_local_backoff_has_bounded_jitter() {
+        let test = TestDatabase::new();
+        let retry_after = now_china() + chrono::Duration::minutes(12);
+        let next = test
+            .database
+            .save_source_run_with_retry_after(
+                "retry-after-fixture",
+                now_china(),
+                HealthState::Failed,
+                0,
+                None,
+                None,
+                None,
+                Some("rate limited"),
+                Some(retry_after),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, retry_after);
+
+        let fixed = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
+        let first = source_backoff_delay("fixture", 1, fixed).num_seconds();
+        let saturated = source_backoff_delay("fixture", 8, fixed).num_seconds();
+        assert!((60..=66).contains(&first));
+        assert!((1800..=1980).contains(&saturated));
+    }
+
+    #[test]
+    fn backoff_health_probe_is_persistent_rate_limited_and_keeps_api_backoff() {
+        let test = TestDatabase::new();
+        let now = now_china();
+        let retry_after = now + chrono::Duration::hours(2);
+        test.database
+            .save_source_run_with_retry_after(
+                "probe-fixture",
+                now,
+                HealthState::Failed,
+                0,
+                None,
+                None,
+                None,
+                Some("rate limited"),
+                Some(retry_after),
+            )
+            .unwrap();
+        let connection = test.database.open().unwrap();
+        let next_probe: Option<String> = connection
+            .query_row(
+                "SELECT next_probe_at FROM source_backoff WHERE source='probe-fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(next_probe.is_some());
+        connection
+            .execute(
+                "UPDATE source_backoff SET next_probe_at=?1 WHERE source='probe-fixture'",
+                [format_dt(now - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            test.database
+                .try_claim_source_probe("probe-fixture", now)
+                .unwrap()
+        );
+        assert!(
+            !test
+                .database
+                .try_claim_source_probe("probe-fixture", now)
+                .unwrap()
+        );
+        test.database
+            .save_source_probe_run("probe-fixture", now, true, None)
+            .unwrap();
+
+        let connection = test.database.open().unwrap();
+        let (probe_success, probe_run_success): (Option<i32>, i32) = connection
+            .query_row(
+                "SELECT last_probe_success, (SELECT success FROM sync_runs WHERE source='health-probe:probe-fixture' ORDER BY id DESC LIMIT 1) FROM source_backoff WHERE source='probe-fixture'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(probe_success, Some(1));
+        assert_eq!(probe_run_success, 1);
+        assert!(
+            !test
+                .database
+                .source_can_attempt("probe-fixture", now)
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
     fn warning_source_run_is_successful_without_losing_diagnostics() {
         let test = TestDatabase::new();
         test.database
@@ -1415,6 +2937,12 @@ mod tests {
     #[test]
     fn source_freshness_respects_the_configured_sync_interval() {
         let test = TestDatabase::new();
+        let settings = AppSettings {
+            normal_sync_minutes: 240,
+            active_day_sync_minutes: 10,
+            ..AppSettings::default()
+        };
+        test.database.save_settings(&settings).unwrap();
         let last_success = now_china() - chrono::Duration::hours(3);
         test.database
             .open()
@@ -1477,6 +3005,9 @@ mod tests {
         let date = now.date_naive() + chrono::Duration::days(1);
         let mut input = test.event();
         input.apply_date = Some(date);
+        input.ballot_date = Some(date + chrono::Duration::days(1));
+        input.payment_date = Some(date + chrono::Duration::days(2));
+        input.listing_date = Some(date + chrono::Duration::days(8));
         input.lifecycle_status = LifecycleStatus::Scheduled;
         let event = test.database.upsert_event(input).unwrap();
         test.database
@@ -1514,6 +3045,9 @@ mod tests {
             crate::core::at(date, chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap());
         let mut input = test.event();
         input.apply_date = Some(date);
+        input.ballot_date = Some(date + chrono::Duration::days(1));
+        input.payment_date = Some(date + chrono::Duration::days(2));
+        input.listing_date = Some(date + chrono::Duration::days(8));
         input.lifecycle_status = LifecycleStatus::Scheduled;
         let event = test.database.upsert_event(input).unwrap();
 
@@ -1534,6 +3068,20 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert!(cancelled > 0);
+        let pending_post_apply: i64 = test.database.open().unwrap().query_row(
+            "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND event_version=?2 AND delivery_state=?3 AND reminder_level IN (?4,?5,?6,?7)",
+            params![
+                event.id,
+                event.event_version,
+                DeliveryState::Pending as i32,
+                ReminderLevel::BallotCheck as i32,
+                ReminderLevel::PaymentMorning as i32,
+                ReminderLevel::PaymentFollowUp as i32,
+                ReminderLevel::ListingMorning as i32,
+            ],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending_post_apply, 4);
 
         test.database
             .revoke_acknowledgement_at(
@@ -1557,6 +3105,20 @@ mod tests {
         ).unwrap();
         assert_eq!(revoked, 1);
         assert!(pending > 0);
+        let pending_post_apply: i64 = test.database.open().unwrap().query_row(
+            "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND event_version=?2 AND delivery_state=?3 AND reminder_level IN (?4,?5,?6,?7)",
+            params![
+                event.id,
+                event.event_version,
+                DeliveryState::Pending as i32,
+                ReminderLevel::BallotCheck as i32,
+                ReminderLevel::PaymentMorning as i32,
+                ReminderLevel::PaymentFollowUp as i32,
+                ReminderLevel::ListingMorning as i32,
+            ],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending_post_apply, 0);
     }
 
     #[test]
@@ -1807,6 +3369,408 @@ mod tests {
                     Some("missing-document"),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sync_conclusion_migration_and_all_kinds_roundtrip() {
+        let test = TestDatabase::new();
+        let connection = test.database.open().unwrap();
+        let (migration_applied, table_exists): (i32, i32) = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4), EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_conclusions')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((migration_applied, table_exists), (1, 1));
+        drop(connection);
+
+        let started = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+        );
+        for (index, kind) in [
+            SyncConclusionKind::Unknown,
+            SyncConclusionKind::HealthyNonempty,
+            SyncConclusionKind::HealthyEmpty,
+            SyncConclusionKind::DegradedCached,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let conclusion = SyncConclusion {
+                kind,
+                started_at: started + chrono::Duration::minutes(index as i64),
+                finished_at: started + chrono::Duration::minutes(index as i64 + 1),
+                today_count: index,
+                event_count: index + 10,
+                announcement_count: index + 20,
+                successful_sources: vec!["eastmoney".into(), "sse".into()],
+                missing_sources: vec!["cninfo".into()],
+                summary: format!("fixture-{kind:?}"),
+            };
+            test.database.save_sync_conclusion(&conclusion).unwrap();
+            let loaded = test.database.latest_sync_conclusion().unwrap().unwrap();
+            assert_eq!(loaded.kind, conclusion.kind);
+            assert_eq!(loaded.started_at, conclusion.started_at);
+            assert_eq!(loaded.finished_at, conclusion.finished_at);
+            assert_eq!(loaded.today_count, conclusion.today_count);
+            assert_eq!(loaded.event_count, conclusion.event_count);
+            assert_eq!(loaded.announcement_count, conclusion.announcement_count);
+            assert_eq!(loaded.successful_sources, conclusion.successful_sources);
+            assert_eq!(loaded.missing_sources, conclusion.missing_sources);
+            assert_eq!(loaded.summary, conclusion.summary);
+        }
+
+        let connection = test.database.open().unwrap();
+        let healthy_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_runs WHERE source='sync-conclusion' AND success=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let degraded_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_runs WHERE source='sync-conclusion' AND success=0 AND error IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healthy_count, 2);
+        assert_eq!(degraded_count, 2);
+    }
+
+    #[test]
+    fn daily_health_summary_is_exactly_once_across_restarts() {
+        let test = TestDatabase::new();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let before = crate::core::at(date, NaiveTime::from_hms_opt(7, 59, 59).unwrap());
+        let due = crate::core::at(date, NaiveTime::from_hms_opt(8, 0, 0).unwrap());
+
+        assert!(!test.database.try_mark_health_summary_due(before).unwrap());
+        assert!(test.database.try_mark_health_summary_due(due).unwrap());
+        assert!(!test.database.try_mark_health_summary_due(due).unwrap());
+
+        let reopened = Database::new(&test.root);
+        reopened.initialize().unwrap();
+        assert!(
+            !reopened
+                .try_mark_health_summary_due(due + chrono::Duration::hours(3))
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .try_mark_health_summary_due(due + chrono::Duration::days(1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn backup_is_integrity_checked_and_leaves_no_temporary_file() {
+        let test = TestDatabase::new();
+        test.database.upsert_event(test.event()).unwrap();
+        let backup_directory = test.root.join("backups");
+
+        let path = test.database.backup(&backup_directory).unwrap();
+
+        assert!(path.exists());
+        let integrity: String = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert!(
+            fs::read_dir(&backup_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    #[test]
+    fn interrupted_backup_commit_preserves_existing_backups_and_cleans_temporary_file() {
+        let test = TestDatabase::new();
+        test.database.upsert_event(test.event()).unwrap();
+        let backup_directory = test.root.join("backups");
+        let existing = test.database.backup(&backup_directory).unwrap();
+
+        let error = test
+            .database
+            .backup_with_commit_hook(&backup_directory, |_| {
+                bail!("simulated interruption before atomic commit")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("simulated interruption"));
+        assert!(existing.exists());
+        assert!(
+            fs::read_dir(&backup_directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.path().extension().is_none_or(|value| value != "tmp"))
+        );
+    }
+
+    #[test]
+    fn overdue_apply_reminders_collapse_to_the_latest_due_level() {
+        let test = TestDatabase::new();
+        let event = test.database.upsert_event(test.event()).unwrap();
+        let date = event.apply_date.unwrap();
+        let claim_at = crate::core::at(date, crate::model::time(14, 56));
+
+        let deliveries = test.database.claim_due_at(50, claim_at).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].level, ReminderLevel::Final);
+        let summary = test.database.reminder_state_summary().unwrap();
+        assert!(summary.collapsed > 0);
+        assert_eq!(summary.leased, 1);
+    }
+
+    #[test]
+    fn local_delivery_failures_use_bounded_backoff_and_expose_error_summary() {
+        let test = TestDatabase::new();
+        let event = test.database.upsert_event(test.event()).unwrap();
+        let date = event.apply_date.unwrap();
+        let first_attempt = crate::core::at(date, crate::model::time(14, 56));
+        let first = test.database.claim_due_at(50, first_attempt).unwrap();
+        assert_eq!(first.len(), 1);
+        test.database
+            .fail_delivery_at(first[0].outbox_id, "fixture render failure", first_attempt)
+            .unwrap();
+        assert!(
+            test.database
+                .claim_due_at(50, first_attempt + chrono::Duration::seconds(59))
+                .unwrap()
+                .is_empty()
+        );
+
+        let second_attempt = first_attempt + chrono::Duration::minutes(1);
+        let second = test.database.claim_due_at(50, second_attempt).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].attempt_count, 2);
+        test.database
+            .fail_delivery_at(
+                second[0].outbox_id,
+                "fixture render failure again",
+                second_attempt,
+            )
+            .unwrap();
+        assert!(
+            test.database
+                .claim_due_at(50, second_attempt + chrono::Duration::minutes(4))
+                .unwrap()
+                .is_empty()
+        );
+        let retry_summary = test.database.reminder_state_summary().unwrap();
+        assert_eq!(retry_summary.failed, 1);
+        assert!(
+            retry_summary
+                .latest_error
+                .as_deref()
+                .is_some_and(|value| value.contains("again"))
+        );
+        assert_eq!(
+            test.database
+                .claim_due_at(50, second_attempt + chrono::Duration::minutes(5))
+                .unwrap()
+                .len(),
+            1
+        );
+        let summary = test.database.reminder_state_summary().unwrap();
+        assert_eq!(summary.failed, 0);
+        assert!(summary.latest_error.is_none());
+    }
+
+    #[test]
+    fn operation_health_migration_and_failure_affect_overall_health() {
+        let test = TestDatabase::new();
+        assert_eq!(test.database.schema_version().unwrap(), 8);
+        let table_exists: i32 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='operation_health')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+
+        test.database
+            .save_operation_health(
+                "database-backup",
+                HealthState::Failed,
+                Some("fixture failure"),
+            )
+            .unwrap();
+        let entries = test.database.operation_health().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].component, "database-backup");
+        assert_eq!(entries[0].state, HealthState::Failed);
+        assert_eq!(entries[0].last_error.as_deref(), Some("fixture failure"));
+        assert_eq!(
+            test.database.health_details().unwrap().overall_state,
+            HealthState::Failed
+        );
+
+        test.database
+            .save_operation_health("database-backup", HealthState::Healthy, None)
+            .unwrap();
+        let entry = test.database.operation_health().unwrap().remove(0);
+        assert_eq!(entry.state, HealthState::Healthy);
+        assert!(entry.last_success_at.is_some());
+        assert!(entry.last_error.is_none());
+    }
+
+    #[test]
+    fn diagnostic_summary_queries_return_structured_runtime_history() {
+        let test = TestDatabase::new();
+        let conclusion = SyncConclusion {
+            kind: SyncConclusionKind::DegradedCached,
+            started_at: now_china() - chrono::Duration::minutes(1),
+            finished_at: now_china(),
+            today_count: 1,
+            event_count: 2,
+            announcement_count: 3,
+            successful_sources: vec!["eastmoney".into()],
+            missing_sources: vec!["bse".into()],
+            summary: "fixture degraded".into(),
+        };
+        test.database.save_sync_conclusion(&conclusion).unwrap();
+
+        let runs = test.database.recent_sync_runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].source, "sync-conclusion");
+        assert!(!runs[0].success);
+        assert_eq!(runs[0].record_count, 1);
+        assert!(runs[0].error.as_deref().unwrap().contains("fixture"));
+
+        let reminders = test.database.reminder_state_summary().unwrap();
+        assert_eq!(reminders.pending, 0);
+        assert_eq!(reminders.shown_last_seven_days, 0);
+        assert!(test.database.recent_reminder_log(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn noncritical_change_enqueues_exactly_one_message_without_version_bump() {
+        let test = TestDatabase::new();
+        let original = test.database.upsert_event(test.event()).unwrap();
+        let mut changed = original.clone();
+        changed.name = "测试股份新简称".into();
+        changed.listing_date = Some(now_china().date_naive() + chrono::Duration::days(10));
+        changed.updated_at += chrono::Duration::seconds(1);
+        let saved = test.database.upsert_event(changed.clone()).unwrap();
+        assert_eq!(saved.event_version, original.event_version);
+
+        let connection = test.database.open().unwrap();
+        let (count, message): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(message) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
+                params![saved.id, ReminderLevel::DataChanged as i32],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(message.contains("证券简称"));
+        assert!(message.contains("上市日期"));
+        drop(connection);
+
+        changed.updated_at += chrono::Duration::seconds(1);
+        test.database.upsert_event(changed).unwrap();
+        let count: i64 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
+                params![saved.id, ReminderLevel::DataChanged as i32],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let delivery = test
+            .database
+            .claim_due_at(100, now_china() + chrono::Duration::minutes(1))
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.level == ReminderLevel::DataChanged)
+            .unwrap();
+        assert!(delivery.message.as_deref().unwrap().contains("仅提醒一次"));
+        test.database.complete_delivery(&delivery, "test").unwrap();
+        assert!(test.database.complete_delivery(&delivery, "test").is_err());
+        let shown_count: i64 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_log WHERE dedupe_key=?1",
+                [delivery.dedupe_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shown_count, 1);
+    }
+
+    #[test]
+    fn outbox_recovers_across_reopen_at_queue_lease_display_and_confirmation_stages() {
+        let test = TestDatabase::new();
+        let event = test.database.upsert_event(test.event()).unwrap();
+        let first_claim_at = now_china() - chrono::Duration::minutes(5);
+
+        let reopened = Database::new(&test.root);
+        reopened.initialize().unwrap();
+        let leased = reopened.claim_due_at(100, first_claim_at).unwrap();
+        assert!(!leased.is_empty());
+
+        let before_expiry = Database::new(&test.root);
+        before_expiry.initialize().unwrap();
+        assert!(
+            before_expiry
+                .claim_due_at(100, first_claim_at + chrono::Duration::minutes(1))
+                .unwrap()
+                .is_empty()
+        );
+
+        let after_expiry = Database::new(&test.root);
+        after_expiry.initialize().unwrap();
+        let reclaimed = after_expiry
+            .claim_due_at(100, first_claim_at + chrono::Duration::minutes(3))
+            .unwrap();
+        assert_eq!(reclaimed.len(), leased.len());
+        assert!(reclaimed.iter().all(|delivery| delivery.attempt_count == 2));
+
+        let displayed = reclaimed[0].clone();
+        after_expiry.complete_delivery(&displayed, "test").unwrap();
+        let after_display_crash = Database::new(&test.root);
+        after_display_crash.initialize().unwrap();
+        let remaining = after_display_crash
+            .claim_due_at(100, first_claim_at + chrono::Duration::minutes(6))
+            .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .all(|delivery| delivery.outbox_id != displayed.outbox_id)
+        );
+
+        let mut today_event = after_display_crash.event(&event.id).unwrap().unwrap();
+        today_event.apply_date = Some(now_china().date_naive());
+        today_event.lifecycle_status = LifecycleStatus::ActiveUnconfirmed;
+        today_event.updated_at = now_china();
+        let today_event = after_display_crash.upsert_event(today_event).unwrap();
+        after_display_crash
+            .acknowledge_at(&today_event.id, today_event.event_version, now_china())
+            .unwrap();
+
+        let after_confirmation_crash = Database::new(&test.root);
+        after_confirmation_crash.initialize().unwrap();
+        assert!(
+            after_confirmation_crash
+                .claim_due_at(100, now_china() + chrono::Duration::minutes(3))
+                .unwrap()
+                .is_empty()
         );
     }
 }
