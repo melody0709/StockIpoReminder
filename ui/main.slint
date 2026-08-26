@@ -57,8 +57,9 @@ component ActionButton inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> danger: false;
     in property <bool> enabled: true;
+    in property <bool> compact: false;
     callback clicked();
-    min-width: 104px;
+    min-width: root.compact ? 88px : 104px;
     min-height: 38px;
     max-height: 38px;
     border-radius: 8px;
@@ -68,7 +69,7 @@ component ActionButton inherits Rectangle {
     Text {
         text: root.label;
         color: root.enabled ? #f8fafc : #64748b;
-        font-size: 14px;
+        font-size: root.compact ? 13px : 14px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -82,15 +83,17 @@ component ActionButton inherits Rectangle {
 component NavButton inherits Rectangle {
     in property <string> label;
     in property <bool> selected: false;
+    in property <bool> compact: false;
     callback clicked();
-    min-width: 128px;
-    min-height: 42px;
-    max-height: 42px;
+    min-width: root.compact ? 100px : 128px;
+    min-height: root.compact ? 38px : 42px;
+    max-height: root.compact ? 38px : 42px;
     border-radius: 8px;
     background: root.selected ? #1d4ed8 : touch.has-hover ? #253552 : #111b2e;
     Text {
         text: root.label;
         color: root.selected ? white : #cbd5e1;
+        font-size: root.compact ? 13px : 14px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -136,17 +139,18 @@ component StatCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
     in property <color> value-color: #f8fafc;
-    min-height: 82px;
-    max-height: 82px;
+    in property <bool> compact: false;
+    min-height: root.compact ? 70px : 82px;
+    max-height: root.compact ? 70px : 82px;
     border-radius: 10px;
     border-width: 1px;
     border-color: #26334a;
     background: #111b2e;
     VerticalBox {
-        padding: 12px;
+        padding: root.compact ? 9px : 12px;
         spacing: 3px;
-        Text { text: root.label; color: #94a3b8; font-size: 13px; }
-        Text { text: root.value; color: root.value-color; font-size: 26px; font-weight: 700; }
+        Text { text: root.label; color: #94a3b8; font-size: root.compact ? 12px : 13px; }
+        Text { text: root.value; color: root.value-color; font-size: root.compact ? 22px : 26px; font-weight: 700; }
     }
 }
 
@@ -169,8 +173,8 @@ export component MainWindow inherits Window {
     title: "A 股新股申购提醒";
     preferred-width: 1180px;
     preferred-height: 780px;
-    min-width: 980px;
-    min-height: 680px;
+    min-width: 760px;
+    min-height: 460px;
     // Toggling repaint-token marks the complete window background dirty. This
     // is used when a tray-resident software-rendered window becomes visible
     // again, because a plain request-redraw may otherwise repaint only the
@@ -184,6 +188,11 @@ export component MainWindow inherits Window {
     in-out property <int> repaint-token: 0;
     in-out property <bool> is-synchronizing: false;
     in-out property <int> runtime-level: 0;
+    in-out property <bool> compact-width: false;
+    in-out property <bool> compact-height: false;
+    property <bool> compact-layout: root.compact-width || root.compact-height;
+    changed width => { root.compact-width = root.width < 1000px; }
+    changed height => { root.compact-height = root.height < 650px; }
     in property <string> app-version: "";
     in-out property <string> status-text: "正在初始化…";
     in-out property <string> sync-text: "尚未同步";
@@ -282,29 +291,29 @@ export component MainWindow inherits Window {
     callback exit-app();
 
     VerticalBox {
-        padding: 20px;
-        spacing: 12px;
+        padding: root.compact-layout ? 12px : 20px;
+        spacing: root.compact-layout ? 8px : 12px;
 
         VerticalBox {
-            min-height: 86px;
-            max-height: 86px;
-            spacing: 8px;
+            min-height: root.compact-layout ? 72px : 86px;
+            max-height: root.compact-layout ? 72px : 86px;
+            spacing: root.compact-layout ? 4px : 8px;
             HorizontalBox {
-                min-height: 46px;
-                max-height: 46px;
-                spacing: 12px;
+                min-height: root.compact-layout ? 40px : 46px;
+                max-height: root.compact-layout ? 40px : 46px;
+                spacing: root.compact-width ? 8px : 12px;
                 Text {
                     text: "A 股新股申购提醒";
-                    min-height: 46px;
-                    max-height: 46px;
-                    font-size: 27px;
+                    min-height: root.compact-layout ? 40px : 46px;
+                    max-height: root.compact-layout ? 40px : 46px;
+                    font-size: root.compact-width ? 23px : 27px;
                     font-weight: 700;
                     color: #f8fafc;
                     vertical-alignment: center;
                 }
                 Rectangle {
-                    min-width: 62px;
-                    max-width: 62px;
+                    min-width: root.compact-width ? 56px : 62px;
+                    max-width: root.compact-width ? 56px : 62px;
                     min-height: 24px;
                     max-height: 24px;
                     border-radius: 12px;
@@ -321,20 +330,20 @@ export component MainWindow inherits Window {
                     }
                 }
                 Rectangle { horizontal-stretch: 1; }
-                ActionButton { label: "立即同步"; primary: true; enabled: !root.is-synchronizing; clicked => { root.sync-now(); } }
-                ActionButton { label: "隐藏到托盘"; clicked => { root.hide-to-tray(); } }
+                ActionButton { label: "立即同步"; compact: root.compact-width; primary: true; enabled: !root.is-synchronizing; clicked => { root.sync-now(); } }
+                ActionButton { label: "隐藏到托盘"; compact: root.compact-width; clicked => { root.hide-to-tray(); } }
             }
             Rectangle {
-                min-height: 32px;
-                max-height: 32px;
+                min-height: root.compact-layout ? 24px : 32px;
+                max-height: root.compact-layout ? 24px : 32px;
                 background: transparent;
                 HorizontalBox {
-                    spacing: 8px;
-                    Rectangle { min-width: 10px; max-width: 10px; min-height: 10px; max-height: 10px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
+                    spacing: root.compact-layout ? 6px : 8px;
+                    Rectangle { min-width: root.compact-layout ? 8px : 10px; max-width: root.compact-layout ? 8px : 10px; min-height: root.compact-layout ? 8px : 10px; max-height: root.compact-layout ? 8px : 10px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
                     Text {
                         text: root.status-text + " · " + root.sync-text;
                         color: #a8b5ca;
-                        font-size: 13px;
+                        font-size: root.compact-layout ? 12px : 13px;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
@@ -343,25 +352,25 @@ export component MainWindow inherits Window {
         }
 
         HorizontalBox {
-            min-height: 42px;
-            max-height: 42px;
+            min-height: root.compact-layout ? 38px : 42px;
+            max-height: root.compact-layout ? 38px : 42px;
             spacing: 6px;
-            NavButton { label: "今日任务"; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
-            NavButton { label: "未来 60 天"; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
-            NavButton { label: "健康与诊断"; selected: root.active-page == 2; clicked => { root.active-page = 2; } }
-            NavButton { label: "设置"; selected: root.active-page == 3; clicked => { root.active-page = 3; } }
+            NavButton { label: "今日任务"; compact: root.compact-width; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
+            NavButton { label: "未来 60 天"; compact: root.compact-width; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
+            NavButton { label: "健康与诊断"; compact: root.compact-width; selected: root.active-page == 2; clicked => { root.active-page = 2; } }
+            NavButton { label: "设置"; compact: root.compact-width; selected: root.active-page == 3; clicked => { root.active-page = 3; } }
             Rectangle { horizontal-stretch: 1; }
-            Text { text: root.health-text; color: #94a3b8; font-size: 12px; vertical-alignment: center; }
+            if !root.compact-width : Text { text: root.health-text; color: #94a3b8; font-size: 12px; vertical-alignment: center; }
         }
 
         if root.active-page == 0 : VerticalBox {
-            spacing: 12px;
+            spacing: root.compact-layout ? 8px : 12px;
             HorizontalBox {
-                spacing: 10px;
-                StatCard { label: "今日任务"; value: "" + root.today-count; horizontal-stretch: 1; }
-                StatCard { label: "待确认"; value: "" + root.pending-count; value-color: #fca5a5; horizontal-stretch: 1; }
-                StatCard { label: "已确认"; value: "" + root.acknowledged-count; value-color: #86efac; horizontal-stretch: 1; }
-                StatCard { label: "异常数据"; value: "" + root.issue-count; value-color: #fcd34d; horizontal-stretch: 1; }
+                spacing: root.compact-width ? 6px : 10px;
+                StatCard { label: "今日任务"; compact: root.compact-layout; value: "" + root.today-count; horizontal-stretch: 1; }
+                StatCard { label: "待确认"; compact: root.compact-layout; value: "" + root.pending-count; value-color: #fca5a5; horizontal-stretch: 1; }
+                StatCard { label: "已确认"; compact: root.compact-layout; value: "" + root.acknowledged-count; value-color: #86efac; horizontal-stretch: 1; }
+                StatCard { label: "异常数据"; compact: root.compact-layout; value: "" + root.issue-count; value-color: #fcd34d; horizontal-stretch: 1; }
             }
             Rectangle {
                 vertical-stretch: 1;
@@ -379,27 +388,27 @@ export component MainWindow inherits Window {
                             font-size: 16px;
                             horizontal-alignment: center;
                             vertical-alignment: center;
-                            height: 320px;
+                            height: root.compact-height ? 180px : 320px;
                             wrap: word-wrap;
                         }
                         for task in root.today-tasks : Rectangle {
-                            height: task.warning == "" ? 132px : 158px;
+                            height: root.compact-width ? (task.warning == "" ? 156px : 184px) : (task.warning == "" ? 132px : 158px);
                             border-radius: 10px;
                             border-width: 1px;
                             border-color: task.needs-review ? #d97706 : #26334a;
                             background: #0f172a;
                             HorizontalBox {
-                                padding: 14px;
-                                spacing: 16px;
+                                padding: root.compact-width ? 10px : 14px;
+                                spacing: root.compact-width ? 8px : 16px;
                                 VerticalBox {
-                                    width: 29%;
+                                    width: root.compact-width ? 26% : 29%;
                                     spacing: 5px;
-                                    Text { text: task.name; color: #f8fafc; font-size: 20px; font-weight: 700; }
+                                    Text { text: task.name; color: #f8fafc; font-size: root.compact-width ? 18px : 20px; font-weight: 700; wrap: word-wrap; }
                                     Text { text: task.market-and-codes; color: #93c5fd; wrap: word-wrap; }
                                     if task.warning != "" : Text { text: task.warning; color: #fbbf24; font-size: 12px; wrap: word-wrap; }
                                 }
                                 VerticalBox {
-                                    width: 25%;
+                                    width: root.compact-width ? 23% : 25%;
                                     spacing: 5px;
                                     Text { text: "申购日 / 安全截止"; color: #94a3b8; font-size: 12px; }
                                     Text { text: task.date-and-cutoff; color: #f8fafc; font-weight: 600; }
@@ -415,11 +424,12 @@ export component MainWindow inherits Window {
                                     Text { text: task.updated; color: #94a3b8; font-size: 12px; }
                                 }
                                 VerticalBox {
-                                    width: 120px;
+                                    width: root.compact-width ? 96px : 120px;
                                     spacing: 6px;
-                                    ActionButton { label: "查看详情"; clicked => { root.select-task(task.event-id); } }
+                                    ActionButton { label: "查看详情"; compact: root.compact-width; clicked => { root.select-task(task.event-id); } }
                                     if task.can-acknowledge : ActionButton {
                                         label: task.confirm-label;
+                                        compact: root.compact-width;
                                         primary: true;
                                         clicked => {
                                             root.confirmation-is-revoke = false;
@@ -432,6 +442,7 @@ export component MainWindow inherits Window {
                                     }
                                     if task.can-revoke : ActionButton {
                                         label: "撤销确认";
+                                        compact: root.compact-width;
                                         danger: true;
                                         clicked => {
                                             root.confirmation-is-revoke = true;
@@ -466,26 +477,26 @@ export component MainWindow inherits Window {
                         font-size: 16px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
-                        height: 380px;
+                        height: root.compact-height ? 200px : 380px;
                     }
                     for task in root.future-tasks : Rectangle {
-                        height: task.warning == "" ? 132px : 158px;
+                        height: root.compact-width ? (task.warning == "" ? 156px : 184px) : (task.warning == "" ? 132px : 158px);
                         border-radius: 10px;
                         border-width: 1px;
                         border-color: task.needs-review ? #d97706 : #26334a;
                         background: #0f172a;
                         HorizontalBox {
-                            padding: 14px;
-                            spacing: 16px;
+                            padding: root.compact-width ? 10px : 14px;
+                            spacing: root.compact-width ? 8px : 16px;
                             VerticalBox {
-                                width: 30%;
+                                width: root.compact-width ? 27% : 30%;
                                 spacing: 5px;
-                                Text { text: task.name; color: #f8fafc; font-size: 20px; font-weight: 700; }
+                                Text { text: task.name; color: #f8fafc; font-size: root.compact-width ? 18px : 20px; font-weight: 700; wrap: word-wrap; }
                                 Text { text: task.market-and-codes; color: #93c5fd; wrap: word-wrap; }
                                 if task.warning != "" : Text { text: task.warning; color: #fbbf24; font-size: 12px; wrap: word-wrap; }
                             }
                             VerticalBox {
-                                width: 26%;
+                                width: root.compact-width ? 23% : 26%;
                                 spacing: 5px;
                                 Text { text: "申购日 / 安全截止"; color: #94a3b8; font-size: 12px; }
                                 Text { text: task.date-and-cutoff; color: #f8fafc; font-weight: 600; }
@@ -499,11 +510,12 @@ export component MainWindow inherits Window {
                                 Text { text: task.updated; color: #94a3b8; font-size: 12px; }
                             }
                             VerticalBox {
-                                width: 120px;
+                                width: root.compact-width ? 96px : 120px;
                                 spacing: 6px;
-                                ActionButton { label: "查看详情"; clicked => { root.select-task(task.event-id); } }
+                                ActionButton { label: "查看详情"; compact: root.compact-width; clicked => { root.select-task(task.event-id); } }
                                 if task.can-acknowledge : ActionButton {
                                     label: task.confirm-label;
+                                    compact: root.compact-width;
                                     primary: true;
                                     clicked => {
                                         root.confirmation-is-revoke = false;
@@ -516,6 +528,7 @@ export component MainWindow inherits Window {
                                 }
                                 if task.can-revoke : ActionButton {
                                     label: "撤销确认";
+                                    compact: root.compact-width;
                                     danger: true;
                                     clicked => {
                                         root.confirmation-is-revoke = true;
@@ -534,25 +547,25 @@ export component MainWindow inherits Window {
         }
 
         if root.active-page == 2 : VerticalBox {
-            spacing: 12px;
+            spacing: root.compact-layout ? 8px : 12px;
             Rectangle {
-                height: 124px;
+                height: root.compact-height ? 110px : 124px;
                 border-radius: 10px;
                 border-width: 1px;
                 border-color: #26334a;
                 background: #111b2e;
                 HorizontalBox {
-                    padding: 14px;
-                    spacing: 12px;
+                    padding: root.compact-layout ? 10px : 14px;
+                    spacing: root.compact-width ? 8px : 12px;
                     VerticalBox {
                         spacing: 6px;
                         horizontal-stretch: 1;
-                        Text { text: root.health-title; color: root.runtime-level == 2 ? #fca5a5 : root.runtime-level == 1 ? #86efac : #fcd34d; font-size: 21px; font-weight: 700; }
+                        Text { text: root.health-title; color: root.runtime-level == 2 ? #fca5a5 : root.runtime-level == 1 ? #86efac : #fcd34d; font-size: root.compact-width ? 19px : 21px; font-weight: 700; }
                         Text { text: root.health-summary; color: #e2e8f0; wrap: word-wrap; }
                         Text { text: root.heartbeat-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                         Text { text: root.clock-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                     }
-                    ActionButton { label: "刷新诊断"; clicked => { root.refresh-data(); } }
+                    ActionButton { label: "刷新诊断"; compact: root.compact-width; clicked => { root.refresh-data(); } }
                 }
             }
             Text { text: "数据源"; color: #f8fafc; font-size: 18px; font-weight: 600; }
@@ -567,7 +580,7 @@ export component MainWindow inherits Window {
                         padding: 10px;
                         spacing: 8px;
                         for source in root.source-health : Rectangle {
-                            height: source.error-text == "" ? 62px : 80px;
+                            height: root.compact-width ? (source.error-text == "" ? 68px : 90px) : (source.error-text == "" ? 62px : 80px);
                             border-radius: 8px;
                             border-width: 1px;
                             border-color: source.state-level == 1 ? #26334a : #d97706;
@@ -576,10 +589,10 @@ export component MainWindow inherits Window {
                                 padding: 10px;
                                 spacing: 3px;
                                 HorizontalBox {
-                                    spacing: 12px;
-                                    Text { text: source.source; color: #f8fafc; font-weight: 600; width: 180px; }
-                                    Text { text: source.state; color: source.state-level == 1 ? #86efac : source.state-level == 2 ? #fcd34d : #fca5a5; width: 110px; }
-                                    Text { text: source.record-text; color: #94a3b8; width: 120px; }
+                                    spacing: root.compact-width ? 8px : 12px;
+                                    Text { text: source.source; color: #f8fafc; font-weight: 600; width: root.compact-width ? 140px : 180px; wrap: word-wrap; }
+                                    Text { text: source.state; color: source.state-level == 1 ? #86efac : source.state-level == 2 ? #fcd34d : #fca5a5; width: root.compact-width ? 90px : 110px; wrap: word-wrap; }
+                                    Text { text: source.record-text; color: #94a3b8; width: root.compact-width ? 100px : 120px; wrap: word-wrap; }
                                     Text { text: source.last-success-text; color: #94a3b8; horizontal-stretch: 1; wrap: word-wrap; }
                                 }
                                 if source.error-text != "" : Text { text: source.error-text; color: #fca5a5; font-size: 12px; overflow: elide; }
@@ -589,21 +602,21 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle {
-                height: 104px;
+                height: root.compact-height ? 100px : 104px;
                 border-radius: 10px;
                 border-width: 1px;
                 border-color: #26334a;
                 background: #111b2e;
                 VerticalBox {
-                    padding: 12px;
-                    spacing: 7px;
+                    padding: root.compact-layout ? 10px : 12px;
+                    spacing: root.compact-layout ? 5px : 7px;
                     Text { text: "本地诊断"; color: #f8fafc; font-size: 17px; font-weight: 600; }
                     Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
                     HorizontalBox {
-                        spacing: 8px;
-                        ActionButton { label: "打开数据目录"; clicked => { root.open-data-folder(); } }
-                        ActionButton { label: "复制诊断摘要"; clicked => { root.copy-diagnostics(); } }
-                        ActionButton { label: "导出脱敏诊断包"; clicked => { root.create-diagnostics(); } }
+                        spacing: root.compact-width ? 6px : 8px;
+                        ActionButton { label: "打开数据目录"; compact: root.compact-width; clicked => { root.open-data-folder(); } }
+                        ActionButton { label: "复制诊断摘要"; compact: root.compact-width; clicked => { root.copy-diagnostics(); } }
+                        ActionButton { label: "导出脱敏诊断包"; compact: root.compact-width; clicked => { root.create-diagnostics(); } }
                         Rectangle { horizontal-stretch: 1; }
                     }
                 }
@@ -618,8 +631,8 @@ export component MainWindow inherits Window {
             background: #111b2e;
             ScrollView {
                 VerticalBox {
-                    padding: 14px;
-                    spacing: 12px;
+                    padding: root.compact-layout ? 10px : 14px;
+                    spacing: root.compact-layout ? 10px : 12px;
                     if !root.onboarding-completed : Rectangle {
                         min-height: 62px;
                         max-height: 62px;
@@ -655,8 +668,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        min-height: 176px;
-                        max-height: 176px;
+                        min-height: root.compact-width ? 264px : 188px;
+                        max-height: root.compact-width ? 264px : 188px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -665,13 +678,26 @@ export component MainWindow inherits Window {
                             padding: 12px;
                             spacing: 8px;
                             Text { text: "券商受理与安全截止"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: "时间格式 HH:mm。安全截止应在 13:00–15:00，建议保留几分钟券商处理余量。"; color: #94a3b8; font-size: 12px; }
-                            HorizontalBox {
+                            Text { text: "时间格式 HH:mm。安全截止应在 13:00–15:00，建议保留几分钟券商处理余量。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                            if !root.compact-width : HorizontalBox {
                                 spacing: 12px;
                                 LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
                                 LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
                                 LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
                                 LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                            }
+                            if root.compact-width : VerticalBox {
+                                spacing: 8px;
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
+                                    LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
+                                }
+                                HorizontalBox {
+                                    spacing: 10px;
+                                    LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
+                                    LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                                }
                             }
                             Toggle { label: "我的券商支持北交所开盘前预约申购"; checked <=> root.beijing-reservation; }
                         }
@@ -700,7 +726,7 @@ export component MainWindow inherits Window {
                             }
                             HorizontalBox {
                                 spacing: 10px;
-                                ActionButton { label: "测试所有提醒通道"; clicked => { root.test-notifications(); } }
+                                ActionButton { label: "测试所有提醒通道"; compact: root.compact-width; clicked => { root.test-notifications(); } }
                                 Text { text: root.notification-test-status; color: root.notification-test-completed ? #86efac : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
                             }
                         }
@@ -730,9 +756,10 @@ export component MainWindow inherits Window {
                     HorizontalBox {
                         spacing: 8px;
                         Rectangle { horizontal-stretch: 1; }
-                        ActionButton { label: "保存设置"; primary: true; clicked => { root.save-settings(); } }
+                        ActionButton { label: "保存设置"; compact: root.compact-width; primary: true; clicked => { root.save-settings(); } }
                         ActionButton {
                             label: "安全退出";
+                            compact: root.compact-width;
                             danger: true;
                             clicked => {
                                 if (root.pending-count > 0) {
@@ -747,7 +774,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        Text {
+        if !root.compact-height : Text {
             text: "本程序只记录你的人工确认，不连接券商、不自动下单，也无法验证券商委托是否成功。";
             color: #94a3b8;
             font-size: 12px;
@@ -757,8 +784,8 @@ export component MainWindow inherits Window {
     if root.show-details : Rectangle {
         background: #aa020617;
         Rectangle {
-            width: parent.width > 1040px ? 960px : parent.width - 40px;
-            height: parent.height > 720px ? 680px : parent.height - 30px;
+            width: parent.width > 1040px ? 960px : parent.width - (root.compact-width ? 24px : 40px);
+            height: parent.height > 720px ? 680px : parent.height - (root.compact-height ? 16px : 30px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 12px;
@@ -766,32 +793,32 @@ export component MainWindow inherits Window {
             border-color: #3b82f6;
             background: #111b2e;
             VerticalBox {
-                padding: 18px;
-                spacing: 10px;
+                padding: root.compact-layout ? 12px : 18px;
+                spacing: root.compact-layout ? 8px : 10px;
                 HorizontalBox {
                     VerticalBox {
                         horizontal-stretch: 1;
                         spacing: 4px;
-                        Text { text: root.selected-title; color: #f8fafc; font-size: 22px; font-weight: 700; wrap: word-wrap; }
+                        Text { text: root.selected-title; color: #f8fafc; font-size: root.compact-width ? 20px : 22px; font-weight: 700; wrap: word-wrap; }
                         Text { text: root.selected-summary; color: #93c5fd; font-size: 12px; wrap: word-wrap; }
                         if root.selected-warning != "" : Text { text: root.selected-warning; color: #fcd34d; font-size: 12px; wrap: word-wrap; }
                     }
                     Rectangle {
-                        width: 126px;
+                        width: root.compact-width ? 110px : 126px;
                         height: 34px;
                         border-radius: 7px;
                         background: root.selected-quality-alert ? #9a3412 : #166534;
                         Text { text: root.selected-quality; color: white; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                     }
-                    ActionButton { label: "关闭"; clicked => { root.show-details = false; } }
+                    ActionButton { label: "关闭"; compact: root.compact-width; clicked => { root.show-details = false; } }
                 }
                 HorizontalBox {
-                    height: 40px;
+                    height: root.compact-width ? 38px : 40px;
                     spacing: 6px;
-                    NavButton { label: "任务摘要"; selected: root.details-active-tab == 0; clicked => { root.details-active-tab = 0; } }
-                    NavButton { label: "字段来源"; selected: root.details-active-tab == 1; clicked => { root.details-active-tab = 1; } }
-                    NavButton { label: "正式公告"; selected: root.details-active-tab == 2; clicked => { root.details-active-tab = 2; } }
-                    NavButton { label: "人工核验与覆盖"; selected: root.details-active-tab == 3; clicked => { root.details-active-tab = 3; } }
+                    NavButton { label: "任务摘要"; compact: root.compact-width; selected: root.details-active-tab == 0; clicked => { root.details-active-tab = 0; } }
+                    NavButton { label: "字段来源"; compact: root.compact-width; selected: root.details-active-tab == 1; clicked => { root.details-active-tab = 1; } }
+                    NavButton { label: "正式公告"; compact: root.compact-width; selected: root.details-active-tab == 2; clicked => { root.details-active-tab = 2; } }
+                    NavButton { label: "人工核验与覆盖"; compact: root.compact-width; selected: root.details-active-tab == 3; clicked => { root.details-active-tab = 3; } }
                 }
 
                 if root.details-active-tab == 0 : Rectangle {
@@ -811,18 +838,18 @@ export component MainWindow inherits Window {
                             spacing: 7px;
                             if root.field-source-rows.length == 0 : Text { text: "尚无可显示的字段来源记录。"; color: #94a3b8; horizontal-alignment: center; height: 300px; vertical-alignment: center; }
                             for source in root.field-source-rows : Rectangle {
-                                height: 70px;
+                                height: root.compact-width ? 86px : 70px;
                                 border-radius: 8px;
                                 border-width: 1px;
                                 border-color: #26334a;
                                 background: #111b2e;
                                 HorizontalBox {
-                                    padding: 10px;
-                                    spacing: 12px;
-                                    Text { text: source.field-name; color: #f8fafc; font-weight: 600; width: 112px; wrap: word-wrap; }
-                                    Text { text: source.normalized-value; color: #e2e8f0; width: 155px; wrap: word-wrap; }
-                                    Text { text: source.source-text; color: #93c5fd; width: 170px; wrap: word-wrap; }
-                                    Text { text: source.fetched-text; color: #94a3b8; width: 140px; wrap: word-wrap; }
+                                    padding: root.compact-width ? 8px : 10px;
+                                    spacing: root.compact-width ? 8px : 12px;
+                                    Text { text: source.field-name; color: #f8fafc; font-weight: 600; width: root.compact-width ? 86px : 112px; wrap: word-wrap; }
+                                    Text { text: source.normalized-value; color: #e2e8f0; width: root.compact-width ? 118px : 155px; wrap: word-wrap; }
+                                    Text { text: source.source-text; color: #93c5fd; width: root.compact-width ? 132px : 170px; wrap: word-wrap; }
+                                    Text { text: source.fetched-text; color: #94a3b8; width: root.compact-width ? 105px : 140px; wrap: word-wrap; }
                                     Text { text: source.raw-value; color: #cbd5e1; horizontal-stretch: 1; wrap: word-wrap; }
                                 }
                             }
@@ -856,10 +883,10 @@ export component MainWindow inherits Window {
                                         Text { text: announcement.evidence; color: #cbd5e1; font-size: 12px; wrap: word-wrap; }
                                     }
                                     VerticalBox {
-                                        width: 120px;
+                                        width: root.compact-width ? 96px : 120px;
                                         spacing: 7px;
-                                        ActionButton { label: "打开原文"; clicked => { root.open-external(announcement.source-url); } }
-                                        ActionButton { label: "打开本地文件"; enabled: announcement.local-available; clicked => { root.open-local(announcement.local-path); } }
+                                        ActionButton { label: "打开原文"; compact: root.compact-width; clicked => { root.open-external(announcement.source-url); } }
+                                        ActionButton { label: "打开本地文件"; compact: root.compact-width; enabled: announcement.local-available; clicked => { root.open-local(announcement.local-path); } }
                                     }
                                 }
                             }
@@ -873,17 +900,17 @@ export component MainWindow inherits Window {
                     background: #0f172a;
                     ScrollView {
                         VerticalBox {
-                            padding: 12px;
-                            spacing: 9px;
+                            padding: root.compact-layout ? 9px : 12px;
+                            spacing: root.compact-layout ? 8px : 9px;
                             Rectangle {
-                                height: 60px;
+                                height: root.compact-width ? 76px : 60px;
                                 border-radius: 8px;
                                 border-width: 1px;
                                 border-color: #d97706;
                                 background: #3a2510;
                                 Text { text: "仅在核对正式公告后使用。人工覆盖会记录字段、值、理由、依据公告和当前发行版本；外部关键数据形成新版本后不会沿用旧覆盖。"; color: #fcd34d; wrap: word-wrap; x: 10px; width: parent.width - 20px; vertical-alignment: center; }
                             }
-                            HorizontalBox {
+                            if !root.compact-width : HorizontalBox {
                                 spacing: 8px;
                                 VerticalBox {
                                     spacing: 4px;
@@ -903,11 +930,38 @@ export component MainWindow inherits Window {
                                     ComboBox { model: root.announcement-choices; current-index <=> root.override-announcement-index; }
                                 }
                             }
+                            if root.compact-width : VerticalBox {
+                                spacing: 8px;
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    VerticalBox {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+                                        Text { text: "覆盖字段"; color: #94a3b8; font-size: 12px; }
+                                        ComboBox {
+                                            model: ["申购代码", "申购日期", "发行价格", "申购上限（股）", "申购单位（股）", "官方申购时段", "发行状态"];
+                                            current-index <=> root.override-field-index;
+                                        }
+                                    }
+                                    VerticalBox {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+                                        Text { text: "依据公告（可选）"; color: #94a3b8; font-size: 12px; }
+                                        ComboBox { model: root.announcement-choices; current-index <=> root.override-announcement-index; }
+                                    }
+                                }
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    LabeledInput { label: "覆盖值"; value <=> root.override-value; horizontal-stretch: 1; }
+                                    LabeledInput { label: "核验理由"; value <=> root.override-reason; horizontal-stretch: 1; }
+                                }
+                            }
                             HorizontalBox {
                                 spacing: 8px;
                                 Text { text: root.override-status; color: #94a3b8; horizontal-stretch: 1; wrap: word-wrap; }
                                 ActionButton {
                                     label: "保存人工覆盖";
+                                    compact: root.compact-width;
                                     primary: true;
                                     enabled: root.selected-event-id != "" && root.override-value != "" && root.override-reason != "";
                                     clicked => {
@@ -921,7 +975,7 @@ export component MainWindow inherits Window {
                             Text { text: "当前版本的人工覆盖记录"; color: #f8fafc; font-size: 16px; font-weight: 600; }
                             if root.override-rows.length == 0 : Text { text: "当前版本尚无人工覆盖记录。"; color: #94a3b8; }
                             for entry in root.override-rows : Rectangle {
-                                height: 76px;
+                                height: root.compact-width ? 88px : 76px;
                                 border-radius: 8px;
                                 border-width: 1px;
                                 border-color: #26334a;
@@ -937,6 +991,7 @@ export component MainWindow inherits Window {
                                     }
                                     ActionButton {
                                         label: "撤销覆盖";
+                                        compact: root.compact-width;
                                         danger: true;
                                         enabled: entry.can-revoke;
                                         clicked => {

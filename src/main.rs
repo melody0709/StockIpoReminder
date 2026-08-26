@@ -142,6 +142,7 @@ fn main() -> Result<()> {
         let icon_window = ui.as_weak();
         Timer::single_shot(Duration::from_millis(50), move || {
             if let Some(window) = icon_window.upgrade() {
+                let _ = windows_integration::fit_window_to_work_area(window.window());
                 let _ = windows_integration::install_window_icon(window.window());
             }
         });

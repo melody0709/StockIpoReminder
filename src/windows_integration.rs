@@ -16,7 +16,10 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError,
-            GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, WPARAM,
+            GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, RECT, WPARAM,
+        },
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
         },
         Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW},
         System::{
@@ -34,8 +37,9 @@ use windows::{
         UI::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, HICON, ICON_BIG,
-                ICON_SMALL, LoadIconW, MB_ICONEXCLAMATION, SW_SHOWNORMAL, SendMessageW, WM_SETICON,
+                FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GetClientRect,
+                GetWindowRect, HICON, ICON_BIG, ICON_SMALL, LoadIconW, MB_ICONEXCLAMATION,
+                SW_SHOWNORMAL, SendMessageW, WM_SETICON,
             },
         },
     },
@@ -146,6 +150,73 @@ pub fn install_window_icon(window: &slint::Window) -> Result<()> {
         let _ = window;
         Ok(())
     }
+}
+
+pub fn fit_window_to_work_area(window: &slint::Window) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = handle.window_handle().context("无法读取主窗口句柄")?;
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            bail!("当前主窗口不是 Win32 窗口");
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut monitor_info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            bail!("无法读取主窗口所在显示器的工作区");
+        }
+
+        let mut window_rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut window_rect) }.context("无法读取主窗口外框")?;
+        let mut client_rect = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut client_rect) }.context("无法读取主窗口客户区")?;
+
+        let work_width = (monitor_info.rcWork.right - monitor_info.rcWork.left).max(1);
+        let work_height = (monitor_info.rcWork.bottom - monitor_info.rcWork.top).max(1);
+        let outer_width = (window_rect.right - window_rect.left).max(1);
+        let outer_height = (window_rect.bottom - window_rect.top).max(1);
+        let client_width = (client_rect.right - client_rect.left).max(1);
+        let client_height = (client_rect.bottom - client_rect.top).max(1);
+        let frame_width = (outer_width - client_width).max(0);
+        let frame_height = (outer_height - client_height).max(0);
+        let margin = (8.0 * window.scale_factor()).round().max(1.0) as i32;
+        let available_width = (work_width - frame_width - margin * 2).max(1) as u32;
+        let available_height = (work_height - frame_height - margin * 2).max(1) as u32;
+        let current_size = window.size();
+        let scale_factor = window.scale_factor();
+        let minimum_width = (760.0 * scale_factor).round().max(1.0) as u32;
+        let minimum_height = (460.0 * scale_factor).round().max(1.0) as u32;
+        let target_width =
+            clamp_window_dimension(current_size.width, minimum_width, available_width);
+        let target_height =
+            clamp_window_dimension(current_size.height, minimum_height, available_height);
+
+        if target_width != current_size.width || target_height != current_size.height {
+            window.set_size(slint::PhysicalSize::new(target_width, target_height));
+        }
+
+        let target_outer_width = target_width as i32 + frame_width;
+        let target_outer_height = target_height as i32 + frame_height;
+        let x = monitor_info.rcWork.left + (work_width - target_outer_width).max(0) / 2;
+        let y = monitor_info.rcWork.top + (work_height - target_outer_height).max(0) / 2;
+        window.set_position(slint::PhysicalPosition::new(x, y));
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Ok(())
+    }
+}
+
+fn clamp_window_dimension(current: u32, minimum: u32, available: u32) -> u32 {
+    current.min(available).max(minimum.min(available))
 }
 
 pub fn open_folder(path: &Path) -> Result<()> {
