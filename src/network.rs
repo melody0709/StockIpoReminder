@@ -330,7 +330,6 @@ pub fn parse_eastmoney(raw: &str, fetched: ChinaDateTime) -> Result<Vec<Candidat
                 status,
                 announcement_url: None,
                 sessions: vec![],
-                announcement_derived: false,
             })
         })
         .collect())
@@ -376,7 +375,6 @@ pub fn parse_sse(raw: &str, fetched: ChinaDateTime) -> Result<Vec<Candidate>> {
                 },
                 announcement_url: text(item, "ANNOUNCEMENT_URL"),
                 sessions: vec![],
-                announcement_derived: false,
             })
         })
         .collect())
@@ -421,7 +419,6 @@ pub fn parse_cninfo(raw: &str, fetched: ChinaDateTime) -> Result<Vec<Candidate>>
                 status: status_from_dates(apply_date, today, false, false),
                 announcement_url: None,
                 sessions: vec![],
-                announcement_derived: false,
             })
         })
         .collect())
@@ -489,7 +486,6 @@ fn parse_bse_page_with_meta(raw: &str, fetched: ChinaDateTime) -> Result<BsePage
                     format!("https://www.bseinfo.net/newshare/listofissues_detail.html?id={id}")
                 }),
                 sessions: vec![],
-                announcement_derived: false,
             })
         })
         .collect();

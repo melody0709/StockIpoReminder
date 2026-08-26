@@ -125,7 +125,6 @@ pub struct Candidate {
     pub status: IssueStatus,
     pub announcement_url: Option<String>,
     pub sessions: Vec<SubscriptionSession>,
-    pub announcement_derived: bool,
 }
 
 impl Candidate {

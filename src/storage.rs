@@ -3187,7 +3187,6 @@ mod tests {
             status: IssueStatus::Active,
             announcement_url: Some("https://example.com/announcement.pdf".into()),
             sessions: Vec::new(),
-            announcement_derived: false,
         };
         test.database
             .replace_field_sources(&event.id, &[candidate])

@@ -1,35 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::Path,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, TimeZone, Utc};
-use regex::Regex;
-use reqwest::{blocking::Client, header::CONTENT_TYPE};
-use serde::{Deserialize, Serialize};
+use reqwest::blocking::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use uuid::Uuid;
-
-#[cfg(windows)]
-use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE},
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
-    },
-};
 
 use crate::{
     core::{at, china_offset, now_china, parse_date, sha256},
@@ -37,186 +16,7 @@ use crate::{
     network::{checked_response, encode_query, ensure_allowed, text},
 };
 
-pub const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024;
-pub const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
-const DOWNLOAD_PREFIX_BYTES: usize = 4 * 1024;
-pub const MAX_PDF_PAGES: usize = 20;
-pub const MAX_EXTRACTED_CHARACTERS: usize = 256_000;
-pub const PDF_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
-pub const PDF_WORKER_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
-const PARSER_VERSION: &str = "rust-announcement-v1";
-
-#[cfg(windows)]
-struct PdfWorkerJob(HANDLE);
-
-#[cfg(windows)]
-impl Drop for PdfWorkerJob {
-    fn drop(&mut self) {
-        // SAFETY: this type owns the handle returned by CreateJobObjectW.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PdfWorkerRequest {
-    input_path: PathBuf,
-    max_pages: usize,
-    max_characters: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PdfWorkerResponse {
-    success: bool,
-    text: String,
-    text_hash: Option<String>,
-    page_count: usize,
-    failed_page_count: usize,
-    truncated: bool,
-    error: Option<String>,
-}
-
-pub fn try_run_pdf_worker(arguments: &[String]) -> Result<Option<i32>> {
-    let Some(request_path) = argument_value(arguments, "--pdf-worker-request") else {
-        return Ok(None);
-    };
-    let response_path = argument_value(arguments, "--pdf-worker-response")
-        .context("PDF Worker 缺少 --pdf-worker-response")?;
-    let response = match (|| -> Result<PdfWorkerResponse> {
-        let request: PdfWorkerRequest = serde_json::from_slice(&fs::read(&request_path)?)?;
-        if request.max_pages == 0
-            || request.max_pages > MAX_PDF_PAGES
-            || request.max_characters == 0
-            || request.max_characters > MAX_EXTRACTED_CHARACTERS
-        {
-            bail!("PDF Worker 参数超出允许范围");
-        }
-        let metadata = fs::metadata(&request.input_path)
-            .with_context(|| format!("无法读取 PDF 元数据：{}", request.input_path.display()))?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_DOWNLOAD_BYTES {
-            bail!("PDF Worker 输入文件为空、不是普通文件或超过 32 MiB 上限");
-        }
-        extract_pdf_text(&request)
-    })() {
-        Ok(response) => response,
-        Err(error) => PdfWorkerResponse {
-            success: false,
-            text: String::new(),
-            text_hash: None,
-            page_count: 0,
-            failed_page_count: 0,
-            truncated: false,
-            error: Some(format!("{error:#}")),
-        },
-    };
-    let temporary = response_path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
-    fs::write(&temporary, serde_json::to_vec(&response)?)?;
-    fs::rename(&temporary, &response_path)?;
-    Ok(Some(if response.success { 0 } else { 2 }))
-}
-
-fn argument_value(arguments: &[String], name: &str) -> Option<PathBuf> {
-    arguments
-        .windows(2)
-        .find(|pair| pair[0] == name)
-        .map(|pair| PathBuf::from(&pair[1]))
-}
-
-fn extract_pdf_text(request: &PdfWorkerRequest) -> Result<PdfWorkerResponse> {
-    let document = lopdf::Document::load_filtered(&request.input_path, pdf_text_object_filter)
-        .with_context(|| format!("无法打开 PDF：{}", request.input_path.display()))?;
-    let all_pages = document.get_pages();
-    let pages: Vec<u32> = all_pages.keys().copied().take(request.max_pages).collect();
-    let page_count = all_pages.len();
-    let mut combined = String::new();
-    let mut remaining_characters = request.max_characters;
-    let mut failed_page_count = 0usize;
-    let mut character_truncated = false;
-    for page in &pages {
-        let page_text = match document.extract_text(&[*page]) {
-            Ok(value) => value,
-            Err(_) => {
-                failed_page_count += 1;
-                continue;
-            }
-        };
-        character_truncated |=
-            append_limited_characters(&mut combined, &page_text, &mut remaining_characters);
-        if remaining_characters > 0 {
-            combined.push('\n');
-            remaining_characters -= 1;
-        } else if pages.last() != Some(page) {
-            character_truncated = true;
-        }
-        if character_truncated {
-            break;
-        }
-    }
-    if combined.trim().is_empty() && failed_page_count == pages.len() && !pages.is_empty() {
-        bail!("PDF 前 {} 页均无法提取文本", pages.len());
-    }
-    drop(document);
-    let truncated = character_truncated || page_count > request.max_pages;
-    let text_hash = (!combined.trim().is_empty()).then(|| sha256(combined.as_bytes()));
-    Ok(PdfWorkerResponse {
-        success: true,
-        text: combined,
-        text_hash,
-        page_count,
-        failed_page_count,
-        truncated,
-        error: None,
-    })
-}
-
-fn pdf_text_object_filter(
-    object_id: (u32, u16),
-    object: &mut lopdf::Object,
-) -> Option<((u32, u16), lopdf::Object)> {
-    const IGNORED_TYPES: &[&[u8]] = &[b"Image", b"FontDescriptor", b"ExtGState", b"Annot"];
-    if IGNORED_TYPES.contains(&object.type_name().unwrap_or_default()) {
-        return None;
-    }
-    if let Ok(dictionary) = object.as_dict_mut() {
-        if dictionary
-            .get(b"Subtype")
-            .ok()
-            .and_then(|value| value.as_name().ok())
-            .is_some_and(|value| value == b"Image")
-        {
-            return None;
-        }
-        dictionary.remove(b"Producer");
-        dictionary.remove(b"ModDate");
-        dictionary.remove(b"Creator");
-        dictionary.remove(b"ProcSet");
-        dictionary.remove(b"Procset");
-        dictionary.remove(b"Annots");
-        if dictionary.is_empty() {
-            return None;
-        }
-    }
-    // lopdf ignores the callback's returned object for ordinary indirect objects,
-    // but uses it for objects unpacked from an object stream. PDF object streams
-    // cannot themselves contain stream objects, so avoid cloning potentially large
-    // page/content streams while still returning full values for packed dictionaries.
-    if matches!(object, lopdf::Object::Stream(_)) {
-        return Some((object_id, lopdf::Object::Null));
-    }
-    Some((object_id, object.to_owned()))
-}
-
-fn append_limited_characters(target: &mut String, value: &str, remaining: &mut usize) -> bool {
-    let mut characters = value.chars();
-    let mut appended = 0usize;
-    for character in characters.by_ref().take(*remaining) {
-        target.push(character);
-        appended += 1;
-    }
-    *remaining = remaining.saturating_sub(appended);
-    characters.next().is_some()
-}
+const METADATA_VERSION: &str = "announcement-metadata-v1";
 
 #[derive(Debug)]
 pub struct SearchOutput {
@@ -839,512 +639,32 @@ fn announcement_type(title: &str) -> String {
     .to_owned()
 }
 
-pub fn download_and_parse(
-    client: &Client,
-    data_root: &Path,
-    event: &IpoEvent,
-    reference: AnnouncementRef,
-) -> Result<(AnnouncementDocument, Option<Candidate>)> {
-    ensure_allowed(&reference.url, true)?;
-    let temporary_directory = data_root.join("temp");
-    fs::create_dir_all(&temporary_directory)?;
-    let operation_id = Uuid::new_v4().simple().to_string();
-    let temporary_path = temporary_directory.join(format!("{operation_id}.download"));
-    let mut request = client.get(&reference.url);
-    if let Some(referer) = announcement_referer(&reference.url) {
-        request = request.header("Referer", referer);
-    }
-    let mut response = checked_response(request.send()?, true)?;
-    let final_host = response.url().host_str().unwrap_or_default().to_owned();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES)
-    {
-        bail!("公告文件超过 32MiB 上限");
-    }
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut target = File::create(&temporary_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; DOWNLOAD_BUFFER_BYTES];
-    let mut prefix = Vec::with_capacity(DOWNLOAD_PREFIX_BYTES);
-    let mut length = 0u64;
-    loop {
-        let count = response.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        length += count as u64;
-        if length > MAX_DOWNLOAD_BYTES {
-            let _ = fs::remove_file(&temporary_path);
-            bail!("公告下载超过 32MiB 上限");
-        }
-        if prefix.len() < DOWNLOAD_PREFIX_BYTES {
-            prefix.extend_from_slice(&buffer[..count.min(DOWNLOAD_PREFIX_BYTES - prefix.len())]);
-        }
-        hasher.update(&buffer[..count]);
-        target.write_all(&buffer[..count])?;
-    }
-    target.flush()?;
-    drop(target);
-    let file_hash = hex::encode(hasher.finalize());
-    if let Err(error) = validate_pdf_download(&prefix, &content_type, length, &final_host) {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(error);
-    }
-    let directory = data_root
-        .join("announcements")
-        .join(sanitize(&reference.provider))
-        .join(sanitize(&event.id));
-    fs::create_dir_all(&directory)?;
-    let local_path = directory.join(format!(
-        "{}-{}.pdf",
-        sanitize(&reference.announcement_id),
-        &file_hash[..16]
-    ));
-    if local_path.exists() {
-        fs::remove_file(&temporary_path)?;
-    } else {
-        fs::rename(&temporary_path, &local_path)?;
-    }
-
-    let response = extract_pdf_in_worker(data_root, &local_path)?;
-    if !response.success {
-        bail!("PDF Worker 失败：{}", response.error.unwrap_or_default());
-    }
-    let (extracted_text, text_hash, truncated, failed_page_count) = (
-        response.text,
-        response.text_hash,
-        response.truncated,
-        response.failed_page_count,
+pub fn metadata_document(event: &IpoEvent, reference: AnnouncementRef) -> AnnouncementDocument {
+    let identity_hash = sha256(
+        format!(
+            "{}|{}|{}",
+            reference.provider, reference.announcement_id, reference.url
+        )
+        .as_bytes(),
     );
-    let fields = parse_fields(&extracted_text, &reference.title)?;
-    let status = if extracted_text.trim().is_empty() {
-        ExtractionStatus::Failed
-    } else if fields.iter().any(|field| field.confidence >= 0.90) {
-        ExtractionStatus::Extracted
-    } else {
-        ExtractionStatus::LowConfidence
-    };
-    let document = AnnouncementDocument {
-        id: Uuid::new_v4().simple().to_string(),
+    AnnouncementDocument {
+        id: format!("metadata-{}", &identity_hash[..32]),
         event_id: event.id.clone(),
-        reference: reference.clone(),
-        local_path: local_path.to_string_lossy().into_owned(),
-        file_hash,
-        text_hash,
-        status,
-        parser_version: format!(
-            "{PARSER_VERSION}{}{}",
-            if truncated { "+truncated" } else { "" },
-            if failed_page_count > 0 {
-                "+partial"
-            } else {
-                ""
-            }
-        ),
-        fields,
+        reference,
+        local_path: String::new(),
+        file_hash: identity_hash,
+        text_hash: None,
+        status: ExtractionStatus::Unsupported,
+        parser_version: METADATA_VERSION.into(),
+        fields: Vec::new(),
         downloaded_at: now_china(),
-    };
-    let candidate = candidate_from_document(event, &document);
-    Ok((document, candidate))
-}
-
-fn announcement_referer(url: &str) -> Option<&'static str> {
-    match url::Url::parse(url).ok()?.host_str()? {
-        "www.sse.com.cn" | "static.sse.com.cn" => Some("https://www.sse.com.cn/"),
-        "www.cninfo.com.cn" | "static.cninfo.com.cn" | "disc.static.szse.cn" => {
-            Some("https://www.cninfo.com.cn/new/index")
-        }
-        "www.bseinfo.net" | "bseinfo.net" | "www.bse.cn" | "bse.cn" => {
-            Some("https://www.bseinfo.net/disclosure/")
-        }
-        _ => None,
     }
-}
-
-fn validate_pdf_download(prefix: &[u8], content_type: &str, length: u64, host: &str) -> Result<()> {
-    if prefix.starts_with(b"%PDF-") {
-        return Ok(());
-    }
-    let prefix_text = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    let looks_html = content_type.contains("html") || prefix_text.contains("<html");
-    let challenge = prefix_text.contains("acw_sc__v2")
-        || prefix_text.contains("document.location.reload")
-        || prefix_text.contains("var arg1=");
-    if looks_html && challenge {
-        bail!(
-            "公告下载遭遇上游 JavaScript 验证页：host={host}；contentType={content_type}；length={length}；未保存为公告证据"
-        );
-    }
-    if looks_html {
-        bail!(
-            "公告下载结果不是有效 PDF：host={host}；contentType={content_type}；length={length}；返回 HTML/WAF 页面"
-        );
-    }
-    if content_type.contains("pdf") {
-        bail!(
-            "公告响应声明为 PDF，但缺少 PDF 签名：host={host}；contentType={content_type}；length={length}"
-        );
-    }
-    bail!(
-        "公告下载结果不是有效 PDF：host={host}；contentType={content_type}；length={length}；缺少 %PDF- 文件签名"
-    )
-}
-
-fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorkerResponse> {
-    let directory = data_root.join("temp");
-    fs::create_dir_all(&directory)?;
-    let operation = Uuid::new_v4().simple().to_string();
-    let request_path = directory.join(format!("{operation}.worker-request.json"));
-    let response_path = directory.join(format!("{operation}.worker-response.json"));
-    fs::write(
-        &request_path,
-        serde_json::to_vec(&PdfWorkerRequest {
-            input_path: input_path.to_owned(),
-            max_pages: MAX_PDF_PAGES,
-            max_characters: MAX_EXTRACTED_CHARACTERS,
-        })?,
-    )?;
-    let executable = std::env::current_exe()?;
-    let mut child = Command::new(executable)
-        .args([
-            "--pdf-worker-request",
-            request_path.to_string_lossy().as_ref(),
-            "--pdf-worker-response",
-            response_path.to_string_lossy().as_ref(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let _worker_job = match constrain_pdf_worker(&child) {
-        Ok(job) => job,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            cleanup_worker_files(&request_path, &response_path);
-            return Err(error);
-        }
-    };
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= PDF_WORKER_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            cleanup_worker_files(&request_path, &response_path);
-            bail!("PDF Worker 超过 60 秒超时");
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let response = fs::read(&response_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PdfWorkerResponse>(&bytes).ok());
-    cleanup_worker_files(&request_path, &response_path);
-    let response = response.with_context(|| {
-        format!("PDF Worker 未生成有效响应（退出状态 {status}；可能崩溃或触发 512 MiB 内存上限）")
-    })?;
-    if !status.success() || !response.success {
-        bail!(
-            "PDF Worker 失败：{}",
-            response.error.clone().unwrap_or_default()
-        );
-    }
-    Ok(response)
-}
-
-#[cfg(windows)]
-fn constrain_pdf_worker(child: &Child) -> Result<PdfWorkerJob> {
-    // SAFETY: the returned handle is owned by PdfWorkerJob; all pointers below
-    // reference initialized values for the duration of each Windows API call.
-    unsafe {
-        let job = CreateJobObjectW(None, None)?;
-        let owned_job = PdfWorkerJob(job);
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT(
-            JOB_OBJECT_LIMIT_PROCESS_MEMORY.0 | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0,
-        );
-        limits.ProcessMemoryLimit = PDF_WORKER_MEMORY_LIMIT_BYTES;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            std::ptr::from_ref(&limits).cast(),
-            std::mem::size_of_val(&limits) as u32,
-        )?;
-        AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()))?;
-        Ok(owned_job)
-    }
-}
-
-fn cleanup_worker_files(request: &Path, response: &Path) {
-    let _ = fs::remove_file(request);
-    let _ = fs::remove_file(response);
-}
-
-pub fn parse_fields(text_value: &str, title: &str) -> Result<Vec<ParsedField>> {
-    let compact = Regex::new(r"\s+")?.replace_all(text_value, " ");
-    let mut fields = Vec::new();
-    capture(
-        &mut fields,
-        &compact,
-        "SecurityCode",
-        r"证券代码\s*[:：]?\s*(\d{6})",
-        0.99,
-        |v| Some(v.to_owned()),
-    )?;
-    capture(
-        &mut fields,
-        &compact,
-        "ApplyCode",
-        r"申购代码\s*[:：]?\s*(\d{6})",
-        0.99,
-        |v| Some(v.to_owned()),
-    )?;
-    capture(
-        &mut fields,
-        &compact,
-        "IssuePrice",
-        r"(?:发行价格|发行价)(?:为)?\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)\s*元",
-        0.98,
-        |v| v.parse::<f64>().ok().map(|n| n.to_string()),
-    )?;
-    capture(
-        &mut fields,
-        &compact,
-        "LotSize",
-        r"每(?:一|个)申购单位(?:为|是)?\s*(\d+)\s*股",
-        0.95,
-        |v| v.parse::<i64>().ok().map(|n| n.to_string()),
-    )?;
-    capture(
-        &mut fields,
-        &compact,
-        "MaxApplyQuantity",
-        r"(?:申购上限|最多可申购|不超过)[^。；]{0,40}?([0-9]+(?:\.[0-9]+)?)\s*(万)?股",
-        0.92,
-        |v| {
-            let mut parts = v.split('|');
-            let number = parts.next()?.parse::<f64>().ok()?;
-            Some(
-                (number
-                    * if parts.next() == Some("万") {
-                        10_000.0
-                    } else {
-                        1.0
-                    })
-                .round()
-                .to_string(),
-            )
-        },
-    )?;
-    capture_date(
-        &mut fields,
-        &compact,
-        "ApplyDate",
-        r"(?:网上申购日|申购日期|申购日)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
-    )?;
-    capture_date(
-        &mut fields,
-        &compact,
-        "BallotDate",
-        r"(?:中签率公告日|中签结果公告日|摇号抽签日)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
-    )?;
-    capture_date(
-        &mut fields,
-        &compact,
-        "PaymentDate",
-        r"(?:网上投资者缴款日|网上缴款日(?:及截止时间)?|缴款日期)(?:为)?\s*[:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日",
-    )?;
-    let session_regex = Regex::new(r"(\d{1,2}:\d{2})\s*[-—至]\s*(\d{1,2}:\d{2})")?;
-    for (index, capture) in session_regex.captures_iter(&compact).take(4).enumerate() {
-        fields.push(ParsedField {
-            name: format!("Session{}", index + 1),
-            value: format!("{}-{}", &capture[1], &capture[2]),
-            confidence: 0.95,
-            evidence: Some(capture[0].to_owned()),
-            character_offset: capture.get(0).map(|m| m.start()),
-        });
-    }
-    if compact.contains("全额缴付申购资金") || compact.contains("全额缴付申购款") {
-        fields.push(ParsedField {
-            name: "FundingMode".into(),
-            value: "FullCash".into(),
-            confidence: 0.98,
-            evidence: Some("全额缴付申购资金".into()),
-            character_offset: compact.find("全额缴付"),
-        });
-    }
-    let definite_termination = ["决定终止发行", "本次发行终止", "终止本次发行"]
-        .iter()
-        .any(|value| compact.contains(value) || title.contains(value));
-    if definite_termination {
-        fields.push(ParsedField {
-            name: "IssueStatus".into(),
-            value: (IssueStatus::Terminated as i32).to_string(),
-            confidence: 0.99,
-            evidence: Some("终止发行决定".into()),
-            character_offset: None,
-        });
-    }
-    Ok(fields)
-}
-
-fn capture<F>(
-    fields: &mut Vec<ParsedField>,
-    text_value: &str,
-    name: &str,
-    pattern: &str,
-    confidence: f64,
-    transform: F,
-) -> Result<()>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let regex = Regex::new(pattern)?;
-    if let Some(captures) = regex.captures(text_value) {
-        let Some(value) = captures.get(1) else {
-            return Ok(());
-        };
-        let transformed_input = if name == "MaxApplyQuantity" {
-            format!(
-                "{}|{}",
-                value.as_str(),
-                captures.get(2).map(|m| m.as_str()).unwrap_or_default()
-            )
-        } else {
-            value.as_str().to_owned()
-        };
-        if let Some(value) = transform(&transformed_input) {
-            fields.push(ParsedField {
-                name: name.into(),
-                value,
-                confidence,
-                evidence: captures.get(0).map(|m| m.as_str().to_owned()),
-                character_offset: captures.get(0).map(|m| m.start()),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn capture_date(
-    fields: &mut Vec<ParsedField>,
-    text_value: &str,
-    name: &str,
-    pattern: &str,
-) -> Result<()> {
-    let regex = Regex::new(pattern)?;
-    if let Some(captures) = regex.captures(text_value) {
-        let date = format!(
-            "{:04}-{:02}-{:02}",
-            captures[1].parse::<u32>()?,
-            captures[2].parse::<u32>()?,
-            captures[3].parse::<u32>()?
-        );
-        fields.push(ParsedField {
-            name: name.into(),
-            value: date,
-            confidence: 0.98,
-            evidence: captures.get(0).map(|m| m.as_str().to_owned()),
-            character_offset: captures.get(0).map(|m| m.start()),
-        });
-    }
-    Ok(())
-}
-
-pub fn candidate_from_document(
-    event: &IpoEvent,
-    document: &AnnouncementDocument,
-) -> Option<Candidate> {
-    let values: HashMap<&str, &str> = document
-        .fields
-        .iter()
-        .filter(|field| field.confidence >= 0.90)
-        .map(|field| (field.name.as_str(), field.value.as_str()))
-        .collect();
-    if values.is_empty() {
-        return None;
-    }
-    let sessions: Vec<SubscriptionSession> = (1..=4)
-        .filter_map(|number| {
-            let value = values.get(format!("Session{number}").as_str())?;
-            let (start, end) = value.split_once('-')?;
-            Some(SubscriptionSession {
-                session_number: number,
-                official_start: chrono::NaiveTime::parse_from_str(start, "%H:%M").ok()?,
-                official_end: chrono::NaiveTime::parse_from_str(end, "%H:%M").ok()?,
-                broker_accept_start: None,
-                safety_cutoff: None,
-                funding_mode: if values.get("FundingMode") == Some(&"FullCash") {
-                    FundingMode::FullCash
-                } else {
-                    FundingMode::MarketValue
-                },
-                allocation_time_sensitive: event.exchange == Exchange::Beijing,
-                source: document.reference.provider.clone(),
-                source_published_at: document.reference.published_at,
-            })
-        })
-        .collect();
-    Some(Candidate {
-        source: document.reference.provider.clone(),
-        priority: 300,
-        fetched_at: document.downloaded_at,
-        published_at: document.reference.published_at,
-        exchange: event.exchange,
-        board: event.board,
-        security_code: values
-            .get("SecurityCode")
-            .map(|v| (*v).to_owned())
-            .or_else(|| Some(event.security_code.clone())),
-        apply_code: values.get("ApplyCode").map(|v| (*v).to_owned()),
-        legacy_code: None,
-        name: Some(event.name.clone()),
-        apply_date: values.get("ApplyDate").and_then(|v| parse_date(v)),
-        issue_price: values.get("IssuePrice").and_then(|v| v.parse().ok()),
-        lot_size: values.get("LotSize").and_then(|v| v.parse().ok()),
-        max_apply_quantity: values.get("MaxApplyQuantity").and_then(|v| v.parse().ok()),
-        required_market_value: None,
-        required_cash: None,
-        ballot_date: values.get("BallotDate").and_then(|v| parse_date(v)),
-        payment_date: values.get("PaymentDate").and_then(|v| parse_date(v)),
-        listing_date: None,
-        status: values
-            .get("IssueStatus")
-            .and_then(|v| v.parse().ok())
-            .map(IssueStatus::from_i32)
-            .unwrap_or(IssueStatus::Unknown),
-        announcement_url: Some(document.reference.url.clone()),
-        sessions,
-        announcement_derived: true,
-    })
-}
-
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(100)
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::dictionary;
+    use std::fs;
 
     fn fixture(path: &str) -> String {
         fs::read_to_string(
@@ -1382,59 +702,6 @@ mod tests {
             mirror[0].url,
             "https://static.cninfo.com.cn/finalpage/2026-08-25/1225499048.PDF"
         );
-    }
-
-    #[test]
-    fn pdf_text_accumulator_never_exceeds_character_budget() {
-        let mut target = String::new();
-        let mut remaining = 5usize;
-        assert!(append_limited_characters(
-            &mut target,
-            "新股公告文本",
-            &mut remaining
-        ));
-        assert_eq!(target.chars().count(), 5);
-        assert_eq!(remaining, 0);
-
-        let mut target = String::new();
-        let mut remaining = 10usize;
-        assert!(!append_limited_characters(
-            &mut target,
-            "三字文",
-            &mut remaining
-        ));
-        assert_eq!(target, "三字文");
-        assert_eq!(remaining, 7);
-    }
-
-    #[test]
-    fn pdf_filter_discards_image_objects_but_preserves_page_dictionaries() {
-        let mut image = lopdf::Object::Dictionary(lopdf::dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Image",
-        });
-        assert!(pdf_text_object_filter((1, 0), &mut image).is_none());
-
-        let mut page = lopdf::Object::Dictionary(lopdf::dictionary! {
-            "Type" => "Page",
-            "Contents" => lopdf::Object::Reference((2, 0)),
-            "Resources" => lopdf::Object::Dictionary(lopdf::dictionary! {
-                "Font" => lopdf::Object::Dictionary(lopdf::Dictionary::new()),
-                "XObject" => lopdf::Object::Dictionary(lopdf::Dictionary::new()),
-            }),
-        });
-        let filtered = pdf_text_object_filter((3, 0), &mut page).unwrap().1;
-        let page = filtered.as_dict().unwrap();
-        assert!(page.has(b"Contents"));
-        assert!(page.has(b"Resources"));
-
-        let mut content = lopdf::Object::Stream(lopdf::Stream::new(
-            lopdf::dictionary! { "Length" => 6 },
-            b"BT ET\n".to_vec(),
-        ));
-        let returned = pdf_text_object_filter((4, 0), &mut content).unwrap().1;
-        assert!(matches!(returned, lopdf::Object::Null));
-        assert!(matches!(content, lopdf::Object::Stream(_)));
     }
 
     #[test]
@@ -1487,48 +754,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sse_javascript_challenge_as_pdf_evidence() {
-        let challenge = fixture("sse-javascript-challenge-20260826.html");
-        let error = validate_pdf_download(
-            challenge.as_bytes(),
-            "text/html; charset=utf-8",
-            challenge.len() as u64,
-            "static.sse.com.cn",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("JavaScript 验证页"));
-        assert!(
-            validate_pdf_download(
-                b"%PDF-1.7\nfixture",
-                "application/pdf",
-                17,
-                "static.cninfo.com.cn"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn parses_announcement_fields_without_false_termination() {
-        let fields = parse_fields(&fixture("bse-920289-excerpt-20260820.txt"), "发行公告").unwrap();
-        assert!(fields.iter().any(|field| field.name == "ApplyCode"));
-        assert!(fields.iter().any(|field| field.name == "IssuePrice"));
-        assert!(!fields.iter().any(|field| field.name == "IssueStatus"));
-
-        let dates = parse_fields(
-            "中签结果公告日：2026年8月27日；网上缴款日及截止时间：2026年8月28日日终。",
-            "发行公告",
-        )
-        .unwrap();
-        assert!(
-            dates
-                .iter()
-                .any(|field| { field.name == "BallotDate" && field.value == "2026-08-27" })
-        );
-        assert!(
-            dates
-                .iter()
-                .any(|field| { field.name == "PaymentDate" && field.value == "2026-08-28" })
-        );
+    fn metadata_documents_never_claim_a_local_pdf_or_parsed_fields() {
+        let now = now_china();
+        let event = IpoEvent {
+            id: "shanghai:601001".into(),
+            exchange: Exchange::Shanghai,
+            board: Board::Main,
+            security_code: "601001".into(),
+            apply_code: Some("780001".into()),
+            legacy_code: None,
+            name: "测试股份".into(),
+            apply_date: Some(now.date_naive()),
+            issue_price: Some(10.0),
+            lot_size: Some(500),
+            max_apply_quantity: Some(10_000),
+            required_market_value: None,
+            required_cash: None,
+            ballot_date: None,
+            payment_date: None,
+            listing_date: None,
+            status: IssueStatus::Active,
+            lifecycle_status: LifecycleStatus::ActiveUnconfirmed,
+            event_version: 1,
+            announcement_url: None,
+            data_quality_status: DataQualityStatus::MultiSourceVerified,
+            data_conflict: false,
+            manual_override_fields: Vec::new(),
+            sessions: Vec::new(),
+            first_seen_at: now,
+            updated_at: now,
+        };
+        let reference = AnnouncementRef {
+            provider: "sse-announcement".into(),
+            announcement_id: "announcement-1".into(),
+            title: "首次公开发行公告".into(),
+            url: "https://www.sse.com.cn/test.pdf".into(),
+            published_at: Some(now),
+            announcement_type: Some("发行公告".into()),
+        };
+        let first = metadata_document(&event, reference.clone());
+        let second = metadata_document(&event, reference);
+        assert_eq!(first.id, second.id);
+        assert!(first.local_path.is_empty());
+        assert!(first.text_hash.is_none());
+        assert!(first.fields.is_empty());
+        assert_eq!(first.status, ExtractionStatus::Unsupported);
+        assert_eq!(first.parser_version, METADATA_VERSION);
     }
 }

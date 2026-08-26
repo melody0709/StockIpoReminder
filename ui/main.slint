@@ -1193,7 +1193,7 @@ export component MainWindow inherits Window {
                         VerticalBox {
                             padding: 10px;
                             spacing: 8px;
-                            if root.announcement-rows.length == 0 : Text { text: "尚未下载到相关正式公告；任务仍会保留并继续提醒。"; color: #94a3b8; horizontal-alignment: center; height: 300px; vertical-alignment: center; wrap: word-wrap; }
+                            if root.announcement-rows.length == 0 : Text { text: "尚未检索到相关正式公告链接；任务仍会保留并继续提醒。"; color: #94a3b8; horizontal-alignment: center; height: 300px; vertical-alignment: center; wrap: word-wrap; }
                             for announcement in root.announcement-rows : Rectangle {
                                 height: 112px;
                                 border-radius: 8px;
@@ -1214,7 +1214,7 @@ export component MainWindow inherits Window {
                                         width: root.compact-width ? 96px : 120px;
                                         spacing: 7px;
                                         ActionButton { label: "打开原文"; compact: root.compact-width; clicked => { root.open-external(announcement.source-url); } }
-                                        ActionButton { label: "打开本地文件"; compact: root.compact-width; enabled: announcement.local-available; clicked => { root.open-local(announcement.local-path); } }
+                                        ActionButton { label: "打开历史本地文件"; compact: root.compact-width; enabled: announcement.local-available; clicked => { root.open-local(announcement.local-path); } }
                                     }
                                 }
                             }

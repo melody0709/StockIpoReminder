@@ -12,7 +12,6 @@ path = "src/main.rs"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-lopdf = { version = "0.38", default-features = false }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "brotli", "cookies", "deflate", "gzip", "json", "multipart", "rustls-tls"] }
 raw-window-handle = "0.6"
@@ -45,7 +44,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_DataExchange",
     "Win32_System_EventNotificationService",
-    "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",

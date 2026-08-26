@@ -57,9 +57,9 @@ $peakMainPrivate = 0L
 $peakMainWorkingSet = 0L
 $peakTotalPrivate = 0L
 $peakTotalWorkingSet = 0L
-$peakPdfWorkerPrivate = 0L
-$peakPdfWorkerWorkingSet = 0L
-$peakWorkerCount = 0
+$peakUnexpectedChildPrivate = 0L
+$peakUnexpectedChildWorkingSet = 0L
+$peakUnexpectedChildCount = 0
 $sampleCount = 0
 $syncCompleted = $false
 $logReadContentionCount = 0
@@ -90,9 +90,9 @@ try {
             $peakMainWorkingSet = [Math]::Max($peakMainWorkingSet, $mainWorkingSet)
             $peakTotalPrivate = [Math]::Max($peakTotalPrivate, $totalPrivate)
             $peakTotalWorkingSet = [Math]::Max($peakTotalWorkingSet, $totalWorkingSet)
-            $peakPdfWorkerPrivate = [Math]::Max($peakPdfWorkerPrivate, $workerPrivate)
-            $peakPdfWorkerWorkingSet = [Math]::Max($peakPdfWorkerWorkingSet, $workerWorkingSet)
-            $peakWorkerCount = [Math]::Max($peakWorkerCount, $workerCount)
+            $peakUnexpectedChildPrivate = [Math]::Max($peakUnexpectedChildPrivate, $workerPrivate)
+            $peakUnexpectedChildWorkingSet = [Math]::Max($peakUnexpectedChildWorkingSet, $workerWorkingSet)
+            $peakUnexpectedChildCount = [Math]::Max($peakUnexpectedChildCount, $workerCount)
             $sampleCount++
         }
 
@@ -153,12 +153,12 @@ try {
 
     Assert-Condition ($idlePrivate -lt 100MB) "Post-sync Private Bytes exceeded 100MB: $idlePrivate"
     Assert-Condition ($idleWorkingSet -lt 100MB) "Post-sync Working Set exceeded 100MB: $idleWorkingSet"
-    Assert-Condition ($peakPdfWorkerPrivate -le 512MB) "PDF Worker exceeded its 512 MiB process memory limit: $peakPdfWorkerPrivate"
-    Assert-Condition ($remainingWorkers.Count -eq 0) "PDF Worker processes remain after synchronization: $($remainingWorkers.Count)"
-    Assert-Condition ($residualFiles.Count -eq 0) "Worker/download temporary files remain after synchronization: $($residualFiles.Count)"
+    Assert-Condition ($peakUnexpectedChildCount -eq 0) "Synchronization spawned an unexpected child process: $peakUnexpectedChildCount"
+    Assert-Condition ($remainingWorkers.Count -eq 0) "Unexpected child processes remain after synchronization: $($remainingWorkers.Count)"
+    Assert-Condition ($residualFiles.Count -eq 0) "Retired PDF worker/download temporary files were created: $($residualFiles.Count)"
 
     $report = [ordered]@{
-        schemaVersion = '1'
+        schemaVersion = '2'
         success = $true
         implementation = 'rust'
         version = $Version
@@ -172,24 +172,23 @@ try {
             peakMainWorkingSetBytes = $peakMainWorkingSet
             peakTotalPrivateBytes = $peakTotalPrivate
             peakTotalWorkingSetBytes = $peakTotalWorkingSet
-            peakPdfWorkerPrivateBytes = $peakPdfWorkerPrivate
-            peakPdfWorkerWorkingSetBytes = $peakPdfWorkerWorkingSet
+            peakUnexpectedChildPrivateBytes = $peakUnexpectedChildPrivate
+            peakUnexpectedChildWorkingSetBytes = $peakUnexpectedChildWorkingSet
             postSyncPrivateBytes = $idlePrivate
             postSyncWorkingSetBytes = $idleWorkingSet
             limitBytes = 100MB
-            pdfWorkerLimitBytes = 512MB
         }
         cleanup = [ordered]@{
-            peakPdfWorkerCount = $peakWorkerCount
-            remainingPdfWorkerCount = $remainingWorkers.Count
-            residualTemporaryFileCount = $residualFiles.Count
+            peakUnexpectedChildCount = $peakUnexpectedChildCount
+            remainingUnexpectedChildCount = $remainingWorkers.Count
+            retiredPdfTemporaryFileCount = $residualFiles.Count
         }
         log = $logPath
     }
 }
 catch {
     $report = [ordered]@{
-        schemaVersion = '1'
+        schemaVersion = '2'
         success = $false
         implementation = 'rust'
         version = $Version

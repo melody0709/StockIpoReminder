@@ -40,9 +40,6 @@ slint::include_modules!();
 fn main() -> Result<()> {
     let startup_started = Instant::now();
     let arguments: Vec<String> = env::args().skip(1).collect();
-    if let Some(exit_code) = announcement::try_run_pdf_worker(&arguments)? {
-        std::process::exit(exit_code);
-    }
     if let Some(exit_code) = deployment::try_handle(&arguments)? {
         std::process::exit(exit_code);
     }
@@ -1983,7 +1980,12 @@ fn show_event_details(ui: &MainWindow, runtime: &RuntimeHandle, event_id: &str) 
             let announcement_rows = announcements
                 .iter()
                 .map(|document| {
-                    let evidence = if document.fields.is_empty() {
+                    let metadata_only = document.local_path.is_empty()
+                        && document.parser_version == "announcement-metadata-v1";
+                    let evidence = if metadata_only {
+                        "程序只保存公告标题和在线链接，不下载或解析正文；请按需打开官方原文核对。"
+                            .into()
+                    } else if document.fields.is_empty() {
                         "未提取到高置信度字段，请人工查看原文。".into()
                     } else {
                         document
@@ -2001,12 +2003,20 @@ fn show_event_details(ui: &MainWindow, runtime: &RuntimeHandle, event_id: &str) 
                             .collect::<Vec<_>>()
                             .join("；")
                     };
-                    let hash_preview = document.file_hash.chars().take(12).collect::<String>();
-                    AnnouncementRow {
-                        id: document.id.clone().into(),
-                        title: document.reference.title.clone().into(),
-                        metadata: format!(
-                            "{} · {} · {} · SHA-256 {}…",
+                    let metadata = if metadata_only {
+                        format!(
+                            "{} · {} · 在线公告链接",
+                            document.reference.provider,
+                            document
+                                .reference
+                                .published_at
+                                .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "发布时间未知".into()),
+                        )
+                    } else {
+                        let hash_preview = document.file_hash.chars().take(12).collect::<String>();
+                        format!(
+                            "{} · {} · {} · 历史文件 SHA-256 {}…",
                             document.reference.provider,
                             document
                                 .reference
@@ -2016,7 +2026,11 @@ fn show_event_details(ui: &MainWindow, runtime: &RuntimeHandle, event_id: &str) 
                             extraction_text(document.status),
                             hash_preview,
                         )
-                        .into(),
+                    };
+                    AnnouncementRow {
+                        id: document.id.clone().into(),
+                        title: document.reference.title.clone().into(),
+                        metadata: metadata.into(),
                         evidence: evidence.into(),
                         source_url: document.reference.url.clone().into(),
                         local_path: document.local_path.clone().into(),
@@ -2120,7 +2134,7 @@ fn extraction_text(status: model::ExtractionStatus) -> &'static str {
         model::ExtractionStatus::Extracted => "文本已解析",
         model::ExtractionStatus::LowConfidence => "低置信度",
         model::ExtractionStatus::Failed => "解析失败",
-        model::ExtractionStatus::Unsupported => "不支持自动解析",
+        model::ExtractionStatus::Unsupported => "仅保存在线链接",
         _ => "待解析",
     }
 }
@@ -2147,7 +2161,7 @@ fn format_event_details(
             .join("；")
     };
     let announcement_text = if announcements.is_empty() {
-        "暂无已保存正式公告".into()
+        "暂无已保存的正式公告链接".into()
     } else {
         announcements
             .iter()
@@ -2157,7 +2171,7 @@ fn format_event_details(
             .join("\n")
     };
     format!(
-        "市场：{}\n证券代码：{}\n申购代码：{}\n申购日期：{}\n发行价格：{}\n申购单位：{} 股\n申购上限：{} 股\n所需市值：{}\n所需现金：{}\n中签日期：{}\n缴款日期：{}\n上市日期：{}\n官方申购时段：{}\n安全截止：{}\n任务状态：{}\n数据质量：{}\n事件版本：{}\n最后更新：{}\n\n正式公告\n{}",
+        "市场：{}\n证券代码：{}\n申购代码：{}\n申购日期：{}\n发行价格：{}\n申购单位：{} 股\n申购上限：{} 股\n所需市值：{}\n所需现金：{}\n中签日期：{}\n缴款日期：{}\n上市日期：{}\n官方申购时段：{}\n安全截止：{}\n任务状态：{}\n数据质量：{}\n事件版本：{}\n最后更新：{}\n\n正式公告链接\n{}",
         market_name(event.exchange, event.board),
         event.security_code,
         event.apply_code.as_deref().unwrap_or("待核验"),
@@ -2298,15 +2312,15 @@ fn market_name(exchange: Exchange, board: Board) -> &'static str {
 
 fn default_session_text(exchange: Exchange) -> &'static str {
     if exchange == Exchange::Shanghai {
-        "09:30–11:30；13:00–15:00（默认，公告优先）"
+        "09:30–11:30；13:00–15:00（默认市场时段，请以交易所或券商当日规则为准）"
     } else {
-        "09:15–11:30；13:00–15:00（默认，公告优先）"
+        "09:15–11:30；13:00–15:00（默认市场时段，请以交易所或券商当日规则为准）"
     }
 }
 
 fn quality_text(status: DataQualityStatus) -> &'static str {
     match status {
-        DataQualityStatus::AnnouncementVerified => "正式公告已核验",
+        DataQualityStatus::AnnouncementVerified => "历史公告解析记录",
         DataQualityStatus::MultiSourceVerified => "多源一致",
         DataQualityStatus::SingleSource => "单一来源待核验",
         DataQualityStatus::DataConflict => "来源冲突",

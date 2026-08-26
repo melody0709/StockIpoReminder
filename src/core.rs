@@ -343,11 +343,8 @@ pub fn reconcile_candidates(
         || conflicts(&usable, |c| {
             (c.status != IssueStatus::Unknown).then(|| format!("{:?}", c.status))
         });
-    let announcement_verified = usable.iter().any(|c| c.announcement_derived);
     let quality = if conflict {
         DataQualityStatus::DataConflict
-    } else if announcement_verified {
-        DataQualityStatus::AnnouncementVerified
     } else if usable.len() > 1 {
         DataQualityStatus::MultiSourceVerified
     } else {
@@ -794,7 +791,6 @@ mod tests {
             status: IssueStatus::Active,
             announcement_url: None,
             sessions: Vec::new(),
-            announcement_derived: false,
         };
         let mut second = base.clone();
         second.source = "b".into();

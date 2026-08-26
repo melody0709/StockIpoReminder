@@ -17,9 +17,9 @@ use crate::{
     announcement,
     core::{at, group_candidates, now_china, reconcile_candidates, sha256},
     model::{
-        AnnouncementDocument, AppSettings, Candidate, ChinaDateTime, DataQualityStatus, Exchange,
-        ExtractionStatus, FieldSourceEntry, HealthState, IpoEvent, LifecycleStatus,
-        ManualOverrideEntry, ReminderDelivery, SyncConclusion, SyncConclusionKind,
+        AnnouncementDocument, AppSettings, Candidate, ChinaDateTime, Exchange, FieldSourceEntry,
+        HealthState, IpoEvent, LifecycleStatus, ManualOverrideEntry, ReminderDelivery,
+        SyncConclusion, SyncConclusionKind,
     },
     network::{self, CollectorOutput},
     operations, secondary_notification,
@@ -46,8 +46,7 @@ struct AnnouncementRunStats {
     attempted_events: usize,
     successful_searches: usize,
     references_found: usize,
-    documents_processed: usize,
-    documents_succeeded: usize,
+    metadata_records: usize,
     mirror_events: usize,
     issue_count: usize,
     issues: Vec<String>,
@@ -61,8 +60,7 @@ impl AnnouncementRunStats {
             attempted_events: 0,
             successful_searches: 0,
             references_found: 0,
-            documents_processed: 0,
-            documents_succeeded: 0,
+            metadata_records: 0,
             mirror_events: 0,
             issue_count: 0,
             issues: Vec::new(),
@@ -87,9 +85,7 @@ impl AnnouncementRunStats {
     }
 
     fn state(&self) -> HealthState {
-        if self.successful_searches == 0
-            || (self.references_found > 0 && self.documents_succeeded == 0 && self.issue_count > 0)
-        {
+        if self.successful_searches == 0 {
             HealthState::Failed
         } else if self.issue_count > 0 {
             HealthState::Warning
@@ -100,12 +96,11 @@ impl AnnouncementRunStats {
 
     fn summary(&self) -> String {
         format!(
-            "attemptedEvents={}, searchSuccesses={}, references={}, documents={}, successfulDocuments={}, mirrorEvents={}, issues={}",
+            "attemptedEvents={}, searchSuccesses={}, references={}, metadataRecords={}, mirrorEvents={}, issues={}",
             self.attempted_events,
             self.successful_searches,
             self.references_found,
-            self.documents_processed,
-            self.documents_succeeded,
+            self.metadata_records,
             self.mirror_events,
             self.issue_count
         )
@@ -114,7 +109,7 @@ impl AnnouncementRunStats {
     fn error_summary(&self) -> Option<String> {
         (self.issue_count > 0).then(|| {
             format!(
-                "公告源部分或全部失败：{}；{}",
+                "公告元数据源部分或全部失败：{}；{}",
                 self.summary(),
                 self.issues.join("；")
             )
@@ -440,7 +435,7 @@ fn run_loop(
             let reason = requested_reason
                 .take()
                 .unwrap_or_else(|| next_sync_reason.clone());
-            if let Err(error) = synchronize(&database, &client, &data_root, &snapshot, &reason) {
+            if let Err(error) = synchronize(&database, &client, &snapshot, &reason) {
                 let message = format!("{error:#}");
                 operations::log("ERROR", &format!("同步失败（{reason}）：{message}"));
                 update_snapshot(&snapshot, |value| {
@@ -697,7 +692,6 @@ fn has_sync_relevant_events_on(
 fn synchronize(
     database: &Database,
     client: &reqwest::blocking::Client,
-    data_root: &Path,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     reason: &str,
 ) -> Result<()> {
@@ -852,16 +846,13 @@ fn synchronize(
         let existing = identity
             .as_deref()
             .and_then(|id| database.event(id).ok().flatten());
-        let Some(mut provisional) =
+        let Some(provisional) =
             reconcile_candidates(&group, existing.as_ref(), &settings, now_china())
         else {
             continue;
         };
-        let mut combined = group;
+        let combined = group;
         let mut documents = Vec::new();
-        let existing_official_evidence = existing.as_ref().is_some_and(|event| {
-            event.data_quality_status == DataQualityStatus::AnnouncementVerified
-        });
         if should_check_announcements(&provisional) {
             let provider = match provisional.exchange {
                 Exchange::Shanghai => "sse-announcement",
@@ -906,73 +897,10 @@ fn synchronize(
                                 ),
                             );
                         }
-                        let mut usable_official_evidence = existing_official_evidence;
-                        let mut event_successful_documents = 0usize;
-                        let mut event_document_issues = Vec::new();
                         for reference in output.references.into_iter().take(5) {
-                            let reference_title = reference.title.clone();
-                            match announcement::download_and_parse(
-                                client,
-                                data_root,
-                                &provisional,
-                                reference,
-                            ) {
-                                Ok((document, candidate)) => {
-                                    stats.documents_processed += 1;
-                                    if document.status == ExtractionStatus::Failed {
-                                        event_document_issues.push(format!(
-                                            "{}：公告正文未能提取",
-                                            document.reference.title
-                                        ));
-                                    } else {
-                                        stats.documents_succeeded += 1;
-                                        event_successful_documents += 1;
-                                    }
-                                    if let Some(candidate) = candidate {
-                                        usable_official_evidence = true;
-                                        combined.push(candidate);
-                                        documents.push(document);
-                                        break;
-                                    }
-                                    documents.push(document);
-                                }
-                                Err(error) => {
-                                    stats.observe_retry_after(network::retry_after_from_error(
-                                        &error,
-                                    ));
-                                    event_document_issues
-                                        .push(format!("{reference_title}：{error:#}"));
-                                }
-                            }
-                        }
-                        if !event_document_issues.is_empty() {
-                            let health_relevant = event_successful_documents == 0;
-                            let detail = event_document_issues
-                                .iter()
-                                .take(2)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join("；");
-                            if health_relevant {
-                                stats.record_issue(format!("event={}：{detail}", provisional.id));
-                            }
-                            operations::log(
-                                if health_relevant { "ERROR" } else { "WARN" },
-                                &format!(
-                                    "公告文档处理{}：event={}, provider={provider}, issues={}",
-                                    if health_relevant {
-                                        "失败"
-                                    } else {
-                                        "部分跳过（已有可用正式公告）"
-                                    },
-                                    provisional.id,
-                                    event_document_issues.len(),
-                                ),
-                            );
-                        }
-                        if requires_official_evidence(&provisional) && !usable_official_evidence {
-                            provisional.data_quality_status =
-                                DataQualityStatus::ManualReviewRequired;
+                            documents
+                                .push(announcement::metadata_document(&provisional, reference));
+                            stats.metadata_records += 1;
                         }
                     }
                     Err(error) => {
@@ -981,28 +909,22 @@ fn synchronize(
                         operations::log(
                             "ERROR",
                             &format!(
-                                "公告检索失败：event={}, provider={provider}, error={error:#}",
+                                "公告元数据检索失败：event={}, provider={provider}, error={error:#}",
                                 provisional.id
                             ),
                         );
-                        if requires_official_evidence(&provisional) && !existing_official_evidence {
-                            provisional.data_quality_status =
-                                DataQualityStatus::ManualReviewRequired;
-                        }
                     }
                 }
-            } else if requires_official_evidence(&provisional) && !existing_official_evidence {
-                provisional.data_quality_status = DataQualityStatus::ManualReviewRequired;
             }
         }
         let mut resolved =
             reconcile_candidates(&combined, existing.as_ref(), &settings, now_china())
-                .unwrap_or(provisional.clone());
-        resolved.data_quality_status = final_data_quality(
-            resolved.data_quality_status,
-            provisional.data_quality_status,
-            existing_official_evidence,
-        );
+                .unwrap_or(provisional);
+        if resolved.announcement_url.is_none() {
+            resolved.announcement_url = documents
+                .first()
+                .map(|document| document.reference.url.clone());
+        }
         persist_reconciled_group(database, resolved, &combined, &documents)?;
         announcement_count += documents.len();
         event_count += 1;
@@ -1022,10 +944,10 @@ fn synchronize(
             provider,
             stats.started,
             state,
-            stats.documents_processed,
+            stats.metadata_records,
             Some(&summary),
             None,
-            Some("announcement-run-v2"),
+            Some("announcement-metadata-run-v3"),
             error.as_deref(),
             stats.retry_after,
         )?;
@@ -1037,7 +959,7 @@ fn synchronize(
             } else {
                 "INFO"
             },
-            &format!("公告源 {provider} 本轮状态 {state:?}：{summary}"),
+            &format!("公告元数据源 {provider} 本轮状态 {state:?}：{summary}"),
         );
     }
     database.touch_heartbeat("synchronization", now_china())?;
@@ -1152,20 +1074,20 @@ fn sync_conclusion(
     let summary = match kind {
         SyncConclusionKind::HealthyEmpty => {
             format!(
-                "同步完成：今日无新股（启用市场来源覆盖正常）；本轮更新 {event_count} 个任务、{announcement_count} 份公告"
+                "同步完成：今日无新股（启用市场来源覆盖正常）；本轮更新 {event_count} 个任务、{announcement_count} 条公告链接"
             )
         }
         SyncConclusionKind::HealthyNonempty => {
             format!(
-                "同步完成：今日任务 {today_count} 只；本轮更新 {event_count} 个任务、{announcement_count} 份公告"
+                "同步完成：今日任务 {today_count} 只；本轮更新 {event_count} 个任务、{announcement_count} 条公告链接"
             )
         }
         SyncConclusionKind::DegradedCached => format!(
-            "已保留现有今日任务：来源覆盖不完整（{}）；本轮更新 {event_count} 个任务、{announcement_count} 份公告",
+            "已保留现有今日任务：来源覆盖不完整（{}）；本轮更新 {event_count} 个任务、{announcement_count} 条公告链接",
             missing_sources.join("、")
         ),
         _ => format!(
-            "暂未获取到今日任务：来源覆盖不完整（{}）；本轮更新 {event_count} 个任务、{announcement_count} 份公告",
+            "暂未获取到今日任务：来源覆盖不完整（{}）；本轮更新 {event_count} 个任务、{announcement_count} 条公告链接",
             missing_sources.join("、")
         ),
     };
@@ -1211,27 +1133,6 @@ fn should_check_announcements(event: &IpoEvent) -> bool {
     event.apply_date.is_some_and(|date| {
         date >= today - chrono::Duration::days(7) && date <= today + chrono::Duration::days(45)
     })
-}
-
-fn requires_official_evidence(event: &IpoEvent) -> bool {
-    let today = now_china().date_naive();
-    event.apply_date.is_some_and(|date| {
-        date >= today - chrono::Duration::days(7) && date <= today + chrono::Duration::days(7)
-    })
-}
-
-fn final_data_quality(
-    resolved: DataQualityStatus,
-    provisional: DataQualityStatus,
-    existing_official_evidence: bool,
-) -> DataQualityStatus {
-    if provisional == DataQualityStatus::ManualReviewRequired {
-        DataQualityStatus::ManualReviewRequired
-    } else if existing_official_evidence && resolved != DataQualityStatus::DataConflict {
-        DataQualityStatus::AnnouncementVerified
-    } else {
-        resolved
-    }
 }
 
 fn run_delivery_cycle(
@@ -1494,7 +1395,7 @@ fn retain_latest_backups(directory: &Path, count: usize, preserve: Option<&Path>
 mod tests {
     use super::*;
     use crate::model::{
-        AnnouncementRef, Board, Exchange, ExtractionStatus, IssueStatus, LifecycleStatus,
+        AnnouncementRef, Board, DataQualityStatus, Exchange, IssueStatus, LifecycleStatus,
     };
     use uuid::Uuid;
 
@@ -1732,18 +1633,14 @@ mod tests {
     fn announcement_run_state_distinguishes_failure_warning_and_success() {
         let mut failed = AnnouncementRunStats::new(now_china());
         failed.attempted_events = 1;
-        failed.successful_searches = 1;
-        failed.references_found = 1;
-        failed.documents_processed = 1;
-        failed.record_issue("PDF 下载失败");
+        failed.record_issue("公告元数据检索失败");
         assert_eq!(failed.state(), HealthState::Failed);
 
         let mut warning = AnnouncementRunStats::new(now_china());
         warning.attempted_events = 2;
         warning.successful_searches = 2;
         warning.references_found = 2;
-        warning.documents_processed = 1;
-        warning.documents_succeeded = 1;
+        warning.metadata_records = 2;
         warning.record_issue("一个事件由备用镜像接管");
         assert_eq!(warning.state(), HealthState::Warning);
 
@@ -1754,35 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn prior_announcement_evidence_is_preserved_without_hiding_conflicts() {
-        assert_eq!(
-            final_data_quality(
-                DataQualityStatus::MultiSourceVerified,
-                DataQualityStatus::MultiSourceVerified,
-                true,
-            ),
-            DataQualityStatus::AnnouncementVerified
-        );
-        assert_eq!(
-            final_data_quality(
-                DataQualityStatus::DataConflict,
-                DataQualityStatus::DataConflict,
-                true,
-            ),
-            DataQualityStatus::DataConflict
-        );
-        assert_eq!(
-            final_data_quality(
-                DataQualityStatus::MultiSourceVerified,
-                DataQualityStatus::ManualReviewRequired,
-                true,
-            ),
-            DataQualityStatus::ManualReviewRequired
-        );
-    }
-
-    #[test]
-    fn new_event_is_saved_before_its_announcement_documents() {
+    fn new_event_is_saved_before_its_announcement_metadata() {
         let root = std::env::temp_dir().join(format!(
             "stock-ipo-rust-runtime-test-{}",
             Uuid::new_v4().simple()
@@ -1811,17 +1680,16 @@ mod tests {
             lifecycle_status: LifecycleStatus::ActiveUnconfirmed,
             event_version: 1,
             announcement_url: None,
-            data_quality_status: DataQualityStatus::AnnouncementVerified,
+            data_quality_status: DataQualityStatus::MultiSourceVerified,
             data_conflict: false,
             manual_override_fields: Vec::new(),
             sessions: Vec::new(),
             first_seen_at: now,
             updated_at: now,
         };
-        let document = AnnouncementDocument {
-            id: "document-1".into(),
-            event_id: event.id.clone(),
-            reference: AnnouncementRef {
+        let document = announcement::metadata_document(
+            &event,
+            AnnouncementRef {
                 provider: "sse-announcement".into(),
                 announcement_id: "announcement-1".into(),
                 title: "首次公开发行公告".into(),
@@ -1829,14 +1697,7 @@ mod tests {
                 published_at: Some(now),
                 announcement_type: Some("发行公告".into()),
             },
-            local_path: "announcements/test.pdf".into(),
-            file_hash: "abc123".into(),
-            text_hash: Some("def456".into()),
-            status: ExtractionStatus::Extracted,
-            parser_version: "rust-test".into(),
-            fields: Vec::new(),
-            downloaded_at: now,
-        };
+        );
 
         persist_reconciled_group(&database, event, &[], &[document]).unwrap();
 
