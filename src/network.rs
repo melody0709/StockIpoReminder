@@ -14,6 +14,14 @@ use serde_json::Value;
 
 use crate::{core::*, model::*};
 
+const IPO_WINDOW_PAST_DAYS: i64 = 60;
+const IPO_WINDOW_FUTURE_DAYS: i64 = 60;
+const MAX_BOUNDED_PAGES: usize = 5;
+const EASTMONEY_PAGE_SIZE: usize = 100;
+const SSE_PAGE_SIZE: usize = 100;
+const EASTMONEY_COLUMNS: &str = "SECURITY_CODE,SECURITY_NAME,MARKET_TYPE_NEW,IS_BEIJING,APPLY_DATE,ISSUE_STATE,APPLY_CODE,ISSUE_PRICE,EACHBALLOT_SHARES,ONLINE_APPLY_UPPER,TOP_APPLY_MARKETCAP,BALLOT_NUM_DATE,BALLOT_PAY_DATE,LISTING_DATE";
+const BSE_COLUMNS: &str = "id,fxCode,stockCode,stockName,purchaseDate,issuePrice,issueResultDate,enterPremiumDate,suspendDate,terminationDate";
+
 pub struct CollectorOutput {
     pub source: &'static str,
     pub started: ChinaDateTime,
@@ -113,20 +121,101 @@ fn source_probe_url(source: &str) -> Option<&'static str> {
     }
 }
 
+fn ipo_window(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    (
+        today - chrono::Duration::days(IPO_WINDOW_PAST_DAYS),
+        today + chrono::Duration::days(IPO_WINDOW_FUTURE_DAYS),
+    )
+}
+
+fn eastmoney_url(today: NaiveDate, page: usize) -> Result<String> {
+    let (from, to) = ipo_window(today);
+    let filter = format!(
+        "(APPLY_DATE>='{}')(APPLY_DATE<='{}')",
+        from.format("%Y-%m-%d"),
+        to.format("%Y-%m-%d")
+    );
+    let mut url = url::Url::parse("https://datacenter-web.eastmoney.com/api/data/v1/get")?;
+    url.query_pairs_mut()
+        .append_pair("reportName", "RPTA_APP_IPOAPPLY")
+        .append_pair("columns", EASTMONEY_COLUMNS)
+        .append_pair("sortColumns", "APPLY_DATE,SECURITY_CODE")
+        .append_pair("sortTypes", "-1,-1")
+        .append_pair("pageNumber", &page.to_string())
+        .append_pair("pageSize", &EASTMONEY_PAGE_SIZE.to_string())
+        .append_pair("source", "WEB")
+        .append_pair("client", "WEB")
+        .append_pair("filter", &filter);
+    Ok(url.into())
+}
+
+fn sse_url(page: usize) -> Result<String> {
+    let mut url = url::Url::parse("https://query.sse.com.cn/commonQuery.do")?;
+    url.query_pairs_mut()
+        .append_pair("sqlId", "COMMON_SSE_IPO_IPO_LIST_L")
+        .append_pair("isPagination", "true")
+        .append_pair("pageHelp.pageNo", &page.to_string())
+        .append_pair("pageHelp.pageSize", &SSE_PAGE_SIZE.to_string())
+        .append_pair("pageHelp.cacheSize", "1")
+        .append_pair("isIssue", "1");
+    Ok(url.into())
+}
+
 pub fn collect_eastmoney(client: &Client) -> Result<CollectorOutput> {
     let started = now_china();
-    let url = "https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPTA_APP_IPOAPPLY&columns=ALL&sortColumns=APPLY_DATE%2CSECURITY_CODE&sortTypes=-1%2C-1&pageNumber=1&pageSize=500&source=WEB&client=WEB";
-    ensure_allowed(url, false)?;
-    let raw = get_text(client, url, None)?;
-    let candidates = parse_eastmoney(&raw, started)?;
-    Ok(output("eastmoney", started, raw, candidates))
+    let mut page = 1usize;
+    let mut total_pages = 1usize;
+    let mut declared_count = None;
+    let mut detail_count = 0usize;
+    let mut raws = Vec::new();
+    let mut candidates = Vec::new();
+    while page <= total_pages && page <= MAX_BOUNDED_PAGES {
+        let url = eastmoney_url(started.date_naive(), page)?;
+        let raw = get_text(client, &url, None)?;
+        let (page_declared, page_details, pages) = eastmoney_page_counts(&raw)?;
+        declared_count = declared_count.or(page_declared);
+        detail_count += page_details;
+        total_pages = pages;
+        candidates.extend(parse_eastmoney(&raw, started)?);
+        raws.push(raw);
+        page += 1;
+    }
+    Ok(output_with_counts(
+        "eastmoney",
+        started,
+        combine_raw_pages(raws),
+        candidates,
+        declared_count,
+        detail_count,
+    ))
 }
 pub fn collect_sse(client: &Client) -> Result<CollectorOutput> {
     let started = now_china();
-    let url = "https://query.sse.com.cn/commonQuery.do?sqlId=COMMON_SSE_IPO_IPO_LIST_L&isPagination=true&pageHelp.pageNo=1&pageHelp.pageSize=500";
-    let raw = get_text(client, url, Some("https://www.sse.com.cn/"))?;
-    let candidates = parse_sse(&raw, started)?;
-    Ok(output("sse", started, raw, candidates))
+    let mut page = 1usize;
+    let mut total_pages = 1usize;
+    let mut declared_count = None;
+    let mut detail_count = 0usize;
+    let mut raws = Vec::new();
+    let mut candidates = Vec::new();
+    while page <= total_pages && page <= MAX_BOUNDED_PAGES {
+        let url = sse_url(page)?;
+        let raw = get_text(client, &url, Some("https://www.sse.com.cn/ipo/listing/"))?;
+        let (page_declared, page_details, pages) = sse_page_counts(&raw)?;
+        declared_count = declared_count.or(page_declared);
+        detail_count += page_details;
+        total_pages = pages;
+        candidates.extend(parse_sse(&raw, started)?);
+        raws.push(raw);
+        page += 1;
+    }
+    Ok(output_with_counts(
+        "sse",
+        started,
+        combine_raw_pages(raws),
+        candidates,
+        declared_count,
+        detail_count,
+    ))
 }
 pub fn collect_cninfo(client: &Client) -> Result<CollectorOutput> {
     let started = now_china();
@@ -137,6 +226,9 @@ pub fn collect_cninfo(client: &Client) -> Result<CollectorOutput> {
 }
 pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
     let started = now_china();
+    let (from, to) = ipo_window(started.date_naive());
+    let from = from.format("%Y-%m-%d").to_string();
+    let to = to.format("%Y-%m-%d").to_string();
     let _ = get_text(
         client,
         "https://www.bseinfo.net/newshare/listofissues.html",
@@ -148,7 +240,8 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
     let mut all = Vec::new();
     let mut detail_count = 0usize;
     let mut declared_count = None;
-    while page < total && page < 50 {
+    while page < total && page < MAX_BOUNDED_PAGES {
+        let page_number = page.to_string();
         let response = client
             .post("https://www.bseinfo.net/newShareController/infoResult.do?callback=ipoCb")
             .header(
@@ -157,10 +250,13 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
             )
             .form(&[
                 ("statetypes", "1"),
-                ("page", &page.to_string()),
+                ("page", page_number.as_str()),
                 ("isNewThree", "1"),
                 ("sortfield", "purchaseDate"),
                 ("sorttype", "desc"),
+                ("startTime", from.as_str()),
+                ("endTime", to.as_str()),
+                ("needFields", BSE_COLUMNS),
             ])
             .send()?;
         let raw = response_text(response, false)?;
@@ -172,7 +268,7 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
         total = parsed.total_pages;
         page += 1;
     }
-    let raw = raws.join("\n");
+    let raw = combine_raw_pages(raws);
     Ok(output_with_counts(
         "bse",
         started,
@@ -223,17 +319,79 @@ fn output_with_counts(
     }
 }
 
+fn eastmoney_page_counts(raw: &str) -> Result<(Option<usize>, usize, usize)> {
+    let root: Value = serde_json::from_str(raw)?;
+    if eastmoney_empty(&root) {
+        return Ok((Some(0), 0, 0));
+    }
+    if root.get("success").and_then(Value::as_bool) == Some(false) {
+        bail!("东方财富响应 success=false")
+    }
+    let result = root
+        .get("result")
+        .and_then(Value::as_object)
+        .context("东方财富响应缺少 result")?;
+    let details = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("东方财富响应缺少 result.data")?;
+    Ok((
+        result
+            .get("count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        details.len(),
+        result.get("pages").and_then(Value::as_u64).unwrap_or(1) as usize,
+    ))
+}
+
+fn sse_page_counts(raw: &str) -> Result<(Option<usize>, usize, usize)> {
+    let root: Value = serde_json::from_str(raw)?;
+    let page = root
+        .get("pageHelp")
+        .and_then(Value::as_object)
+        .context("上交所响应缺少 pageHelp")?;
+    let details = page
+        .get("data")
+        .and_then(Value::as_array)
+        .context("上交所响应缺少 pageHelp.data")?;
+    Ok((
+        page.get("total")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        details.len(),
+        page.get("pageCount").and_then(Value::as_u64).unwrap_or(1) as usize,
+    ))
+}
+
+fn eastmoney_empty(root: &Value) -> bool {
+    root.get("success").and_then(Value::as_bool) == Some(false)
+        && root.get("code").and_then(Value::as_i64) == Some(9201)
+        && root.get("result").is_none_or(Value::is_null)
+}
+
+fn combine_raw_pages(raws: Vec<String>) -> String {
+    let pages = raws
+        .iter()
+        .map(|raw| parse_payload(raw))
+        .collect::<Result<Vec<_>>>();
+    match pages {
+        Ok(pages) => Value::Array(pages).to_string(),
+        Err(_) => raws.join("\n"),
+    }
+}
+
 fn response_counts(source: &str, raw: &str) -> Result<(Option<usize>, usize)> {
+    if source == "eastmoney" {
+        let (declared_count, detail_count, _) = eastmoney_page_counts(raw)?;
+        return Ok((declared_count, detail_count));
+    }
+    if source == "sse" {
+        let (declared_count, detail_count, _) = sse_page_counts(raw)?;
+        return Ok((declared_count, detail_count));
+    }
     let root: Value = serde_json::from_str(raw)?;
     let (declared_count, details) = match source {
-        "eastmoney" => (
-            root.pointer("/result/count").and_then(Value::as_u64),
-            root.pointer("/result/data").and_then(Value::as_array),
-        ),
-        "sse" => (
-            root.pointer("/pageHelp/total").and_then(Value::as_u64),
-            root.pointer("/pageHelp/data").and_then(Value::as_array),
-        ),
         "cninfo" => (
             root.get("count").and_then(Value::as_u64),
             root.get("data").and_then(Value::as_array),
@@ -272,6 +430,9 @@ fn collector_audit(
 
 pub fn parse_eastmoney(raw: &str, fetched: ChinaDateTime) -> Result<Vec<Candidate>> {
     let root: Value = serde_json::from_str(raw)?;
+    if eastmoney_empty(&root) {
+        return Ok(Vec::new());
+    }
     if root.get("success").and_then(Value::as_bool) == Some(false) {
         bail!("东方财富响应 success=false")
     };
@@ -635,11 +796,15 @@ fn unwrap_jsonp(raw: &str) -> Result<&str> {
     let end = trimmed.rfind(')').context("无效 JSONP")?;
     Ok(&trimmed[start + 1..end])
 }
+
+fn parse_payload(raw: &str) -> Result<Value> {
+    serde_json::from_str(raw)
+        .or_else(|_| unwrap_jsonp(raw).and_then(|value| Ok(serde_json::from_str(value)?)))
+}
+
 fn schema_fingerprint(raw: &str) -> String {
     let mut keys = BTreeSet::new();
-    if let Ok(value) = serde_json::from_str::<Value>(raw)
-        .or_else(|_| unwrap_jsonp(raw).and_then(|v| serde_json::from_str(v).map_err(Into::into)))
-    {
+    if let Ok(value) = parse_payload(raw) {
         collect_keys(&value, &mut keys);
     }
     sha256(keys.into_iter().collect::<Vec<_>>().join("\n"))
@@ -735,6 +900,64 @@ mod tests {
         let rejected = collector_audit(None, 2, 1);
         assert_eq!(rejected.state(), HealthState::Warning);
         assert!(rejected.summary().unwrap().contains("仅 1 条通过"));
+    }
+
+    #[test]
+    fn collector_queries_are_bounded_to_the_reminder_scope() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        assert_eq!(
+            ipo_window(today),
+            (
+                NaiveDate::from_ymd_opt(2026, 6, 27).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()
+            )
+        );
+
+        let eastmoney = url::Url::parse(&eastmoney_url(today, 2).unwrap()).unwrap();
+        let eastmoney: std::collections::HashMap<_, _> =
+            eastmoney.query_pairs().into_owned().collect();
+        assert_eq!(
+            eastmoney.get("filter").map(String::as_str),
+            Some("(APPLY_DATE>='2026-06-27')(APPLY_DATE<='2026-10-25')")
+        );
+        assert_eq!(
+            eastmoney.get("columns").map(String::as_str),
+            Some(EASTMONEY_COLUMNS)
+        );
+        assert_eq!(eastmoney.get("pageNumber").map(String::as_str), Some("2"));
+        assert_eq!(eastmoney.get("pageSize").map(String::as_str), Some("100"));
+
+        let sse = url::Url::parse(&sse_url(3).unwrap()).unwrap();
+        let sse: std::collections::HashMap<_, _> = sse.query_pairs().into_owned().collect();
+        assert_eq!(sse.get("isIssue").map(String::as_str), Some("1"));
+        assert_eq!(sse.get("pageHelp.cacheSize").map(String::as_str), Some("1"));
+        assert_eq!(sse.get("pageHelp.pageNo").map(String::as_str), Some("3"));
+        assert_eq!(
+            sse.get("pageHelp.pageSize").map(String::as_str),
+            Some("100")
+        );
+    }
+
+    #[test]
+    fn eastmoney_empty_window_is_a_healthy_empty_result() {
+        let raw = r#"{"version":null,"result":null,"success":false,"message":"返回数据为空","code":9201}"#;
+        let fetched = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            crate::model::time(12, 0),
+        );
+        assert!(parse_eastmoney(raw, fetched).unwrap().is_empty());
+        assert_eq!(response_counts("eastmoney", raw).unwrap(), (Some(0), 0));
+        assert_eq!(collector_audit(Some(0), 0, 0).state(), HealthState::Healthy);
+    }
+
+    #[test]
+    fn combined_pages_keep_a_parseable_schema_snapshot() {
+        let raw = combine_raw_pages(vec![
+            r#"{"page":{"first":1}}"#.to_owned(),
+            r#"callback([{"second":2}])"#.to_owned(),
+        ]);
+        assert!(serde_json::from_str::<Value>(&raw).is_ok());
+        assert_ne!(schema_fingerprint(&raw), sha256(b""));
     }
 
     #[test]

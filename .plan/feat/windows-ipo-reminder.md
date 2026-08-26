@@ -23,7 +23,7 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 
 0.3.1 已具备可运行的核心业务闭环：
 
-- 四来源候选采集、多来源裁决，以及只保存标题、来源、发布时间和官方 URL 的正式公告元数据检索。
+- 四来源有界候选采集、多来源裁决，以及只保存标题、来源、发布时间和官方 URL 的正式公告元数据检索。
 - SQLite 持久化、逐只确认与撤销、关键变化后重新确认。
 - 四态同步结论、来源计数审计、来源健康和持久化退避。
 - 06:00–22:00 自动同步窗口、前夜和 08:00 定点核验、错过补做与确定性抖动。
@@ -53,6 +53,14 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 - 当前版本不再产生新的 `AnnouncementVerified` 状态或本地公告文件；旧数据库中的历史状态、公告记录和已有 PDF 继续兼容读取，但不会自动删除。
 - 退役 PDF 自动处理不得削弱四来源采集、数量审计、来源健康、冲突提示、缺失字段保留和“来源不完整时不得宣称今日无新股”等现有可靠性边界。
 
+### 0.2 候选数据源减负决策（2026-08-26）
+
+- Eastmoney 的 `RPTA_APP_IPOAPPLY` 是历史累计表。此前无过滤请求固定第一页 500 条，却用全历史 `result.count=5622` 与本页明细数比较，造成长期 Warning；500 条全部通过解析，问题属于查询范围和分页审计语义，不是解析丢数。
+- Eastmoney 保留为全市场候选发现来源，不下载全历史。查询改为申购日在过去 60 天至未来 60 天，只请求代码、简称、市场、申购日期、发行状态、申购代码、价格、单位、上限、市值要求、中签、缴款和上市日期等实际使用字段，并按过滤后的页数读取。
+- SSE 改用其官方“新股发行一览”页面自身的 `isIssue=1`、`pageHelp.cacheSize=1` 查询语义，不再读取全历史发行记录。BSE 使用页面接口已经支持的 `startTime/endTime` 限定同一 120 天窗口。CNINFO 当前只提供小型近期 IPO 结果集，三个公告源也已经按单只股票和短日期窗查询，因此保持现状。
+- Eastmoney、SSE、BSE 的有界查询最多读取 5 页。超过上限时继续使用已解析候选，但声明数与实际明细数不一致会使来源进入 Warning，不能参与“完整覆盖”结论；Eastmoney 明确的空窗口响应按 0 条健康结果处理。
+- 本次减负不改变来源优先级：交易所/CNINFO 结构化字段仍为 200，Eastmoney 为 100；不把第三方聚合结果置于官方来源之上，也不移除全市场发现兜底。
+
 仍须避免以下误判：
 
 - Windows Toast 主路径已经实现；当前只要求在实际安装环境验证用户启用的 Toast 或气泡回退一次，不再要求覆盖通知中心、勿扰、专注助手和所有系统策略组合。便携版没有 MSI 快捷方式注册时允许明确降级到托盘气泡。
@@ -70,14 +78,14 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 | 项目 | 结果 | 证据 |
 | --- | --- | --- |
 | Cargo 版本 | 0.3.1 | Cargo.toml |
-| Rust/Slint 测试 | 84/84 通过 | `rtk cargo test` 已通过；删除 4 项 PDF 下载/解析专用测试后，package 阶段仍执行 `rtk cargo test --locked` |
+| Rust/Slint 测试 | 87/87 通过 | `rtk cargo test` 已通过；新增有界查询、明确空窗口和多页 schema 快照回归，package 阶段仍执行 `rtk cargo test --locked` |
 | 233 MiB 旧库启动迁移 | 界面与托盘 17 ms 呈现；数据库 233,574,400 → 782,336 bytes | 2026-08-26 隔离数据根实测；schema v8→v9，正文 0，空闲页 0 |
 | Release 构建 | 通过 | rtk cmd /c build.bat --package |
 | 构建布局 | 通过 | scripts/validate-build-layout.ps1，runtime 文件数 4 |
-| Windows smoke | schema v10，18/18 检查通过 | build/artifacts/tests/smoke/windows-rust-0.3.1-20260827-003543.json |
+| Windows smoke | schema v10，18/18 检查通过 | build/artifacts/tests/smoke/windows-rust-0.3.1-20260827-010551.json |
 | 签名/更新集成 | 6/6 检查通过；本次设置简化未改签名/更新协议，未重复执行 | build/artifacts/tests/signing-update/signing-update-0.3.1-20260826-222236.json |
 | Release audit | schema v2，10/10 通过；本次设置简化未改审计规则，未重复执行 | build/artifacts/tests/audit/release-rust-0.3.1-20260826-222630.json |
-| 联网同步/内存 | schema v2，通过；SSE/CNINFO/BSE 与三个公告源正常，Eastmoney 覆盖不完整时安全保持 Unknown；意外子进程和退役 PDF 临时文件均为 0 | build/artifacts/diagnostics/memory/rust-0.3.1-20260827-000819.json |
+| 联网同步/内存 | schema v2，通过；Eastmoney/SSE/CNINFO/BSE 与三个公告源全部 Healthy，结论为 HealthyEmpty；意外子进程和退役 PDF 临时文件均为 0 | build/artifacts/diagnostics/memory/rust-0.3.1-20260827-010551.json |
 | Watchdog 恢复矩阵 | 通过；本次设置简化未改监督协议，未重复执行 | build/artifacts/tests/watchdog/watchdog-matrix-0.3.1-20260826-222244.json |
 | 可运行 EXE | 已生成 | build/run/x64-release/StockIpoReminder.exe |
 | 便携 ZIP | 已生成 | build/packages/0.3.1/StockIpoReminder-0.3.1-win-x64-portable.zip |
@@ -85,14 +93,14 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 | 发布清单 | 已生成；`signed=false`，崩溃接收端/隐私政策均未配置 | build/packages/0.3.1/release-manifest.json |
 | 校验和 | 已生成 | build/packages/0.3.1/SHA256SUMS.txt |
 
-注：本轮 smoke 和联网内存报告的文件名由脚本按本机本地日期生成，因此包含 `20260827`；报告 JSON 内的 `generatedAtUtc` 分别为 `2026-08-26T16:36:12Z` 和 `2026-08-26T16:08:39Z`。
+注：本轮 smoke 和联网内存报告的文件名由脚本按本机本地日期生成，因此包含 `20260827`；报告 JSON 内的 `generatedAtUtc` 分别为 `2026-08-26T17:06:37Z` 和 `2026-08-26T17:06:04Z`。
 
 当前发布物：
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| StockIpoReminder-0.3.1-win-x64-portable.zip | 7,686,135 bytes | c123d9bff419b44e2460c9d5b4567705e92122edf416dd8c79c07a087bc4c8bd |
-| StockIpoReminder-0.3.1-win-x64.msi | 6,348,800 bytes | 049fe3b941ebf7401eb391346fc819e0def145732a2899f98e262956c8c1f272 |
+| StockIpoReminder-0.3.1-win-x64-portable.zip | 7,689,687 bytes | 53b51d0839c26968528dcf65c67890f5e5c0d13e0d3001960bf6ce831cfe48b9 |
+| StockIpoReminder-0.3.1-win-x64.msi | 6,352,896 bytes | 2293746a78ae5e80b2f0ac68e72f604847803288fe679730691cc85244c35c4b |
 
 Windows smoke 空闲采样：
 
@@ -102,11 +110,11 @@ Windows smoke 空闲采样：
 
 联网同步内存报告：
 
-- 主进程峰值：18,657,280 bytes Private Bytes / 46,706,688 bytes Working Set，低于 100 MiB 门禁。
+- 主进程峰值：6,553,600 bytes Private Bytes / 34,721,792 bytes Working Set，低于 100 MiB 门禁。
 - 进程族峰值与主进程相同；意外子进程峰值数量 0，意外子进程内存峰值 0。
-- 同步后主进程：7,352,320 / 10,199,040 bytes。
+- 同步后主进程：5,984,256 / 9,834,496 bytes。
 - 结束后残留意外子进程 0，退役 PDF 临时文件 0；隔离数据目录没有新增 PDF 文件。
-- 本轮 SSE、CNINFO、BSE 分别取得 1,475、4、347 条记录；三个公告元数据源均为 Healthy，共更新 23 个任务和 32 条公告链接。Eastmoney 覆盖不完整时同步结论保持 Unknown，没有误报“今日无新股”，因此当前发布候选联网项已闭环。
+- 本轮 Eastmoney、SSE、CNINFO、BSE 分别取得 39、7、4、18 条记录，四个候选源和三个公告元数据源均为 Healthy，共更新 23 个任务和 32 条公告链接；同步结论为 HealthyEmpty。此前 Eastmoney 的 `declared=5622/details=500` 假警告已经消失，SSE/BSE 也不再抓取 1,475/347 条历史记录。
 
 Watchdog 恢复矩阵：
 
@@ -157,7 +165,7 @@ Watchdog 恢复矩阵：
 | 系统恢复 | 已实现，实机证据待补 | 休眠恢复、解锁、时间变化、网络恢复触发检查和同步；schema v10 smoke 注入 power/unlock/time 消息并验证 5 秒防抖；历史过期提醒折叠回归已通过 | **必须**：睡眠/锁屏和网络恢复各一次；RDP/恢复风暴停止专项投入 |
 | Windows Toast/气泡/声音/闪烁 | 已实现，用户已确认 | 稳定 AUMID 的 WinRT Toast；失败后回退带 NIIF_RESPECT_QUIET_TIME 的 Shell_NotifyIcon 气泡；MessageBeep、FlashWindowEx；用户已验证当前提醒、提示窗、声音和闪烁 | **闭环**：不补完整系统通知状态矩阵 |
 | 通知通道自检 | 已实现 | 专用提醒窗、Windows Toast、托盘气泡回退、声音、任务栏闪烁分开测试；Toast 或气泡回退任一通过可满足已启用的系统通知通道 | **保持**：不追加系统策略和无交互桌面报告 |
-| 四来源采集 | 已实现 | Eastmoney、SSE、CNINFO、BSE | **必须**：每个发布候选执行一次隔离联网同步 |
+| 四来源采集 | 已实现 | Eastmoney 与 BSE 使用过去/未来各 60 天窗口，SSE 使用官方“发行中”筛选，CNINFO 保持当前小结果集；有界分页最多 5 页 | **必须**：每个发布候选执行一次隔离联网同步 |
 | Collector 数量审计 | 已实现 | 审计声明数、明细数和身份校验数，不一致时来源 Warning | **必须**：纳入发布候选联网同步，不单独建设监控 |
 | 正式公告 | 已简化 | SSE、CNINFO、BSE，沪市可用巨潮镜像兜底；只保存标题、来源、发布时间和官方 URL，不请求 PDF 正文 | **必须**：联网同步中抽查链接可打开；不恢复正文处理 |
 | PDF Worker | 已移除 | `lopdf`、Worker 命令入口、请求/响应临时文件、PDF 下载和 Windows Job Object 限制均已从当前源码移除 | 旧实现证据仅作历史记录，不重新引入自动正文解析 |
@@ -580,7 +588,7 @@ Watchdog：
 ### P0：产品减重（已完成）
 
 - 自动 PDF 下载/解析、`lopdf`、PDF Worker 和对应 Job Object 已移除；新同步只保存公告元数据与官方 URL，旧 PDF 保留。
-- 84/84 测试、发布打包、布局、schema v10 smoke 18/18 和 schema v2 联网同步内存检查均已通过。
+- 87/87 测试、发布打包、布局、schema v10 smoke 18/18 和 schema v2 联网同步内存检查均已通过。
 
 ### P1：核心实机闭环（当前唯一必做）
 
@@ -619,7 +627,7 @@ Watchdog：
 - 安全 MSI 卸载主路径、默认保留数据、精确确认短语和当前用户数据根目录限制已经实现；真实安装环境只补最小安装、升级、保留数据卸载和明确清理。
 - 数据库升级前备份改为按实际 schema 触发，备份节流参数已修正，并有 schema 变化/应用版本变化分离的回归测试。
 - 233,574,400 bytes 旧库副本已验证 UI/托盘 17 ms 呈现；后台完成 v8→v9 安全备份、接口正文清理和 VACUUM 后数据库缩至 782,336 bytes。
-- 当前批次已补齐过期提醒跳过与折叠、本地投递有界退避和健康错误、系统时间与跨日/回拨调度矩阵、唯一临时备份与提交前中断保护、Windows 写穿原子状态替换、DPAPI 凭据轮换及 2,000 条筛选回归。
+- 当前批次已补齐过期提醒跳过与折叠、本地投递有界退避和健康错误、系统时间与跨日/回拨调度矩阵、唯一临时备份与提交前中断保护、Windows 写穿原子状态替换、DPAPI 凭据轮换、2,000 条筛选回归，以及四来源有界候选查询与正确分页审计。
 - P0 公告链路减重已完成：当前源码不再包含 `lopdf`、PDF Worker、PDF Job Object 或自动公告下载/正文解析；同步只保存公告元数据和官方 URL，旧本地 PDF 不自动删除。
 - Authenticode/RFC 3161 构建链、detached CMS 更新清单、证书固定、MSI 下载验证和更新 helper 已实现；临时签名集成已验证文件签名、CMS、哈希、证书固定和篡改拒绝。
 - 当前正式发布物仍为 `signed=false`，未编译正式更新源和证书指纹，因此设置页自动更新保持关闭；正式 CA、真实时间戳、线上 HTTPS 源和在线升级/回滚属于公开分发条件，不阻塞当前个人/内部使用。
