@@ -23,7 +23,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -38,6 +38,7 @@ use slint::{CloseRequestResponse, ComponentHandle, ModelRc, Timer, TimerMode, Ve
 slint::include_modules!();
 
 fn main() -> Result<()> {
+    let startup_started = Instant::now();
     let arguments: Vec<String> = env::args().skip(1).collect();
     if let Some(exit_code) = announcement::try_run_pdf_worker(&arguments)? {
         std::process::exit(exit_code);
@@ -72,7 +73,7 @@ fn main() -> Result<()> {
     }
 
     let _instance = windows_integration::SingleInstance::acquire(&options.data_root)?;
-    run_application(options)
+    run_application(options, startup_started)
 }
 
 fn activate_existing_instance(data_root: &std::path::Path) {
@@ -94,7 +95,7 @@ fn activate_existing_instance(data_root: &std::path::Path) {
     );
 }
 
-fn run_application(options: RuntimeOptions) -> Result<()> {
+fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<()> {
     let reminder_window_smoke_report = options.reminder_window_smoke_report.clone();
     let windows_recovery_smoke_report = options.windows_recovery_smoke_report.clone();
     if let Err(error) = windows_integration::initialize_notification_platform() {
@@ -157,21 +158,6 @@ fn run_application(options: RuntimeOptions) -> Result<()> {
             .unwrap_or_else(crash_upload::configuration_status)
             .into(),
     );
-    let initial_settings = runtime.settings().unwrap_or_default();
-    if initial_settings.onboarding_completed && !options.skip_auto_start_registration {
-        if let Err(error) = windows_integration::set_auto_start(
-            initial_settings.auto_start_enabled,
-            &env::current_exe()?,
-            &options.data_root,
-        ) {
-            operations::log("WARN", &format!("校准开机自启动失败：{error:#}"));
-        }
-    }
-    apply_settings(&ui, &initial_settings);
-    refresh_secondary_notification_ui(&ui, &options.data_root, &initial_settings, &runtime);
-    if !initial_settings.onboarding_completed {
-        ui.set_active_page(3);
-    }
     refresh_ui(&ui, &runtime);
     let available_update = Arc::new(Mutex::new(None::<updater::AvailableUpdate>));
     let crash_upload_busy = Arc::new(AtomicBool::new(false));
@@ -211,31 +197,6 @@ fn run_application(options: RuntimeOptions) -> Result<()> {
     );
     wire_reminder_callbacks(&reminder_window, &ui, runtime.clone());
 
-    if initial_settings.automatic_updates_enabled && update_configured && !options.skip_update_check
-    {
-        let update_window = ui.as_weak();
-        let update_state = Arc::clone(&available_update);
-        Timer::single_shot(Duration::from_secs(3), move || {
-            start_update_check(update_window.clone(), Arc::clone(&update_state), true);
-        });
-    }
-    if initial_settings.crash_report_upload_enabled
-        && crash_upload_configured
-        && !options.skip_crash_upload
-    {
-        let upload_window = ui.as_weak();
-        let upload_root = options.data_root.clone();
-        let upload_busy = Arc::clone(&crash_upload_busy);
-        Timer::single_shot(Duration::from_secs(5), move || {
-            start_crash_upload(
-                upload_window.clone(),
-                upload_root.clone(),
-                Arc::clone(&upload_busy),
-                true,
-            );
-        });
-    }
-
     let weak = ui.as_weak();
     let reminder_weak = reminder_window.as_weak();
     let polling_runtime = runtime.clone();
@@ -243,10 +204,66 @@ fn run_application(options: RuntimeOptions) -> Result<()> {
     let polling_tray = Arc::clone(&tray);
     let polling_data_root = options.data_root.clone();
     let polling_secondary_busy = Arc::clone(&secondary_notification_busy);
+    let polling_available_update = Arc::clone(&available_update);
+    let polling_crash_upload_busy = Arc::clone(&crash_upload_busy);
+    let polling_skip_auto_start_registration = options.skip_auto_start_registration;
+    let polling_skip_update_check = options.skip_update_check;
+    let polling_skip_crash_upload = options.skip_crash_upload;
     let polling_timer = Timer::default();
     let mut secondary_status_tick = 0_u8;
+    let mut runtime_startup_applied = false;
     polling_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
         let Some(ui) = weak.upgrade() else { return };
+        if !runtime_startup_applied && polling_runtime.is_ready() {
+            let settings = polling_runtime.settings().unwrap_or_default();
+            if settings.onboarding_completed && !polling_skip_auto_start_registration {
+                match env::current_exe() {
+                    Ok(executable) => {
+                        if let Err(error) = windows_integration::set_auto_start(
+                            settings.auto_start_enabled,
+                            &executable,
+                            &polling_data_root,
+                        ) {
+                            operations::log("WARN", &format!("校准开机自启动失败：{error:#}"));
+                        }
+                    }
+                    Err(error) => operations::log(
+                        "WARN",
+                        &format!("读取当前程序路径失败，无法校准开机自启动：{error:#}"),
+                    ),
+                }
+            }
+            apply_settings(&ui, &settings);
+            refresh_secondary_notification_ui(&ui, &polling_data_root, &settings, &polling_runtime);
+            if !settings.onboarding_completed {
+                ui.set_active_page(3);
+            }
+            if settings.automatic_updates_enabled && update_configured && !polling_skip_update_check
+            {
+                let update_window = ui.as_weak();
+                let update_state = Arc::clone(&polling_available_update);
+                Timer::single_shot(Duration::from_secs(3), move || {
+                    start_update_check(update_window.clone(), Arc::clone(&update_state), true);
+                });
+            }
+            if settings.crash_report_upload_enabled
+                && crash_upload_configured
+                && !polling_skip_crash_upload
+            {
+                let upload_window = ui.as_weak();
+                let upload_root = polling_data_root.clone();
+                let upload_busy = Arc::clone(&polling_crash_upload_busy);
+                Timer::single_shot(Duration::from_secs(5), move || {
+                    start_crash_upload(
+                        upload_window.clone(),
+                        upload_root.clone(),
+                        Arc::clone(&upload_busy),
+                        true,
+                    );
+                });
+            }
+            runtime_startup_applied = true;
+        }
         refresh_ui(&ui, &polling_runtime);
         secondary_status_tick = (secondary_status_tick + 1) % 5;
         if ui.get_active_page() == 3
@@ -359,6 +376,13 @@ fn run_application(options: RuntimeOptions) -> Result<()> {
     });
 
     ui.show().context("无法显示主窗口")?;
+    operations::log(
+        "INFO",
+        &format!(
+            "启动界面与托盘已呈现：elapsedMs={}",
+            startup_started.elapsed().as_millis()
+        ),
+    );
     #[cfg(windows)]
     {
         let icon_window = ui.as_weak();
@@ -902,20 +926,18 @@ fn wire_callbacks(
     let weak = ui.as_weak();
     ui.on_create_diagnostics(move || {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_status_text(
-            match operations::create_diagnostic_bundle(
-                &diagnostic_root,
-                diagnostic_runtime.database(),
-            ) {
-                Ok(path) => {
-                    if let Some(directory) = path.parent() {
-                        let _ = windows_integration::open_folder(directory);
-                    }
-                    format!("诊断包已生成：{}", path.display()).into()
+        let result = diagnostic_runtime
+            .database()
+            .and_then(|database| operations::create_diagnostic_bundle(&diagnostic_root, database));
+        ui.set_status_text(match result {
+            Ok(path) => {
+                if let Some(directory) = path.parent() {
+                    let _ = windows_integration::open_folder(directory);
                 }
-                Err(error) => format!("诊断包生成失败：{error:#}").into(),
-            },
-        );
+                format!("诊断包已生成：{}", path.display()).into()
+            }
+            Err(error) => format!("诊断包生成失败：{error:#}").into(),
+        });
     });
 
     let open_root = data_root.clone();
@@ -1657,6 +1679,10 @@ fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
         0
     };
     ui.set_runtime_level(level);
+
+    if !runtime.is_ready() {
+        return;
+    }
 
     let settings = runtime.settings().unwrap_or_default();
     let today = runtime.today_events().unwrap_or_default();

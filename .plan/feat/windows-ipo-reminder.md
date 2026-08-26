@@ -37,6 +37,7 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 - 设置页可从当前用户进程启动安全 MSI 卸载；默认保留数据，可选清理必须精确确认且只允许当前用户默认数据目录。
 - 每日备份、日志保留、运维健康、诊断 ZIP 和异常退出报告。
 - Windows Time 服务检查、同 EXE Watchdog、崩溃循环限制、数据库迁移前备份。
+- 主窗口和托盘先呈现，数据库备份、迁移、完整性检查与必要压缩在后台完成；就绪前数据库操作有统一门禁。
 - x64 MSI、便携 ZIP、发布布局、Windows smoke、发布审计和联网内存测量。
 - 可选 Authenticode/RFC 3161 签名构建、detached CMS 更新清单、签名证书固定、MSI 安装版安全自动更新和短生命周期更新 helper。
 - 用户明确同意后可发送二次脱敏的受控 Watchdog 崩溃报告；默认关闭，接收地址和隐私政策必须同时配置为无凭据 HTTPS。
@@ -59,14 +60,15 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 | 项目 | 结果 | 证据 |
 | --- | --- | --- |
 | Cargo 版本 | 0.3.1 | Cargo.toml |
-| Rust/Slint 测试 | 86/86 通过 | package 阶段执行 `rtk cargo test --locked` 并通过 |
+| Rust/Slint 测试 | 88/88 通过 | `rtk cargo test` 已通过；package 阶段仍执行 `rtk cargo test --locked` |
+| 233 MiB 旧库启动迁移 | 界面与托盘 17 ms 呈现；数据库 233,574,400 → 782,336 bytes | 2026-08-26 隔离数据根实测；schema v8→v9，正文 0，空闲页 0 |
 | Release 构建 | 通过 | rtk cmd /c build.bat --package |
 | 构建布局 | 通过 | scripts/validate-build-layout.ps1，runtime 文件数 4 |
-| Windows smoke | schema v10，18/18 检查通过 | build/artifacts/tests/smoke/windows-rust-0.3.1-20260826-222200.json |
-| 签名/更新集成 | 6/6 检查通过；正式系统信任仍待接入 | build/artifacts/tests/signing-update/signing-update-0.3.1-20260826-222236.json |
-| Release audit | schema v2，10/10 通过 | build/artifacts/tests/audit/release-rust-0.3.1-20260826-222630.json |
-| 联网同步/内存 | 通过；单 Worker 峰值低于 512 MiB Job Object 硬上限 | build/artifacts/diagnostics/memory/rust-0.3.1-20260826-222504.json |
-| Watchdog 恢复矩阵 | 通过 | build/artifacts/tests/watchdog/watchdog-matrix-0.3.1-20260826-222244.json |
+| Windows smoke | schema v10，18/18 检查通过 | build/artifacts/tests/smoke/windows-rust-0.3.1-20260826-230820.json |
+| 签名/更新集成 | 6/6 检查通过；本次启动/存储修复未重复执行 | build/artifacts/tests/signing-update/signing-update-0.3.1-20260826-222236.json |
+| Release audit | schema v2，10/10 通过；本次启动/存储修复未重复执行 | build/artifacts/tests/audit/release-rust-0.3.1-20260826-222630.json |
+| 联网同步/内存 | 通过；本次未改网络/PDF 路径，未重复执行 | build/artifacts/diagnostics/memory/rust-0.3.1-20260826-222504.json |
+| Watchdog 恢复矩阵 | 通过；本次未改监督协议，未重复执行 | build/artifacts/tests/watchdog/watchdog-matrix-0.3.1-20260826-222244.json |
 | 可运行 EXE | 已生成 | build/run/x64-release/StockIpoReminder.exe |
 | 便携 ZIP | 已生成 | build/packages/0.3.1/StockIpoReminder-0.3.1-win-x64-portable.zip |
 | MSI | 已生成 | build/packages/0.3.1/StockIpoReminder-0.3.1-win-x64.msi |
@@ -77,13 +79,13 @@ Stock IPO Reminder 已完成从 C#、WPF 到 Rust、Slint 的正式迁移。当�
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| StockIpoReminder-0.3.1-win-x64-portable.zip | 8,023,317 bytes | eb31d474b212f4d74f11504e0b10fd7dcc1c4602200dff17d40657e31da806b4 |
-| StockIpoReminder-0.3.1-win-x64.msi | 6,643,712 bytes | f6fababb795602b2e77abdb8381447e02c0c462fcbf4bc02dbd5ae218ca5989f |
+| StockIpoReminder-0.3.1-win-x64-portable.zip | 8,026,964 bytes | 6681d845b2123fa4a6e279638e2e4eba21b2e7c416836086a91ed78380f7a3a1 |
+| StockIpoReminder-0.3.1-win-x64.msi | 6,643,712 bytes | bdac46a3393b08e502715c1d19669a2c3be6536755901d0f56dc6b80d32b5a44 |
 
 Windows smoke 空闲采样：
 
-- Private Bytes：6,864,896 bytes。
-- Working Set：38,580,224 bytes。
+- Private Bytes：6,455,296 bytes。
+- Working Set：36,691,968 bytes。
 - 便携自检、W32Time 与 Windows Toast 诊断、后台 UI、专用提醒窗不抢焦点、第二次启动唤醒、模拟托盘图标丢失后的 TaskbarCreated 重新注册、恢复消息防抖、MSI 管理安装映像、MSI 载荷自检、可选安装目录、AUMID、安全卸载、签名更新、崩溃报告隐私和第二通知通道安全 authoring 均通过。
 
 联网同步内存报告：
@@ -146,9 +148,10 @@ Watchdog 恢复矩阵：
 | 自动同步调度 | 已实现 | 06:00–22:00；前夜 20:00；申购日 08:00；错过补做；普通日 0–90 秒、申购日 0–20 秒抖动；跨日窗口和时钟回拨输入已有确定性回归 | 仍需节假日和真实长时间运行报告 |
 | 每日健康摘要 | 已实现 | 08:00 精确边界，数据库唯一键跨重启去重 | 无任务、部分来源失败、全部失败的 UI 截图和实机报告 |
 | 系统时间检查 | 已实现 | Microsoft/Cloudflare HTTPS Date 样本，加 W32Time 服务状态；自动化矩阵覆盖无样本、单样本、正常偏差、超过五分钟偏差、服务停止和状态读取失败 | 仍需真实服务禁用、权限限制和代理篡改环境证据 |
-| SQLite 数据层 | 已实现 | WAL、migration v1–v8、事件/来源/公告/确认、本地与第二通知 Outbox、发送尝试和健康表 | 继续保持每次 schema 演进独立 migration |
-| 每日维护与备份 | 已实现 | 每小时独立触发；每日 SQLite 在线备份；唯一临时文件、完整性检查、`sync_all`、原子提交；提交前中断会保留既有备份并清理临时文件；保留 7 份 | 仍需磁盘满、只读目录和真实强杀进程故障注入 |
-| 版本迁移前备份 | 已实现 | 应用版本标记变化时，在 schema 初始化前创建并校验备份；失败则中止；版本标记使用 Windows 写穿原子替换 | 仍需真实旧版本→0.3.1 MSI 与便携升级矩阵 |
+| SQLite 数据层 | 已实现 | WAL、migration v1–v9、事件/来源/公告/确认、本地与第二通知 Outbox、发送尝试和健康表；同步审计只存元数据与哈希，不保存接口正文 | 继续保持每次 schema 演进独立 migration |
+| 启动与数据库就绪 | 已实现 | UI/托盘先呈现；备份、迁移、完整性检查和必要压缩在后台执行；就绪前设置、任务、确认、人工覆盖与诊断入口统一拒绝数据库访问 | 继续观察极慢磁盘和安全软件环境，不再把后台准备误记为首屏阻塞 |
+| 每日维护与备份 | 已实现 | 每小时独立触发；每日 SQLite 在线备份；每 1,024 页仅让出 1 ms；唯一临时文件、完整性检查、`sync_all`、原子提交；提交前中断会保留既有备份并清理临时文件；保留 7 份 | 仍需磁盘满、只读目录和真实强杀进程故障注入 |
+| 版本迁移前备份 | 已实现 | 根据实际 schema 版本判断，只在需要迁移时于 initialize 前创建并校验备份；失败则不迁移；application-version 标记继续使用 Windows 写穿原子替换 | 仍需真实旧版本→0.3.1 MSI 与便携升级矩阵 |
 | 日志与诊断 | 已实现 | 按日期日志、单日分段、14 天保留；诊断 ZIP schema v4；近期同步、健康、本地与第二通知 Outbox、提醒、崩溃及 Windows Toast 诊断；不包含第二通道凭据 | 一键复制摘要、用户可选时间范围 |
 | MSI/便携包 | 已实现/历史替代 | x64 per-machine MSI、可选目录、Major Upgrade、Portable ZIP；开始菜单快捷方式写入稳定 AUMID | 真实安装、升级、回滚、修复、卸载及安装版 Toast 矩阵 |
 | 卸载删除数据选项 | 已实现，实机证据待补 | 设置页检测本产品 MSI 后提供入口；默认保留数据；可选清理要求精确短语，通过 UpgradeCode 查询 ProductCode，临时 helper 等主进程退出后调用 msiexec；仅 MSI 成功后删除当前用户默认 LocalAppData 数据目录 | 在隔离 Windows 虚拟机补普通卸载保留数据、确认清理、取消/UAC 拒绝、MSI 失败和重启码矩阵 |
@@ -368,6 +371,9 @@ Outbox v7：
 
 ### 6.3 运维、备份与诊断
 
+- Watchdog/单实例建立后立即创建主窗口和托盘；数据库升级备份、initialize、空间回收和 integrity_check 在 runtime 后台线程执行。
+- 数据库未就绪时，UI 只读取内存快照；设置保存、确认、撤销、人工覆盖、第二通知测试和诊断导出返回“本地数据库仍在后台初始化”，不会以默认设置覆盖真实配置。
+- SQLite 在线备份从每 128 页暂停 50 ms 调整为每 1,024 页暂停 1 ms。57,025 页旧库原参数会产生约 22.25 秒固定等待，新参数的固定让出时间低于 60 ms。
 - 维护每小时独立运行，不依赖同步成功。
 - 每日备份使用 SQLite 在线备份 API。
 - 每次备份使用唯一临时文件，写入后执行 integrity_check，并在读写句柄上执行 `sync_all`。
@@ -376,11 +382,13 @@ Outbox v7：
 - 默认保留最近 7 份备份。
 - 日志按日期命名，单日达到大小上限后分段，保留 14 天。
 - 维护、备份和日志保留失败写入 operation_health。
+- 同步运行继续记录来源、时间、结果、条数、结构指纹、响应哈希和脱敏错误，但不再持久化接口正文；migration v9 清除旧正文，空闲页达到总页数四分之一时执行 VACUUM。
+- 233,574,400 bytes 的真实 schema v8 数据库副本迁移实测：UI/托盘 17 ms 呈现，备份约 0.58 秒完成，空间回收约 1.19 秒完成，最终数据库 782,336 bytes、191 页、0 空闲页。
 
 版本升级保护：
 
 - application-version.txt 记录最近一次成功初始化数据库的应用版本，并通过 Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` 替换。
-- 发现数据库存在且版本标记不同或缺失时，先创建完整备份。
+- 发现数据库 schema 低于当前 `LATEST_SCHEMA_VERSION` 或无法安全识别时，先创建完整备份；单纯应用版本变化不触发重复备份。
 - 只有 initialize 和 integrity_check 都成功后才更新版本标记。
 - 这同时保护 MSI 与便携版首次运行，不依赖安装目录。
 
@@ -599,7 +607,8 @@ Watchdog：
 - Explorer 图标丢失后的 TaskbarCreated 重新注册、Windows 恢复消息与五秒防抖已有 schema v10 自动化证据；真实 Explorer 重启、物理睡眠和 RDP 仍待实机验收。
 - 明确确认申购后的中签查询、缴款资金和上市日提醒已经实现，但不读取账户或持仓，不推断中签、缴款或交易状态。
 - 安全 MSI 卸载主路径、默认保留数据、精确确认短语和当前用户数据根目录限制已经实现；真实安装环境中的卸载/UAC/失败矩阵仍待隔离虚拟机验收。
-- 数据库升级前备份已有回归测试。
+- 数据库升级前备份改为按实际 schema 触发，备份节流参数已修正，并有 schema 变化/应用版本变化分离的回归测试。
+- 233,574,400 bytes 旧库副本已验证 UI/托盘 17 ms 呈现；后台完成 v8→v9 安全备份、接口正文清理和 VACUUM 后数据库缩至 782,336 bytes。
 - 当前批次已补齐过期提醒跳过与折叠、本地投递有界退避和健康错误、系统时间与跨日/回拨调度矩阵、唯一临时备份与提交前中断保护、Windows 写穿原子状态替换、DPAPI 凭据轮换及 2,000 条筛选回归。
 - PDF Worker 已关闭默认并行解析并施加 512 MiB Job Object 硬上限；本轮实测单 Worker 峰值 427,749,376 bytes，结束后无残留 Worker 或临时文件。继续降低峰值属于暂停的性能研究，不是未闭环可靠性缺口。
 - Authenticode/RFC 3161 构建链、detached CMS 更新清单、证书固定、MSI 下载验证和更新 helper 已实现；临时签名集成已验证文件签名、CMS、哈希、证书固定和篡改拒绝。
@@ -609,13 +618,18 @@ Watchdog：
 - Windows 10、真实 MSI 升级矩阵、多屏/RDP、Explorer 自动重启和安装版 Toast 交互尚未完成，因此不得把这些项目描述为已经验收。
 - 未实现的邮件、短信、通用 Webhook、OCR、多设备同步、采集服务拆分和服务端推送按用户决定暂停，但继续保留在本文档中。
 
-后续每次修改提醒、同步、存储、备份、Windows 集成或打包行为时，至少执行：
+后续每次修改提醒、同步、存储、备份、Windows 集成或打包行为时，先完成统一基础门禁：
 
 ~~~text
 rtk cargo fmt
 rtk cmd /c build.bat --package
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.ps1
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
+~~~
+
+再按实际影响范围补对应专项，避免每次小改都重复执行无关的联网、签名或破坏性矩阵：
+
+~~~text
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/measure-rust-memory.ps1

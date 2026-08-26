@@ -84,7 +84,7 @@ StockIpoReminder-0.3.1-win-x64.msi
 
 MSI 是 64 位按计算机安装，写入 Program Files 时会请求管理员权限；升级会记住上次选择的安装目录。开始菜单快捷方式写入 `StockIpoReminder.Desktop` AUMID，供 Windows Toast 识别。程序启动或保存设置时，会按“登录 Windows 后自动启动”选项写入当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，并清理旧版本遗留的同名计划任务。
 
-MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供程序文件事务回滚。用户数据始终保存在 `%LocalAppData%\StockIpoReminder`，不会随程序目录升级而移动；新版本第一次打开旧数据库时，会在任何 schema 迁移前创建并校验 SQLite 备份，备份失败则停止启动而不继续迁移。
+MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供程序文件事务回滚。用户数据始终保存在 `%LocalAppData%\StockIpoReminder`，不会随程序目录升级而移动；程序只在检测到数据库 schema 确实需要升级时，才会在迁移前创建并校验 SQLite 备份，普通应用版本变化不会重复复制未变化的数据库。备份失败时不会继续迁移。
 
 普通 MSI 卸载只删除程序文件、开始菜单入口和安装目录记录，默认保留数据库、设置、公告缓存和备份。设置页在检测到本产品的 Windows Installer 注册后会提供“卸载程序”入口；默认仍保留数据，也可明确选择在 MSI 成功卸载后删除当前用户数据。删除数据必须准确输入 `删除当前用户数据`，卸载助手只接受当前用户默认的 `%LocalAppData%\StockIpoReminder`，不会枚举或删除其他 Windows 用户目录；MSI 卸载失败时不会删除数据。
 
@@ -111,7 +111,9 @@ secrets\secondary-notification.dpapi.json 当前 Windows 用户加密的第二�
 application-version.txt   已成功打开数据库的应用版本标记
 ```
 
-程序每小时独立检查每日数据库备份，默认保留最近 7 份；备份使用唯一临时文件、SQLite 完整性检查、写盘刷新和最终提交，失败时清理临时文件并保留既有备份。日志按日期保存、单日按大小分段并保留 14 天。诊断包 schema v4 默认不包含数据库、公告全文、原始接口响应或第二通知通道凭据，会脱敏 URL 查询参数、Cookie、Authorization、临时目录和工作区绝对路径，并附带近期同步、来源/运维健康、本地与第二通知 Outbox、提醒日志、Windows Toast/AUMID 状态和最近的 Watchdog 崩溃报告。
+程序每小时独立检查每日数据库备份，默认保留最近 7 份；备份使用唯一临时文件、SQLite 完整性检查、写盘刷新和最终提交，失败时清理临时文件并保留既有备份。同步审计只在 SQLite 中保存来源、时间、条数、状态、结构指纹、响应哈希和脱敏错误，不保存上游接口正文；schema v9 会清除旧版已保存的接口正文，并在空闲页达到数据库四分之一时压缩文件。日志按日期保存、单日按大小分段并保留 14 天。诊断包 schema v4 默认不包含数据库、公告全文、原始接口响应或第二通知通道凭据，会脱敏 URL 查询参数、Cookie、Authorization、临时目录和工作区绝对路径，并附带近期同步、来源/运维健康、本地与第二通知 Outbox、提醒日志、Windows Toast/AUMID 状态和最近的 Watchdog 崩溃报告。
+
+主窗口和托盘会先建立，数据库备份、schema 迁移、完整性检查和必要的空间回收在后台完成；数据库就绪前，设置保存、任务确认和诊断导出会明确提示稍候，不会用默认值覆盖已有配置。
 
 正常启动会由同一 EXE 的轻量 Watchdog 监督主程序。主程序异常退出时最多在 10 分钟窗口内重启 3 次，并按 2、10、30 秒退避；正常“安全退出”不会重启。它不是 Windows Service，关机、退出登录、同时结束 Watchdog 与主程序或 Watchdog 自身被结束时无法继续拉起。
 

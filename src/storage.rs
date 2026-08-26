@@ -29,6 +29,9 @@ const SECONDARY_ATTEMPT_RETENTION_DAYS: i64 = 30;
 const SECONDARY_OUTBOX_RETENTION_DAYS: i64 = 90;
 const SECONDARY_MAX_ATTEMPT_RECORDS: i64 = 2000;
 const LOCAL_DELIVERY_PERSISTENT_FAILURE_MINUTES: i64 = 15;
+const BACKUP_PAGES_PER_STEP: i32 = 1024;
+const BACKUP_STEP_PAUSE: StdDuration = StdDuration::from_millis(1);
+pub const LATEST_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone)]
 pub struct Database {
@@ -65,6 +68,7 @@ impl Database {
         migrate_source_probes_v6(&connection)?;
         migrate_outbox_messages_v7(&connection)?;
         migrate_secondary_notifications_v8(&connection)?;
+        migrate_raw_payload_metadata_v9(&connection)?;
         Ok(())
     }
 
@@ -825,7 +829,7 @@ impl Database {
         started: ChinaDateTime,
         state: HealthState,
         count: usize,
-        raw: Option<&str>,
+        _raw: Option<&str>,
         hash: Option<&str>,
         schema: Option<&str>,
         error: Option<&str>,
@@ -839,13 +843,12 @@ impl Database {
         }
         let now = now_china();
         let success = state != HealthState::Failed;
-        let limited_raw = raw.map(|value| limit(value, 1_000_000));
         let limited_error = error.map(|value| limit(value, 2000));
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO raw_payloads(source,fetched_at,success,record_count,raw_hash,schema_fingerprint,payload,error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![source, format_dt(now), i32::from(success), count as i64, hash, schema, limited_raw, limited_error],
+            params![source, format_dt(now), i32::from(success), count as i64, hash, schema, Option::<String>::None, limited_error],
         )?;
         transaction.execute(
             "INSERT INTO sync_runs(source,started_at,finished_at,success,record_count,error) VALUES(?1,?2,?3,?4,?5,?6)",
@@ -1697,6 +1700,18 @@ impl Database {
         Ok(())
     }
 
+    pub fn compact_if_needed(&self) -> Result<bool> {
+        let connection = self.open()?;
+        let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let free_pages: i64 =
+            connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        if page_count < 256 || free_pages.saturating_mul(4) < page_count {
+            return Ok(false);
+        }
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(true)
+    }
+
     pub fn backup(&self, backup_dir: &Path) -> Result<PathBuf> {
         self.backup_with_commit_hook(backup_dir, |_| Ok(()))
     }
@@ -1721,7 +1736,7 @@ impl Database {
             let mut destination = Connection::open(&temporary)?;
             {
                 let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-                backup.run_to_completion(128, StdDuration::from_millis(50), None)?;
+                backup.run_to_completion(BACKUP_PAGES_PER_STEP, BACKUP_STEP_PAUSE, None)?;
             }
             let integrity: String =
                 destination.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
@@ -1988,6 +2003,29 @@ fn migrate_secondary_notifications_v8(connection: &Connection) -> Result<()> {
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_raw_payload_metadata_v9(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=9)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE raw_payloads SET payload=NULL WHERE payload IS NOT NULL",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,?1)",
         [format_dt(now_china())],
     )?;
     transaction.commit()?;
@@ -3468,6 +3506,51 @@ mod tests {
     }
 
     #[test]
+    fn raw_payload_migration_discards_bodies_and_future_runs_keep_metadata_only() {
+        let test = TestDatabase::new();
+        let connection = test.database.open().unwrap();
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version=9", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO raw_payloads(source,fetched_at,success,record_count,raw_hash,schema_fingerprint,payload,error)
+                 VALUES('fixture',?1,1,1,'old-hash','fixture-schema','large-response',NULL)",
+                [format_dt(now_china())],
+            )
+            .unwrap();
+        drop(connection);
+
+        test.database.initialize().unwrap();
+        test.database
+            .save_source_run(
+                "fixture",
+                now_china(),
+                HealthState::Healthy,
+                2,
+                Some("another-large-response"),
+                Some("new-hash"),
+                Some("fixture-schema"),
+                None,
+            )
+            .unwrap();
+
+        let connection = test.database.open().unwrap();
+        let (rows, bodies, hashes): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),COUNT(payload),COUNT(raw_hash) FROM raw_payloads WHERE source='fixture'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, bodies, hashes), (2, 0, 2));
+        assert_eq!(
+            test.database.schema_version().unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn backup_is_integrity_checked_and_leaves_no_temporary_file() {
         let test = TestDatabase::new();
         test.database.upsert_event(test.event()).unwrap();
@@ -3585,7 +3668,10 @@ mod tests {
     #[test]
     fn operation_health_migration_and_failure_affect_overall_health() {
         let test = TestDatabase::new();
-        assert_eq!(test.database.schema_version().unwrap(), 8);
+        assert_eq!(
+            test.database.schema_version().unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
         let table_exists: i32 = test
             .database
             .open()

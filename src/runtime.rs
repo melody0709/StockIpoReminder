@@ -1,7 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, mpsc},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -136,8 +140,8 @@ pub struct RuntimeSnapshot {
 impl Default for RuntimeSnapshot {
     fn default() -> Self {
         Self {
-            is_synchronizing: false,
-            status_text: "正在初始化后台提醒服务…".into(),
+            is_synchronizing: true,
+            status_text: "正在后台准备本地数据库…".into(),
             last_sync_text: "尚未同步".into(),
             last_sync_succeeded: None,
             health_text: "正在读取健康状态…".into(),
@@ -170,6 +174,8 @@ pub struct RuntimeHandle {
     command_sender: mpsc::Sender<RuntimeCommand>,
     event_receiver: Arc<Mutex<mpsc::Receiver<UiEvent>>>,
     snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    ready: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl RuntimeHandle {
@@ -185,7 +191,11 @@ impl RuntimeHandle {
         let _ = self.command_sender.send(RuntimeCommand::Recovery);
     }
     pub fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
         let _ = self.command_sender.send(RuntimeCommand::Stop);
+    }
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.snapshot
@@ -197,15 +207,19 @@ impl RuntimeHandle {
         self.event_receiver.lock().ok()?.try_recv().ok()
     }
     pub fn complete_delivery(&self, delivery: &ReminderDelivery) -> Result<()> {
+        self.ensure_ready()?;
         self.database.complete_delivery(delivery, "slint+tray")
     }
     pub fn fail_delivery(&self, delivery: &ReminderDelivery, error: &str) -> Result<()> {
+        self.ensure_ready()?;
         self.database.fail_delivery(delivery.outbox_id, error)
     }
     pub fn settings(&self) -> Result<AppSettings> {
+        self.ensure_ready()?;
         self.database.settings()
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        self.ensure_ready()?;
         self.database.save_settings(settings)?;
         self.database.replan_all()?;
         Ok(())
@@ -214,6 +228,7 @@ impl RuntimeHandle {
         &self,
         provider: crate::model::SecondaryNotificationProvider,
     ) -> Result<Option<i64>> {
+        self.ensure_ready()?;
         self.database.reserve_secondary_notification_test(provider)
     }
     pub fn finish_secondary_notification_test(
@@ -221,44 +236,56 @@ impl RuntimeHandle {
         attempt_id: i64,
         error: Option<&str>,
     ) -> Result<()> {
+        self.ensure_ready()?;
         self.database
             .finish_secondary_notification_test(attempt_id, error)
     }
     pub fn secondary_notification_summary(
         &self,
     ) -> Result<crate::model::SecondaryNotificationSummary> {
+        self.ensure_ready()?;
         self.database.secondary_notification_summary()
     }
     pub fn today_events(&self) -> Result<Vec<IpoEvent>> {
+        self.ensure_ready()?;
         self.database.today_events()
     }
     pub fn future_events(&self) -> Result<Vec<IpoEvent>> {
+        self.ensure_ready()?;
         self.database.future_events(60)
     }
     pub fn health_details(&self) -> Result<crate::model::HealthDetails> {
+        self.ensure_ready()?;
         self.database.health_details()
     }
     pub fn event(&self, id: &str) -> Result<Option<IpoEvent>> {
+        self.ensure_ready()?;
         self.database.event(id)
     }
     pub fn announcement_titles(&self, id: &str) -> Result<Vec<String>> {
+        self.ensure_ready()?;
         self.database.announcement_titles(id)
     }
     pub fn field_sources(&self, id: &str) -> Result<Vec<FieldSourceEntry>> {
+        self.ensure_ready()?;
         self.database.field_sources(id)
     }
     pub fn announcements(&self, id: &str) -> Result<Vec<AnnouncementDocument>> {
+        self.ensure_ready()?;
         self.database.announcements(id)
     }
     pub fn manual_overrides(&self, id: &str, version: i32) -> Result<Vec<ManualOverrideEntry>> {
+        self.ensure_ready()?;
         self.database.manual_overrides(id, version)
     }
     pub fn acknowledge(&self, id: &str, version: i32) -> Result<()> {
+        self.ensure_ready()?;
         self.database.acknowledge(id, version)?;
         self.wake();
         Ok(())
     }
     pub fn revoke_acknowledgement(&self, id: &str, version: i32) -> Result<()> {
+        self.ensure_ready()?;
         self.database.revoke_acknowledgement(id, version)?;
         self.wake();
         Ok(())
@@ -272,46 +299,99 @@ impl RuntimeHandle {
         reason: &str,
         announcement_id: Option<&str>,
     ) -> Result<()> {
+        self.ensure_ready()?;
         self.database
             .apply_manual_override(id, version, field, value, reason, announcement_id)?;
         self.wake();
         Ok(())
     }
     pub fn revoke_override(&self, id: &str, version: i32, override_id: i64) -> Result<()> {
+        self.ensure_ready()?;
         self.database
             .revoke_manual_override(id, version, override_id)?;
         self.wake();
         Ok(())
     }
     pub fn revoke_overrides(&self, id: &str, version: i32) -> Result<usize> {
+        self.ensure_ready()?;
         let count = self.database.revoke_manual_overrides(id, version)?;
         self.wake();
         Ok(count)
     }
-    pub fn database(&self) -> &Database {
-        &self.database
+    pub fn database(&self) -> Result<&Database> {
+        self.ensure_ready()?;
+        Ok(&self.database)
+    }
+
+    fn ensure_ready(&self) -> Result<()> {
+        if self.is_ready() {
+            Ok(())
+        } else {
+            anyhow::bail!("本地数据库仍在后台初始化，请稍候")
+        }
     }
 }
 
 pub fn start(data_root: PathBuf, startup_sync: bool) -> Result<(RuntimeHandle, JoinHandle<()>)> {
+    start_with_initializer(data_root, startup_sync, |database, data_root| {
+        let _upgrade_backup =
+            operations::prepare_database_upgrade(data_root, env!("CARGO_PKG_VERSION"))?;
+        database.initialize()?;
+        match database.compact_if_needed() {
+            Ok(true) => operations::log("INFO", "已回收历史接口正文释放的 SQLite 空闲空间"),
+            Ok(false) => {}
+            Err(error) => operations::log("WARN", &format!("SQLite 空闲空间回收跳过：{error:#}")),
+        }
+        database.integrity_check()?;
+        operations::mark_database_version(data_root, env!("CARGO_PKG_VERSION"))?;
+        Ok(())
+    })
+}
+
+fn start_with_initializer<F>(
+    data_root: PathBuf,
+    startup_sync: bool,
+    initialize: F,
+) -> Result<(RuntimeHandle, JoinHandle<()>)>
+where
+    F: FnOnce(&Database, &Path) -> Result<()> + Send + 'static,
+{
     let database = Database::new(&data_root);
-    let _upgrade_backup =
-        operations::prepare_database_upgrade(&data_root, env!("CARGO_PKG_VERSION"))?;
-    database.initialize()?;
-    database.integrity_check()?;
-    operations::mark_database_version(&data_root, env!("CARGO_PKG_VERSION"))?;
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
+    let ready = Arc::new(AtomicBool::new(false));
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let handle = RuntimeHandle {
         database: database.clone(),
         command_sender,
         event_receiver: Arc::new(Mutex::new(event_receiver)),
         snapshot: Arc::clone(&snapshot),
+        ready: Arc::clone(&ready),
+        stop_requested: Arc::clone(&stop_requested),
     };
     let thread = thread::Builder::new()
         .name("stock-ipo-runtime".into())
         .spawn(move || {
+            if let Err(error) = initialize(&database, &data_root) {
+                crate::operations::log("ERROR", &format!("本地数据库初始化失败：{error:#}"));
+                update_snapshot(&snapshot, |value| {
+                    value.is_synchronizing = false;
+                    value.status_text = "本地数据库初始化失败，请查看日志".into();
+                    value.health_text = "后台提醒服务未启动".into();
+                    value.health_state = HealthState::Failed;
+                    value.last_error = Some(format!("{error:#}"));
+                });
+                return;
+            }
+            ready.store(true, Ordering::Release);
+            update_snapshot(&snapshot, |value| {
+                value.is_synchronizing = false;
+                value.status_text = "本地数据已就绪，正在启动后台提醒服务…".into();
+            });
+            if stop_requested.load(Ordering::Acquire) {
+                return;
+            }
             if let Err(error) = run_loop(
                 database,
                 data_root,
@@ -1765,6 +1845,27 @@ mod tests {
             database.announcement_titles("shanghai:601001").unwrap(),
             vec!["首次公开发行公告"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_start_does_not_wait_for_database_initialization() {
+        let root = std::env::temp_dir().join(format!(
+            "stock-ipo-runtime-start-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let started = Instant::now();
+        let (runtime, worker) = start_with_initializer(root.clone(), false, |_, _| {
+            thread::sleep(Duration::from_millis(400));
+            anyhow::bail!("simulated initialization failure")
+        })
+        .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(!runtime.is_ready());
+        assert!(runtime.settings().is_err());
+        worker.join().unwrap();
+        assert_eq!(runtime.snapshot().health_state, HealthState::Failed);
         let _ = std::fs::remove_dir_all(root);
     }
 

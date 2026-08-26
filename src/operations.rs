@@ -11,7 +11,10 @@ use regex::Regex;
 use serde_json::json;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
-use crate::{core::now_china, storage::Database};
+use crate::{
+    core::now_china,
+    storage::{Database, LATEST_SCHEMA_VERSION},
+};
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const LOG_SEGMENTS_PER_DAY: usize = 5;
@@ -112,7 +115,8 @@ pub fn prepare_database_upgrade(
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if previous_version.as_deref() == Some(current_version) {
+    let previous_schema_version = database.schema_version().ok();
+    if previous_schema_version == Some(LATEST_SCHEMA_VERSION) {
         return Ok(None);
     }
 
@@ -120,15 +124,18 @@ pub fn prepare_database_upgrade(
         .backup(&data_root.join("backups"))
         .with_context(|| {
             format!(
-                "应用版本从 {} 变更为 {current_version} 前无法创建数据库备份",
-                previous_version.as_deref().unwrap_or("未知版本")
+                "应用版本 {} 启动数据库 schema 迁移前无法创建备份",
+                current_version
             )
         })?;
     log(
         "INFO",
         &format!(
-            "应用版本从 {} 变更为 {current_version}，数据库迁移前备份已创建：{}",
+            "应用版本从 {} 变更为 {current_version}，数据库 schema 从 {} 迁移至 {LATEST_SCHEMA_VERSION} 前备份已创建：{}",
             previous_version.as_deref().unwrap_or("未知版本"),
+            previous_schema_version
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "未知".into()),
             backup.display()
         ),
     );
@@ -447,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn version_change_creates_one_integrity_checked_pre_migration_backup() {
+    fn only_schema_change_creates_one_integrity_checked_pre_migration_backup() {
         let root = std::env::temp_dir().join(format!(
             "stock-ipo-upgrade-backup-test-{}",
             Uuid::new_v4().simple()
@@ -456,10 +463,19 @@ mod tests {
         database.initialize().unwrap();
         mark_database_version(&root, "0.2.4").unwrap();
 
-        assert!(prepare_database_upgrade(&root, "0.2.4").unwrap().is_none());
+        assert!(prepare_database_upgrade(&root, "0.2.5").unwrap().is_none());
+        let connection = rusqlite::Connection::open(database.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM schema_migrations WHERE version=?1",
+                [LATEST_SCHEMA_VERSION],
+            )
+            .unwrap();
+        drop(connection);
+
         let backup = prepare_database_upgrade(&root, "0.2.5")
             .unwrap()
-            .expect("version change should create a backup");
+            .expect("schema change should create a backup");
         assert!(backup.is_file());
         let integrity: String = rusqlite::Connection::open(backup)
             .unwrap()
@@ -467,6 +483,7 @@ mod tests {
             .unwrap();
         assert_eq!(integrity, "ok");
 
+        database.initialize().unwrap();
         mark_database_version(&root, "0.2.5").unwrap();
         assert!(prepare_database_upgrade(&root, "0.2.5").unwrap().is_none());
         let _ = fs::remove_dir_all(root);
