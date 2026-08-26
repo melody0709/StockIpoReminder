@@ -1156,9 +1156,6 @@ impl Database {
         transaction.commit()?;
         Ok(())
     }
-    pub fn has_announcement(&self, provider: &str, id: &str, hash: &str) -> Result<bool> {
-        Ok(self.open()?.query_row("SELECT EXISTS(SELECT 1 FROM announcement_documents WHERE provider=?1 AND announcement_id=?2 AND file_hash=?3)",params![provider,id,hash],|r|r.get::<_,i32>(0))?!=0)
-    }
     pub fn touch_heartbeat(&self, component: &str, now: ChinaDateTime) -> Result<()> {
         self.open()?.execute("INSERT INTO app_heartbeat(component,heartbeat_at) VALUES(?1,?2) ON CONFLICT(component) DO UPDATE SET heartbeat_at=excluded.heartbeat_at",params![component,format_dt(now)])?;
         Ok(())
@@ -1504,6 +1501,7 @@ impl Database {
         self.try_mark_health_summary_sent(now.date_naive(), now)
     }
 
+    #[cfg(test)]
     pub fn announcement_titles(&self, event_id: &str) -> Result<Vec<String>> {
         let connection = self.open()?;
         let mut statement = connection.prepare("SELECT title FROM announcement_documents WHERE ipo_event_id=?1 ORDER BY published_at DESC,downloaded_at DESC")?;
@@ -1515,22 +1513,17 @@ impl Database {
     pub fn field_sources(&self, event_id: &str) -> Result<Vec<FieldSourceEntry>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT field_name,raw_value,normalized_value,source,priority,source_published_at,fetched_at,raw_hash FROM ipo_field_sources WHERE ipo_event_id=?1 ORDER BY field_name,priority DESC,fetched_at DESC,id",
+            "SELECT field_name,raw_value,normalized_value,source,priority,fetched_at FROM ipo_field_sources WHERE ipo_event_id=?1 ORDER BY field_name,priority DESC,fetched_at DESC,id",
         )?;
         let rows = statement.query_map([event_id], |row| {
-            let source_published_at: Option<String> = row.get(5)?;
-            let fetched_at: String = row.get(6)?;
+            let fetched_at: String = row.get(5)?;
             Ok(FieldSourceEntry {
                 field_name: row.get(0)?,
                 raw_value: row.get(1)?,
                 normalized_value: row.get(2)?,
                 source: row.get(3)?,
                 priority: row.get(4)?,
-                source_published_at: source_published_at
-                    .as_deref()
-                    .and_then(|value| parse_dt(value).ok()),
                 fetched_at: parse_dt(&fetched_at).map_err(to_sql_error)?,
-                raw_hash: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1579,19 +1572,17 @@ impl Database {
     ) -> Result<Vec<ManualOverrideEntry>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT id,ipo_event_id,event_version,field_name,override_value,reason,announcement_document_id,created_at,revoked_at FROM manual_overrides WHERE ipo_event_id=?1 AND event_version=?2 ORDER BY created_at DESC,id DESC",
+            "SELECT id,field_name,override_value,reason,announcement_document_id,created_at,revoked_at FROM manual_overrides WHERE ipo_event_id=?1 AND event_version=?2 ORDER BY created_at DESC,id DESC",
         )?;
         let rows = statement.query_map(params![event_id, version], |row| {
-            let created_at: String = row.get(7)?;
-            let revoked_at: Option<String> = row.get(8)?;
+            let created_at: String = row.get(5)?;
+            let revoked_at: Option<String> = row.get(6)?;
             Ok(ManualOverrideEntry {
                 id: row.get(0)?,
-                event_id: row.get(1)?,
-                event_version: row.get(2)?,
-                field_name: row.get(3)?,
-                override_value: row.get(4)?,
-                reason: row.get(5)?,
-                announcement_document_id: row.get(6)?,
+                field_name: row.get(1)?,
+                override_value: row.get(2)?,
+                reason: row.get(3)?,
+                announcement_document_id: row.get(4)?,
                 created_at: parse_dt(&created_at).map_err(to_sql_error)?,
                 revoked_at: revoked_at.as_deref().and_then(|value| parse_dt(value).ok()),
             })
@@ -1655,17 +1646,6 @@ impl Database {
             self.reconcile_schedule(&event, &self.settings()?, now_china())?;
         }
         Ok(())
-    }
-
-    pub fn revoke_manual_overrides(&self, event_id: &str, version: i32) -> Result<usize> {
-        let count = self.open()?.execute(
-            "UPDATE manual_overrides SET revoked_at=?1 WHERE ipo_event_id=?2 AND event_version=?3 AND revoked_at IS NULL",
-            params![format_dt(now_china()), event_id, version],
-        )?;
-        if let Some(event) = self.event(event_id)? {
-            self.reconcile_schedule(&event, &self.settings()?, now_china())?;
-        }
-        Ok(count)
     }
 
     pub fn maintenance(&self, data_root: &Path) -> Result<()> {

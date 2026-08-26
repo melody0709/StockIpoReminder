@@ -259,8 +259,9 @@ export component MainWindow inherits Window {
     in-out property <int> normal-sync-interval-unit-index: 0;
     in-out property <string> active-sync-interval-value: "10";
     in-out property <int> active-sync-interval-unit-index: 0;
-    in-out property <bool> automatic-updates-enabled: true;
+    in-out property <bool> automatic-updates-enabled: false;
     in-out property <bool> update-configured: false;
+    in-out property <bool> advanced-settings-expanded: false;
     in-out property <bool> update-available: false;
     in-out property <string> update-version: "";
     in-out property <string> update-status: "正在读取安全更新配置…";
@@ -862,6 +863,59 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
+                        min-height: 176px;
+                        max-height: 176px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 7px;
+                            Text { text: "同步频率"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
+                                Text { width: root.compact-width ? 150px : 190px; text: "普通日期"; color: #cbd5e1; vertical-alignment: center; }
+                                LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
+                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
+                                Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                            }
+                            HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
+                                Text { width: root.compact-width ? 150px : 190px; text: "当日有未确认任务"; color: #cbd5e1; vertical-alignment: center; }
+                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "10"; }
+                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
+                                Text { text: "默认 10 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                            }
+                            Text { text: "程序启动时同步一次；普通日期和申购日分别按上述间隔自动同步，均可设置为 5 分钟至 7 天，也可以随时手动同步。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        min-height: 78px;
+                        max-height: 78px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        HorizontalBox {
+                            padding: 12px;
+                            spacing: 12px;
+                            VerticalBox {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+                                Text { text: "高级可选功能"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                Text { text: "第二通知、自动更新和崩溃报告默认关闭，不影响本地提醒；仅在确实需要时配置。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                            }
+                            ActionButton {
+                                label: root.advanced-settings-expanded ? "收起高级功能" : "展开高级功能";
+                                compact: root.compact-width;
+                                clicked => { root.advanced-settings-expanded = !root.advanced-settings-expanded; }
+                            }
+                        }
+                    }
+                    if root.advanced-settings-expanded || root.secondary-notification-configured || root.secondary-notification-enabled : Rectangle {
                         min-height: root.compact-width ? 264px : 220px;
                         max-height: root.compact-width ? 264px : 220px;
                         border-radius: 9px;
@@ -871,10 +925,10 @@ export component MainWindow inherits Window {
                         VerticalBox {
                             padding: 12px;
                             spacing: 8px;
-                            Text { text: "第二通知通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: "高级 · 第二通知通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
                             Text {
                                 text: root.secondary-notification-status;
-                                color: root.secondary-notification-configured ? #86efac : #fcd34d;
+                                color: root.secondary-notification-configured ? #86efac : #94a3b8;
                                 font-size: 12px;
                                 wrap: word-wrap;
                                 horizontal-stretch: 1;
@@ -922,37 +976,7 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle {
-                        min-height: 176px;
-                        max-height: 176px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 7px;
-                            Text { text: "同步频率"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "普通日期"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
-                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
-                                Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
-                            }
-                            HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "当日有未确认任务"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "10"; }
-                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
-                                Text { text: "默认 10 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
-                            }
-                            Text { text: "程序启动时同步一次；普通日期和申购日分别按上述间隔自动同步，均可设置为 5 分钟至 7 天，也可以随时手动同步。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
-                        }
-                    }
-                    Rectangle {
+                    if root.advanced-settings-expanded || root.update-configured : Rectangle {
                         min-height: 148px;
                         max-height: 148px;
                         border-radius: 9px;
@@ -962,11 +986,11 @@ export component MainWindow inherits Window {
                         VerticalBox {
                             padding: 12px;
                             spacing: 8px;
-                            Text { text: "安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #fcd34d; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            Text { text: "高级 · 安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
                             HorizontalBox {
                                 spacing: 10px;
-                                Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; }
+                                Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
                                 Rectangle { horizontal-stretch: 1; }
                                 ActionButton {
                                     label: "检查更新";
@@ -985,7 +1009,7 @@ export component MainWindow inherits Window {
                             Text { text: "只接受 HTTPS、固定证书签名的 CMS 清单，以及哈希和 Authenticode 证书均匹配的 MSI；安装仍需你明确点击。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
                         }
                     }
-                    Rectangle {
+                    if root.advanced-settings-expanded || root.crash-upload-configured || root.crash-upload-enabled : Rectangle {
                         min-height: 172px;
                         max-height: 172px;
                         border-radius: 9px;
@@ -995,8 +1019,8 @@ export component MainWindow inherits Window {
                         VerticalBox {
                             padding: 12px;
                             spacing: 8px;
-                            Text { text: "脱敏崩溃报告"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.crash-upload-status; color: root.crash-upload-configured ? #cbd5e1 : #fcd34d; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            Text { text: "高级 · 脱敏崩溃报告"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.crash-upload-status; color: root.crash-upload-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
                             HorizontalBox {
                                 spacing: 10px;
                                 Toggle {

@@ -91,15 +91,6 @@ pub fn client() -> Result<Client> {
         .build()?)
 }
 
-pub fn collect_all(client: &Client) -> Vec<Result<CollectorOutput>> {
-    vec![
-        collect_eastmoney(client),
-        collect_sse(client),
-        collect_cninfo(client),
-        collect_bse(client),
-    ]
-}
-
 pub fn probe_source(client: &Client, source: &str) -> Result<()> {
     let url = source_probe_url(source).context("未知数据源，无法执行低频健康探测")?;
     ensure_allowed(url, false)?;
@@ -431,6 +422,7 @@ struct BsePage {
     detail_count: usize,
 }
 
+#[cfg(test)]
 pub fn parse_bse_page(raw: &str, fetched: ChinaDateTime) -> Result<(Vec<Candidate>, usize)> {
     let page = parse_bse_page_with_meta(raw, fetched)?;
     Ok((page.candidates, page.total_pages))

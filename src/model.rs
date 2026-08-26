@@ -10,6 +10,7 @@ macro_rules! numeric_enum {
         #[repr(i32)]
         pub enum $name { $($variant = $value),+ }
         impl $name {
+            #[allow(dead_code)]
             pub fn from_i32(value: i32) -> Self {
                 match value { $($value => Self::$variant,)+ _ => Self::Unknown }
             }
@@ -194,7 +195,7 @@ impl Default for AppSettings {
             daily_health_summary_enabled: true,
             post_apply_reminders_enabled: true,
             listing_reminders_enabled: true,
-            automatic_updates_enabled: true,
+            automatic_updates_enabled: false,
             crash_report_upload_enabled: false,
             secondary_notification_enabled: false,
             secondary_notification_provider: SecondaryNotificationProvider::Disabled,
@@ -256,6 +257,7 @@ pub struct ReminderDelivery {
     pub due_at: ChinaDateTime,
     pub level: ReminderLevel,
     pub dedupe_key: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub attempt_count: i32,
     pub message: Option<String>,
 }
@@ -328,16 +330,12 @@ pub struct FieldSourceEntry {
     pub normalized_value: Option<String>,
     pub source: String,
     pub priority: i32,
-    pub source_published_at: Option<ChinaDateTime>,
     pub fetched_at: ChinaDateTime,
-    pub raw_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ManualOverrideEntry {
     pub id: i64,
-    pub event_id: String,
-    pub event_version: i32,
     pub field_name: String,
     pub override_value: String,
     pub reason: String,

@@ -391,10 +391,6 @@ impl SingleInstance {
         Self::acquire_named(data_root, "")
     }
 
-    pub fn acquire_supervisor(data_root: &Path) -> Result<Self> {
-        Self::acquire_named(data_root, "-Watchdog")
-    }
-
     pub fn try_acquire_supervisor(data_root: &Path) -> Result<Option<Self>> {
         Self::try_acquire_named(data_root, "-Watchdog")
     }

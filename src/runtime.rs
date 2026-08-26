@@ -257,10 +257,6 @@ impl RuntimeHandle {
         self.ensure_ready()?;
         self.database.event(id)
     }
-    pub fn announcement_titles(&self, id: &str) -> Result<Vec<String>> {
-        self.ensure_ready()?;
-        self.database.announcement_titles(id)
-    }
     pub fn field_sources(&self, id: &str) -> Result<Vec<FieldSourceEntry>> {
         self.ensure_ready()?;
         self.database.field_sources(id)
@@ -306,12 +302,6 @@ impl RuntimeHandle {
             .revoke_manual_override(id, version, override_id)?;
         self.wake();
         Ok(())
-    }
-    pub fn revoke_overrides(&self, id: &str, version: i32) -> Result<usize> {
-        self.ensure_ready()?;
-        let count = self.database.revoke_manual_overrides(id, version)?;
-        self.wake();
-        Ok(count)
     }
     pub fn database(&self) -> Result<&Database> {
         self.ensure_ready()?;
@@ -524,6 +514,7 @@ fn run_loop(
     }
 }
 
+#[cfg(test)]
 fn automatic_sync_interval_for(settings: &AppSettings, active_day: bool) -> Duration {
     let configured = if active_day {
         settings.active_day_sync_minutes

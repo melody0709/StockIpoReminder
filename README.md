@@ -141,7 +141,7 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 签名与安全自动更新
 
-仓库已提供 Authenticode、RFC 3161 时间戳、detached CMS 更新清单、证书指纹固定和 CI 手动签名发布主路径。正式签名构建必须同时配置具有 Code Signing EKU 的证书和 HTTPS 稳定版更新清单地址；应用只对已安装的 MSI 版本开放自动更新，便携版继续手动更新。
+仓库已提供 Authenticode、RFC 3161 时间戳、detached CMS 更新清单、证书指纹固定和 CI 手动签名发布主路径。正式签名构建必须同时配置具有 Code Signing EKU 的证书和 HTTPS 稳定版更新清单地址；应用只对已安装的 MSI 版本开放自动更新，便携版继续手动更新。启动时自动检查默认关闭，且未配置正式更新源时不会执行联网检查。
 
 客户端会依次验证 HTTPS、CMS 清单签名、固定证书 SHA-256、产品和 stable 通道、递增版本、最低 Windows Build、安装包大小与 SHA-256，以及 MSI Authenticode 信任和相同证书指纹。只有全部通过并由用户明确点击后才调用 Windows Installer；下载或验证失败不会启动安装。
 
