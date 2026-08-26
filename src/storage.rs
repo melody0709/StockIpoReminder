@@ -205,11 +205,29 @@ impl Database {
     }
 
     pub fn acknowledge(&self, event_id: &str, version: i32) -> Result<()> {
+        self.acknowledge_at(event_id, version, now_china())
+    }
+
+    fn acknowledge_at(&self, event_id: &str, version: i32, now: ChinaDateTime) -> Result<()> {
         let event = self.event(event_id)?.context("申购任务不存在")?;
         if event.event_version != version {
             bail!("申购数据已更新，请刷新后确认")
         }
-        let now = now_china();
+        let apply_date = event
+            .apply_date
+            .context("任务缺少申购日期，不能确认已申购")?;
+        if apply_date != now.date_naive() {
+            bail!("只能在申购日当天确认已申购")
+        }
+        if !matches!(
+            event.lifecycle_status,
+            LifecycleStatus::Scheduled
+                | LifecycleStatus::ActiveUnconfirmed
+                | LifecycleStatus::Acknowledged
+                | LifecycleStatus::AcknowledgedNeedsReview
+        ) {
+            bail!("当前任务状态不能确认已申购")
+        }
         let mut connection = self.open()?;
         let tx = connection.transaction()?;
         tx.execute("INSERT INTO acknowledgements(ipo_event_id,event_version,confirmed_at,confirmed_data_hash) VALUES(?1,?2,?3,?4) ON CONFLICT(ipo_event_id,event_version) DO UPDATE SET confirmed_at=excluded.confirmed_at,confirmed_data_hash=excluded.confirmed_data_hash,reconfirmed_at=excluded.confirmed_at,revoked_at=NULL,needs_review_at=NULL,review_reason=NULL",params![event_id,version,format_dt(now),event_hash(&event)])?;
@@ -220,19 +238,32 @@ impl Database {
     }
 
     pub fn revoke_acknowledgement(&self, event_id: &str, version: i32) -> Result<()> {
+        self.revoke_acknowledgement_at(event_id, version, now_china())
+    }
+
+    fn revoke_acknowledgement_at(
+        &self,
+        event_id: &str,
+        version: i32,
+        now: ChinaDateTime,
+    ) -> Result<()> {
         let mut event = self.event(event_id)?.context("申购任务不存在")?;
         if event.event_version != version || event.lifecycle_status != LifecycleStatus::Acknowledged
         {
             bail!("当前没有可撤销的有效确认");
         }
         let settings = self.settings()?;
-        let now = now_china();
         let date = event.apply_date.context("任务缺少申购日期")?;
         if now >= crate::core::at(date, crate::core::effective_cutoff(&event, &settings)) {
             bail!("已超过安全截止时间，不能撤销确认");
         }
 
-        event.lifecycle_status = LifecycleStatus::ActiveUnconfirmed;
+        let restored_status = if date > now.date_naive() {
+            LifecycleStatus::Scheduled
+        } else {
+            LifecycleStatus::ActiveUnconfirmed
+        };
+        event.lifecycle_status = restored_status;
         event.updated_at = now;
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
@@ -246,7 +277,7 @@ impl Database {
         let event_changed = transaction.execute(
             "UPDATE ipo_events SET lifecycle_status=?1,updated_at=?2 WHERE id=?3 AND event_version=?4 AND lifecycle_status=?5",
             params![
-                LifecycleStatus::ActiveUnconfirmed as i32,
+                restored_status as i32,
                 format_dt(now),
                 event_id,
                 version,
@@ -264,6 +295,11 @@ impl Database {
     pub fn refresh_lifecycle(&self) -> Result<()> {
         let now = now_china();
         let settings = self.settings()?;
+        for event in self.future_events(60)? {
+            if event.lifecycle_status == LifecycleStatus::Acknowledged {
+                self.revoke_acknowledgement_at(&event.id, event.event_version, now)?;
+            }
+        }
         for mut event in self.today_events()? {
             let next = if event.lifecycle_status == LifecycleStatus::Scheduled {
                 Some(LifecycleStatus::ActiveUnconfirmed)
@@ -1251,7 +1287,9 @@ mod tests {
     #[test]
     fn acknowledgement_override_and_backoff_roundtrip() {
         let test = TestDatabase::new();
-        let event = test.database.upsert_event(test.event()).unwrap();
+        let mut input = test.event();
+        input.apply_date = Some(now_china().date_naive());
+        let event = test.database.upsert_event(input).unwrap();
         test.database
             .apply_manual_override(
                 &event.id,
@@ -1398,15 +1436,89 @@ mod tests {
     }
 
     #[test]
+    fn future_event_cannot_be_acknowledged() {
+        let test = TestDatabase::new();
+        let now = now_china();
+        let mut input = test.event();
+        input.apply_date = Some(now.date_naive() + chrono::Duration::days(1));
+        input.lifecycle_status = LifecycleStatus::Scheduled;
+        let event = test.database.upsert_event(input).unwrap();
+
+        let error = test
+            .database
+            .acknowledge_at(&event.id, event.event_version, now)
+            .unwrap_err();
+        assert!(error.to_string().contains("只能在申购日当天确认已申购"));
+        assert_eq!(
+            test.database
+                .event(&event.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_status,
+            LifecycleStatus::Scheduled,
+        );
+        let acknowledgement_count: i64 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM acknowledgements WHERE ipo_event_id=?1",
+                [&event.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledgement_count, 0);
+    }
+
+    #[test]
+    fn lifecycle_refresh_repairs_legacy_future_acknowledgement() {
+        let test = TestDatabase::new();
+        let now = now_china();
+        let date = now.date_naive() + chrono::Duration::days(1);
+        let mut input = test.event();
+        input.apply_date = Some(date);
+        input.lifecycle_status = LifecycleStatus::Scheduled;
+        let event = test.database.upsert_event(input).unwrap();
+        test.database
+            .acknowledge_at(
+                &event.id,
+                event.event_version,
+                crate::core::at(date, chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap()),
+            )
+            .unwrap();
+
+        test.database.refresh_lifecycle().unwrap();
+
+        assert_eq!(
+            test.database
+                .event(&event.id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_status,
+            LifecycleStatus::Scheduled,
+        );
+        let (revoked, pending): (i64, i64) = test.database.open().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM acknowledgements WHERE ipo_event_id=?1 AND event_version=?2 AND revoked_at IS NOT NULL), (SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND event_version=?2 AND delivery_state=?3)",
+            params![event.id, event.event_version, DeliveryState::Pending as i32],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(revoked, 1);
+        assert!(pending > 0);
+    }
+
+    #[test]
     fn acknowledgement_can_be_revoked_before_cutoff_and_reminders_are_replanned() {
         let test = TestDatabase::new();
+        let date = chrono::NaiveDate::from_ymd_opt(2030, 1, 8).unwrap();
+        let confirmation_time =
+            crate::core::at(date, chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap());
         let mut input = test.event();
-        input.apply_date = Some(now_china().date_naive() + chrono::Duration::days(1));
+        input.apply_date = Some(date);
         input.lifecycle_status = LifecycleStatus::Scheduled;
         let event = test.database.upsert_event(input).unwrap();
 
         test.database
-            .acknowledge(&event.id, event.event_version)
+            .acknowledge_at(&event.id, event.event_version, confirmation_time)
             .unwrap();
         assert_eq!(
             test.database
@@ -1424,7 +1536,11 @@ mod tests {
         assert!(cancelled > 0);
 
         test.database
-            .revoke_acknowledgement(&event.id, event.event_version)
+            .revoke_acknowledgement_at(
+                &event.id,
+                event.event_version,
+                confirmation_time + chrono::Duration::minutes(1),
+            )
             .unwrap();
         assert_eq!(
             test.database

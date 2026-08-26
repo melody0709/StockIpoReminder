@@ -2,7 +2,7 @@
 
 一个常驻 Windows 系统托盘的 A 股新股申购提醒程序。它从公开渠道发现沪市、深市和北交所申购任务，并持续提醒，直到你对每只股票分别完成“确认已申购”的二次确认。
 
-当前版本：`0.2.2`
+当前版本：`0.2.3`
 
 正式运行版本已经完全迁移到 Rust：界面使用 Slint，Windows 托盘、通知、单实例、声音和当前用户开机自启动注册使用 `windows-rs`，数据层使用内嵌 SQLite。MSI 安装包和便携包都不依赖 .NET Runtime，仓库也已移除旧 C#/.NET 工程。
 
@@ -26,7 +26,7 @@
 - 不调用自动申购或下单接口。
 - 不验证券商是否已受理委托。
 
-“确认已申购”只代表你在本程序中的人工确认，不代表券商订单成功。
+“确认已申购”只代表你在本程序中的人工确认，不代表券商订单成功。该操作仅在任务所列申购日当天可用；未来 60 天列表中的待申购任务不能提前确认。升级后若检测到旧版本遗留的未来确认记录，程序会自动撤销该无效确认并恢复提醒。
 
 ## 数据渠道
 
@@ -64,7 +64,7 @@
 运行：
 
 ```text
-StockIpoReminder-0.2.2-win-x64.msi
+StockIpoReminder-0.2.3-win-x64.msi
 ```
 
 默认目录：
@@ -80,7 +80,7 @@ MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供事务回
 
 ## 便携版
 
-解压 `StockIpoReminder-0.2.2-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
+解压 `StockIpoReminder-0.2.3-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
 
 便携版如果启用“登录 Windows 后自动启动”，会按当前可执行文件位置写入当前用户 Run 注册项。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序后，应先关闭自启动或重新保存设置以更新路径。
 
@@ -121,7 +121,7 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 未签名风险
 
-`0.2.2` 发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
+`0.2.3` 发布物尚未进行 Authenticode 代码签名。Windows SmartScreen 或安全软件可能显示“未知发布者”或要求额外确认。请只使用本项目发布目录中的文件，并在运行前核对 `SHA256SUMS.txt`。
 
 发布清单会明确记录 `signed: false`。代码签名属于后续增强，不会通过隐藏警告来伪装成已签名版本。
 
@@ -133,8 +133,8 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 rtk build.bat
 rtk build.bat --rebuild
 rtk build.bat --package
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1 -Version 0.2.2
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1 -Version 0.2.2
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1 -Version 0.2.3
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1 -Version 0.2.3
 ```
 
 唯一可直接运行的开发版本位于 `build\run\x64-release\StockIpoReminder.exe`。Cargo 缓存和测试二进制位于 `build\cargo`；MSI 与便携包位于 `build\packages\<version>`。

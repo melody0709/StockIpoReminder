@@ -1095,12 +1095,25 @@ fn diagnostic_summary(runtime: &RuntimeHandle, data_root: &PathBuf) -> String {
 }
 
 fn is_pending(event: &IpoEvent) -> bool {
-    matches!(
+    can_acknowledge_on(
+        event.apply_date,
         event.lifecycle_status,
-        LifecycleStatus::Scheduled
-            | LifecycleStatus::ActiveUnconfirmed
-            | LifecycleStatus::AcknowledgedNeedsReview
+        crate::core::now_china().date_naive(),
     )
+}
+
+fn can_acknowledge_on(
+    apply_date: Option<chrono::NaiveDate>,
+    lifecycle_status: LifecycleStatus,
+    today: chrono::NaiveDate,
+) -> bool {
+    apply_date == Some(today)
+        && matches!(
+            lifecycle_status,
+            LifecycleStatus::Scheduled
+                | LifecycleStatus::ActiveUnconfirmed
+                | LifecycleStatus::AcknowledgedNeedsReview
+        )
 }
 
 fn event_needs_review(event: &IpoEvent) -> bool {
@@ -1202,6 +1215,32 @@ fn lifecycle_text(status: LifecycleStatus) -> &'static str {
         LifecycleStatus::SuspendedOrCancelled => "暂停或终止",
         LifecycleStatus::ExpiredUnconfirmed => "已过截止时间",
         _ => "已发现",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acknowledgement_is_available_only_on_the_apply_date() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+
+        assert!(can_acknowledge_on(
+            Some(today),
+            LifecycleStatus::Scheduled,
+            today,
+        ));
+        assert!(!can_acknowledge_on(
+            Some(today + chrono::Duration::days(1)),
+            LifecycleStatus::Scheduled,
+            today,
+        ));
+        assert!(!can_acknowledge_on(
+            Some(today),
+            LifecycleStatus::ExpiredUnconfirmed,
+            today,
+        ));
     }
 }
 
