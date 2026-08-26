@@ -24,8 +24,8 @@ use crate::{
 };
 
 pub const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024;
-pub const MAX_HTML_BYTES: u64 = 4 * 1024 * 1024;
 pub const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
+const DOWNLOAD_PREFIX_BYTES: usize = 4 * 1024;
 pub const MAX_PDF_PAGES: usize = 20;
 pub const MAX_EXTRACTED_CHARACTERS: usize = 256_000;
 pub const PDF_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -123,21 +123,79 @@ fn take_characters(value: &str, maximum: usize) -> (String, bool) {
     (text, iterator.next().is_some())
 }
 
+#[derive(Debug)]
+pub struct SearchOutput {
+    pub references: Vec<AnnouncementRef>,
+    pub warning: Option<String>,
+    pub used_mirror: bool,
+}
+
+impl SearchOutput {
+    fn direct(references: Vec<AnnouncementRef>) -> Self {
+        Self {
+            references,
+            warning: None,
+            used_mirror: false,
+        }
+    }
+}
+
 pub fn search(
     client: &Client,
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
-) -> Result<Vec<AnnouncementRef>> {
+) -> Result<SearchOutput> {
     match event.exchange {
         Exchange::Shanghai => search_sse(client, event, from, to),
-        Exchange::Shenzhen => search_cninfo(client, event, from, to),
-        Exchange::Beijing => search_bse(client, event, from, to),
-        _ => Ok(Vec::new()),
+        Exchange::Shenzhen => {
+            search_cninfo_market(client, event, from, to, "szse", "cninfo-announcement")
+                .map(SearchOutput::direct)
+        }
+        Exchange::Beijing => search_bse(client, event, from, to).map(SearchOutput::direct),
+        _ => Ok(SearchOutput::direct(Vec::new())),
     }
 }
 
 fn search_sse(
+    client: &Client,
+    event: &IpoEvent,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<SearchOutput> {
+    let official = search_sse_official(client, event, from, to);
+    let mirror = search_cninfo_market(client, event, from, to, "sse", "sse-announcement");
+    match (official, mirror) {
+        (Ok(_official), Ok(mirror)) if !mirror.is_empty() => Ok(SearchOutput {
+            references: mirror,
+            warning: None,
+            used_mirror: true,
+        }),
+        (Ok(official), Ok(_)) => Ok(SearchOutput {
+            warning: (!official.is_empty())
+                .then(|| "巨潮沪市公告镜像未命中，已回退上交所公告直链".to_owned()),
+            references: official,
+            used_mirror: false,
+        }),
+        (Ok(official), Err(error)) => Ok(SearchOutput {
+            references: official,
+            warning: Some(format!("巨潮沪市公告镜像不可用：{error:#}")),
+            used_mirror: false,
+        }),
+        (Err(error), Ok(mirror)) => Ok(SearchOutput {
+            references: mirror,
+            warning: Some(format!(
+                "上交所公告检索失败，已由巨潮沪市镜像接管：{error:#}"
+            )),
+            used_mirror: true,
+        }),
+        (Err(official_error), Err(mirror_error)) => bail!(
+            "上交所公告检索与巨潮沪市镜像均失败：上交所={official_error:#}；巨潮={mirror_error:#}"
+        ),
+    }
+}
+
+fn search_sse_official(
     client: &Client,
     event: &IpoEvent,
     from: NaiveDate,
@@ -166,12 +224,13 @@ fn search_sse(
         encode_query(&values)
     );
     ensure_allowed(&url, true)?;
-    let raw = client
+    let response = client
         .get(url)
         .header("Referer", "https://www.sse.com.cn/")
         .send()?
-        .error_for_status()?
-        .text()?;
+        .error_for_status()?;
+    ensure_allowed(response.url().as_str(), true)?;
+    let raw = response.text()?;
     parse_sse_references(&raw)
 }
 
@@ -224,25 +283,28 @@ pub fn parse_sse_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
     Ok(result)
 }
 
-fn search_cninfo(
+fn search_cninfo_market(
     client: &Client,
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
+    column: &str,
+    provider: &str,
 ) -> Result<Vec<AnnouncementRef>> {
     let landing = "https://www.cninfo.com.cn/new/index";
     ensure_allowed(landing, true)?;
-    let _ = client.get(landing).send()?.error_for_status()?;
+    let landing_response = client.get(landing).send()?.error_for_status()?;
+    ensure_allowed(landing_response.url().as_str(), true)?;
     thread::sleep(Duration::from_millis(350));
     let url = "https://www.cninfo.com.cn/new/hisAnnouncement/query";
     ensure_allowed(url, true)?;
-    let raw = client
+    let response = client
         .post(url)
         .header("Referer", landing)
         .form(&[
             ("pageNum", "1"),
             ("pageSize", "100"),
-            ("column", "szse"),
+            ("column", column),
             ("tabName", "fulltext"),
             ("searchkey", event.security_code.as_str()),
             (
@@ -257,24 +319,45 @@ fn search_cninfo(
             ("sortType", ""),
         ])
         .send()?
-        .error_for_status()?
-        .text()?;
-    parse_cninfo_references(&raw)
+        .error_for_status()?;
+    ensure_allowed(response.url().as_str(), true)?;
+    let raw = response.text()?;
+    parse_cninfo_references_for_event(&raw, Some(&event.security_code), provider)
 }
 
-pub fn parse_cninfo_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
+#[cfg(test)]
+fn parse_cninfo_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
+    parse_cninfo_references_for_event(raw, None, "cninfo-announcement")
+}
+
+fn parse_cninfo_references_for_event(
+    raw: &str,
+    expected_code: Option<&str>,
+    provider: &str,
+) -> Result<Vec<AnnouncementRef>> {
     let root: Value = serde_json::from_str(raw).context("巨潮公告响应不是有效 JSON")?;
     let Some(value) = root.get("announcements") else {
         bail!("巨潮公告响应缺少 announcements")
     };
     if value.is_null() {
-        return Ok(Vec::new());
+        let total_announcements = cninfo_count(&root, "totalAnnouncement")?;
+        let total_records = cninfo_count(&root, "totalRecordNum")?;
+        if total_announcements == 0 && total_records == 0 {
+            return Ok(Vec::new());
+        }
+        bail!(
+            "巨潮公告响应 announcements=null，但计数非零：totalAnnouncement={total_announcements}, totalRecordNum={total_records}"
+        );
     }
     let rows = value
         .as_array()
         .context("巨潮公告 announcements 不是数组")?;
     let mut result = Vec::new();
     for item in rows {
+        if expected_code.is_some_and(|expected| text(item, "secCode").as_deref() != Some(expected))
+        {
+            continue;
+        }
         let (Some(title), Some(path), Some(id)) = (
             text(item, "announcementTitle"),
             text(item, "adjunctUrl"),
@@ -283,6 +366,11 @@ pub fn parse_cninfo_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
             continue;
         };
         if !is_relevant(&title) {
+            continue;
+        }
+        if !path.to_ascii_lowercase().ends_with(".pdf")
+            || text(item, "adjunctType").is_some_and(|value| !value.eq_ignore_ascii_case("pdf"))
+        {
             continue;
         }
         let url = if path.starts_with("https://") {
@@ -297,15 +385,29 @@ pub fn parse_cninfo_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
             .and_then(|epoch| Utc.timestamp_millis_opt(epoch).single())
             .map(|value| value.with_timezone(&china_offset()));
         result.push(AnnouncementRef {
-            provider: "cninfo-announcement".into(),
-            announcement_id: id,
+            provider: provider.into(),
+            announcement_id: if provider == "sse-announcement" {
+                format!("cninfo-{id}")
+            } else {
+                id
+            },
             title: title.clone(),
             url,
             published_at,
             announcement_type: Some(announcement_type(&title)),
         });
     }
-    Ok(result)
+    deduplicate(result)
+}
+
+fn cninfo_count(root: &Value, key: &str) -> Result<u64> {
+    let value = root
+        .get(key)
+        .with_context(|| format!("巨潮公告健康空结果缺少 {key}"))?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .with_context(|| format!("巨潮公告 {key} 不是非负整数"))
 }
 
 fn search_bse(
@@ -385,15 +487,16 @@ fn search_bse_pages(
         let url = format!("{endpoint}?{}", encode_query(&query));
         query.clear();
         ensure_allowed(&url, true)?;
-        let raw = client
+        let response = client
             .get(url)
             .header(
                 "Referer",
                 "https://www.bseinfo.net/newshare/listofissues.html",
             )
             .send()?
-            .error_for_status()?
-            .text()?;
+            .error_for_status()?;
+        ensure_allowed(response.url().as_str(), true)?;
+        let raw = response.text()?;
         let (rows, pages) = parse_bse_references(&raw, event, from, to)?;
         result.extend(rows);
         total_pages = pages;
@@ -572,8 +675,33 @@ fn deduplicate(rows: Vec<AnnouncementRef>) -> Result<Vec<AnnouncementRef>> {
         .into_iter()
         .filter(|row| urls.insert(row.url.to_ascii_lowercase()))
         .collect();
-    result.sort_by_key(|row| std::cmp::Reverse(row.published_at));
+    result.sort_by_key(|row| {
+        std::cmp::Reverse((announcement_priority(&row.title), row.published_at))
+    });
     Ok(result)
+}
+
+fn announcement_priority(title: &str) -> u8 {
+    if ["终止发行", "中止发行", "暂缓发行"]
+        .iter()
+        .any(|keyword| title.contains(keyword))
+    {
+        120
+    } else if title.contains("发行公告") && !title.contains("发行结果") {
+        110
+    } else if title.contains("发行安排及初步询价公告") {
+        105
+    } else if title.contains("网上发行申购情况") || title.contains("中签率公告") {
+        90
+    } else if title.contains("中签结果") || title.contains("发行结果") {
+        85
+    } else if title.contains("招股意向书提示性公告") {
+        80
+    } else if title.contains("招股说明书") || title.contains("招股意向书") {
+        70
+    } else {
+        60
+    }
 }
 
 fn is_relevant(title: &str) -> bool {
@@ -592,6 +720,12 @@ fn is_relevant(title: &str) -> bool {
         "审计报告",
         "投资者关系",
         "公司章程",
+        "法律意见",
+        "核查报告",
+        "保荐书",
+        "批复",
+        "招股说明书附录",
+        "招股意向书附录",
     ];
     required.iter().any(|keyword| title.contains(keyword))
         && !excluded.iter().any(|keyword| title.contains(keyword))
@@ -619,7 +753,13 @@ pub fn download_and_parse(
     fs::create_dir_all(&temporary_directory)?;
     let operation_id = Uuid::new_v4().simple().to_string();
     let temporary_path = temporary_directory.join(format!("{operation_id}.download"));
-    let mut response = client.get(&reference.url).send()?.error_for_status()?;
+    let mut request = client.get(&reference.url);
+    if let Some(referer) = announcement_referer(&reference.url) {
+        request = request.header("Referer", referer);
+    }
+    let mut response = request.send()?.error_for_status()?;
+    ensure_allowed(response.url().as_str(), true)?;
+    let final_host = response.url().host_str().unwrap_or_default().to_owned();
     if response
         .content_length()
         .is_some_and(|length| length > MAX_DOWNLOAD_BYTES)
@@ -635,7 +775,7 @@ pub fn download_and_parse(
     let mut target = File::create(&temporary_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; DOWNLOAD_BUFFER_BYTES];
-    let mut prefix = Vec::with_capacity(512);
+    let mut prefix = Vec::with_capacity(DOWNLOAD_PREFIX_BYTES);
     let mut length = 0u64;
     loop {
         let count = response.read(&mut buffer)?;
@@ -647,8 +787,8 @@ pub fn download_and_parse(
             let _ = fs::remove_file(&temporary_path);
             bail!("公告下载超过 32MiB 上限");
         }
-        if prefix.len() < 512 {
-            prefix.extend_from_slice(&buffer[..count.min(512 - prefix.len())]);
+        if prefix.len() < DOWNLOAD_PREFIX_BYTES {
+            prefix.extend_from_slice(&buffer[..count.min(DOWNLOAD_PREFIX_BYTES - prefix.len())]);
         }
         hasher.update(&buffer[..count]);
         target.write_all(&buffer[..count])?;
@@ -656,34 +796,19 @@ pub fn download_and_parse(
     target.flush()?;
     drop(target);
     let file_hash = hex::encode(hasher.finalize());
-    let pdf = prefix.starts_with(b"%PDF-");
-    let looks_html = content_type.contains("html")
-        || String::from_utf8_lossy(&prefix)
-            .to_ascii_lowercase()
-            .contains("<html");
-    if content_type.contains("pdf") && !pdf {
+    if let Err(error) = validate_pdf_download(&prefix, &content_type, length, &final_host) {
         let _ = fs::remove_file(&temporary_path);
-        bail!("公告响应声明为 PDF，但缺少 PDF 签名");
-    }
-    if !pdf && !looks_html {
-        let _ = fs::remove_file(&temporary_path);
-        bail!("公告文件既不是 PDF，也不是 HTML");
-    }
-    if looks_html && length > MAX_HTML_BYTES {
-        let _ = fs::remove_file(&temporary_path);
-        bail!("公告 HTML 超过 4MiB 上限");
+        return Err(error);
     }
     let directory = data_root
         .join("announcements")
         .join(sanitize(&reference.provider))
         .join(sanitize(&event.id));
     fs::create_dir_all(&directory)?;
-    let extension = if pdf { "pdf" } else { "html" };
     let local_path = directory.join(format!(
-        "{}-{}.{}",
+        "{}-{}.pdf",
         sanitize(&reference.announcement_id),
-        &file_hash[..16],
-        extension
+        &file_hash[..16]
     ));
     if local_path.exists() {
         fs::remove_file(&temporary_path)?;
@@ -691,21 +816,12 @@ pub fn download_and_parse(
         fs::rename(&temporary_path, &local_path)?;
     }
 
-    let (extracted_text, text_hash, truncated) = if pdf {
-        let response = extract_pdf_in_worker(data_root, &local_path)?;
-        if !response.success {
-            bail!("PDF Worker 失败：{}", response.error.unwrap_or_default());
-        }
-        (response.text, response.text_hash, response.truncated)
-    } else {
-        let html = fs::read_to_string(&local_path).or_else(|_| {
-            fs::read(&local_path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        })?;
-        let plain = html_to_text(&html);
-        let (plain, truncated) = take_characters(&plain, MAX_EXTRACTED_CHARACTERS);
-        let hash = (!plain.trim().is_empty()).then(|| sha256(plain.as_bytes()));
-        (plain, hash, truncated)
-    };
+    let response = extract_pdf_in_worker(data_root, &local_path)?;
+    if !response.success {
+        bail!("PDF Worker 失败：{}", response.error.unwrap_or_default());
+    }
+    let (extracted_text, text_hash, truncated) =
+        (response.text, response.text_hash, response.truncated);
     let fields = parse_fields(&extracted_text, &reference.title)?;
     let status = if extracted_text.trim().is_empty() {
         ExtractionStatus::Failed
@@ -731,6 +847,48 @@ pub fn download_and_parse(
     };
     let candidate = candidate_from_document(event, &document);
     Ok((document, candidate))
+}
+
+fn announcement_referer(url: &str) -> Option<&'static str> {
+    match url::Url::parse(url).ok()?.host_str()? {
+        "www.sse.com.cn" | "static.sse.com.cn" => Some("https://www.sse.com.cn/"),
+        "www.cninfo.com.cn" | "static.cninfo.com.cn" | "disc.static.szse.cn" => {
+            Some("https://www.cninfo.com.cn/new/index")
+        }
+        "www.bseinfo.net" | "bseinfo.net" | "www.bse.cn" | "bse.cn" => {
+            Some("https://www.bseinfo.net/disclosure/")
+        }
+        _ => None,
+    }
+}
+
+fn validate_pdf_download(prefix: &[u8], content_type: &str, length: u64, host: &str) -> Result<()> {
+    if prefix.starts_with(b"%PDF-") {
+        return Ok(());
+    }
+    let prefix_text = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    let looks_html = content_type.contains("html") || prefix_text.contains("<html");
+    let challenge = prefix_text.contains("acw_sc__v2")
+        || prefix_text.contains("document.location.reload")
+        || prefix_text.contains("var arg1=");
+    if looks_html && challenge {
+        bail!(
+            "公告下载遭遇上游 JavaScript 验证页：host={host}；contentType={content_type}；length={length}；未保存为公告证据"
+        );
+    }
+    if looks_html {
+        bail!(
+            "公告下载结果不是有效 PDF：host={host}；contentType={content_type}；length={length}；返回 HTML/WAF 页面"
+        );
+    }
+    if content_type.contains("pdf") {
+        bail!(
+            "公告响应声明为 PDF，但缺少 PDF 签名：host={host}；contentType={content_type}；length={length}"
+        );
+    }
+    bail!(
+        "公告下载结果不是有效 PDF：host={host}；contentType={content_type}；length={length}；缺少 %PDF- 文件签名"
+    )
 }
 
 fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorkerResponse> {
@@ -789,27 +947,6 @@ fn extract_pdf_in_worker(data_root: &Path, input_path: &Path) -> Result<PdfWorke
 fn cleanup_worker_files(request: &Path, response: &Path) {
     let _ = fs::remove_file(request);
     let _ = fs::remove_file(response);
-}
-
-fn html_to_text(html: &str) -> String {
-    let scripts = Regex::new("(?is)<(script|style)[^>]*>.*?</(script|style)>")
-        .unwrap()
-        .replace_all(html, " ");
-    let tags = Regex::new("(?is)<[^>]+>")
-        .unwrap()
-        .replace_all(&scripts, " ");
-    let decoded = tags
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#39;", "'")
-        .replace("&quot;", "\"");
-    Regex::new(r"\s+")
-        .unwrap()
-        .replace_all(&decoded, " ")
-        .trim()
-        .to_owned()
 }
 
 pub fn parse_fields(text_value: &str, title: &str) -> Result<Vec<ParsedField>> {
@@ -1085,6 +1222,90 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        let mirror = parse_cninfo_references_for_event(
+            &fixture("cninfo-sse-603448-20260826.json"),
+            Some("603448"),
+            "sse-announcement",
+        )
+        .unwrap();
+        assert_eq!(mirror.len(), 1);
+        assert_eq!(mirror[0].provider, "sse-announcement");
+        assert_eq!(mirror[0].announcement_id, "cninfo-1225499048");
+        assert_eq!(
+            mirror[0].url,
+            "https://static.cninfo.com.cn/finalpage/2026-08-25/1225499048.PDF"
+        );
+    }
+
+    #[test]
+    fn prioritizes_primary_announcements_and_excludes_adviser_documents() {
+        assert!(is_relevant("测试股份首次公开发行股票并上市发行公告"));
+        assert!(!is_relevant(
+            "律师事务所关于测试股份首次公开发行股票并上市的法律意见书"
+        ));
+        let published = at(NaiveDate::from_ymd_opt(2026, 8, 25).unwrap(), time(0, 0));
+        let rows = deduplicate(vec![
+            AnnouncementRef {
+                provider: "sse-announcement".into(),
+                announcement_id: "prospectus".into(),
+                title: "测试股份首次公开发行股票并上市招股说明书".into(),
+                url: "https://static.cninfo.com.cn/prospectus.pdf".into(),
+                published_at: Some(published),
+                announcement_type: Some("招股说明书".into()),
+            },
+            AnnouncementRef {
+                provider: "sse-announcement".into(),
+                announcement_id: "issue".into(),
+                title: "测试股份首次公开发行股票并上市发行公告".into(),
+                url: "https://static.cninfo.com.cn/issue.pdf".into(),
+                published_at: Some(published - chrono::Duration::days(1)),
+                announcement_type: Some("发行公告".into()),
+            },
+        ])
+        .unwrap();
+        assert_eq!(rows[0].announcement_id, "issue");
+    }
+
+    #[test]
+    fn cninfo_null_announcements_require_zero_counts() {
+        assert!(
+            parse_cninfo_references(&fixture("cninfo-301689-empty-20260824.json"))
+                .unwrap()
+                .is_empty()
+        );
+        let inconsistent = r#"{
+            "announcements": null,
+            "totalAnnouncement": 1,
+            "totalRecordNum": 1
+        }"#;
+        assert!(
+            parse_cninfo_references(inconsistent)
+                .unwrap_err()
+                .to_string()
+                .contains("计数非零")
+        );
+    }
+
+    #[test]
+    fn rejects_sse_javascript_challenge_as_pdf_evidence() {
+        let challenge = fixture("sse-javascript-challenge-20260826.html");
+        let error = validate_pdf_download(
+            challenge.as_bytes(),
+            "text/html; charset=utf-8",
+            challenge.len() as u64,
+            "static.sse.com.cn",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("JavaScript 验证页"));
+        assert!(
+            validate_pdf_download(
+                b"%PDF-1.7\nfixture",
+                "application/pdf",
+                17,
+                "static.cninfo.com.cn"
+            )
+            .is_ok()
         );
     }
 

@@ -9,6 +9,8 @@
 - `announcements/sse-601123-20260824.json`：上交所发行公告检索。
 - `announcements/cninfo-301688-20260824.json`：巨潮发行公告检索。
 - `announcements/cninfo-301689-empty-20260824.json`：巨潮公告健康空结果契约。
+- `announcements/cninfo-sse-603448-20260826.json`：巨潮沪市镜像发行公告检索，并包含一条错误证券代码用于身份隔离回归。
+- `announcements/sse-javascript-challenge-20260826.html`：上交所静态 PDF 域名返回的 JavaScript Cookie 验证页裁剪样本。
 - `announcements/bse-detail-920289-20260824.jsonp`：北交所公开发行详情接口。
 - `announcements/bse-disclosure-920289-20260824.jsonp`：北交所发行信息披露兜底接口。
 - `announcements/bse-920289-excerpt-20260820.txt`：正式发行公告关键字段摘录。

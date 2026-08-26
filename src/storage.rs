@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration as StdDuration,
@@ -325,23 +326,74 @@ impl Database {
         Ok(())
     }
 
-    pub fn save_collector_run(
+    pub fn save_source_run(
         &self,
         source: &str,
         started: ChinaDateTime,
-        success: bool,
+        state: HealthState,
         count: usize,
         raw: Option<&str>,
         hash: Option<&str>,
         schema: Option<&str>,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<ChinaDateTime>> {
+        if !matches!(
+            state,
+            HealthState::Healthy | HealthState::Warning | HealthState::Failed
+        ) {
+            bail!("来源运行状态无效：{state:?}");
+        }
         let now = now_china();
-        let c = self.open()?;
-        c.execute("INSERT INTO raw_payloads(source,fetched_at,success,record_count,raw_hash,schema_fingerprint,payload,error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![source,format_dt(now),i32::from(success),count as i64,hash,schema,raw.map(|v|limit(v,1_000_000)),error.map(|v|limit(v,2000))])?;
-        c.execute("INSERT INTO sync_runs(source,started_at,finished_at,success,record_count,error) VALUES(?1,?2,?3,?4,?5,?6)",params![source,format_dt(started),format_dt(now),i32::from(success),count as i64,error.map(|v|limit(v,2000))])?;
-        c.execute("INSERT INTO source_health(source,last_attempt_at,last_success_at,last_record_count,schema_fingerprint,consecutive_failures,health_state,last_error) VALUES(?1,?2,CASE WHEN ?3=1 THEN ?2 END,?4,?5,CASE WHEN ?3=1 THEN 0 ELSE 1 END,?6,?7) ON CONFLICT(source) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_success_at=CASE WHEN excluded.health_state=1 THEN excluded.last_attempt_at ELSE source_health.last_success_at END,last_record_count=excluded.last_record_count,schema_fingerprint=COALESCE(excluded.schema_fingerprint,source_health.schema_fingerprint),consecutive_failures=CASE WHEN excluded.health_state=1 THEN 0 ELSE source_health.consecutive_failures+1 END,health_state=excluded.health_state,last_error=excluded.last_error",params![source,format_dt(now),i32::from(success),count as i64,schema,if success{HealthState::Healthy as i32}else{HealthState::Failed as i32},error.map(|v|limit(v,2000))])?;
-        Ok(())
+        let success = state != HealthState::Failed;
+        let limited_raw = raw.map(|value| limit(value, 1_000_000));
+        let limited_error = error.map(|value| limit(value, 2000));
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO raw_payloads(source,fetched_at,success,record_count,raw_hash,schema_fingerprint,payload,error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![source, format_dt(now), i32::from(success), count as i64, hash, schema, limited_raw, limited_error],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_runs(source,started_at,finished_at,success,record_count,error) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![source, format_dt(started), format_dt(now), i32::from(success), count as i64, limited_error],
+        )?;
+        transaction.execute(
+            "INSERT INTO source_health(source,last_attempt_at,last_success_at,last_record_count,schema_fingerprint,consecutive_failures,health_state,last_error) VALUES(?1,?2,CASE WHEN ?3<>3 THEN ?2 END,?4,?5,CASE WHEN ?3=3 THEN 1 ELSE 0 END,?3,?6) ON CONFLICT(source) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_success_at=CASE WHEN excluded.health_state<>3 THEN excluded.last_attempt_at ELSE source_health.last_success_at END,last_record_count=excluded.last_record_count,schema_fingerprint=COALESCE(excluded.schema_fingerprint,source_health.schema_fingerprint),consecutive_failures=CASE WHEN excluded.health_state=3 THEN source_health.consecutive_failures+1 ELSE 0 END,health_state=excluded.health_state,last_error=excluded.last_error",
+            params![source, format_dt(now), state as i32, count as i64, schema, limited_error],
+        )?;
+        let next_attempt = if state == HealthState::Failed {
+            let failures: i32 = transaction
+                .query_row(
+                    "SELECT failure_count FROM source_backoff WHERE source=?1",
+                    [source],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                + 1;
+            let minutes = match failures {
+                1 => 1,
+                2 => 2,
+                3 => 4,
+                4 => 8,
+                5 => 15,
+                _ => 30,
+            };
+            let next = now + chrono::Duration::minutes(minutes);
+            transaction.execute(
+                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_failure_at,last_error) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(source) DO UPDATE SET failure_count=excluded.failure_count,next_attempt_at=excluded.next_attempt_at,last_failure_at=excluded.last_failure_at,last_error=excluded.last_error",
+                params![source, failures, format_dt(next), format_dt(now), limited_error],
+            )?;
+            Some(next)
+        } else {
+            transaction.execute(
+                "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_success_at,last_error) VALUES(?1,0,NULL,?2,NULL) ON CONFLICT(source) DO UPDATE SET failure_count=0,next_attempt_at=NULL,last_success_at=excluded.last_success_at,last_error=NULL",
+                params![source, format_dt(now)],
+            )?;
+            None
+        };
+        transaction.commit()?;
+        Ok(next_attempt)
     }
 
     pub fn save_announcement(&self, document: &AnnouncementDocument) -> Result<()> {
@@ -422,46 +474,6 @@ impl Database {
         Ok((next.is_none_or(|value| value <= now), next))
     }
 
-    pub fn record_source_success(&self, source: &str, now: ChinaDateTime) -> Result<()> {
-        self.open()?.execute(
-            "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_success_at,last_error) VALUES(?1,0,NULL,?2,NULL) ON CONFLICT(source) DO UPDATE SET failure_count=0,next_attempt_at=NULL,last_success_at=excluded.last_success_at,last_error=NULL",
-            params![source, format_dt(now)],
-        )?;
-        Ok(())
-    }
-
-    pub fn record_source_failure(
-        &self,
-        source: &str,
-        now: ChinaDateTime,
-        error: &str,
-    ) -> Result<ChinaDateTime> {
-        let connection = self.open()?;
-        let failures: i32 = connection
-            .query_row(
-                "SELECT failure_count FROM source_backoff WHERE source=?1",
-                [source],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0)
-            + 1;
-        let minutes = match failures {
-            1 => 1,
-            2 => 2,
-            3 => 4,
-            4 => 8,
-            5 => 15,
-            _ => 30,
-        };
-        let next = now + chrono::Duration::minutes(minutes);
-        connection.execute(
-            "INSERT INTO source_backoff(source,failure_count,next_attempt_at,last_failure_at,last_error) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(source) DO UPDATE SET failure_count=excluded.failure_count,next_attempt_at=excluded.next_attempt_at,last_failure_at=excluded.last_failure_at,last_error=excluded.last_error",
-            params![source, failures, format_dt(next), format_dt(now), limit(error, 2000)],
-        )?;
-        Ok(next)
-    }
-
     pub fn pending_count(&self) -> Result<i64> {
         Ok(self.open()?.query_row(
             "SELECT COUNT(*) FROM ipo_events WHERE apply_date=?1 AND lifecycle_status IN (?2,?3)",
@@ -508,8 +520,27 @@ impl Database {
             .filter(|event| settings.exchange_enabled(event.exchange))
             .collect();
         let active_window = !events.is_empty();
-        let stale_after = chrono::Duration::hours(if active_window { 1 } else { 2 });
-        let failed_after = chrono::Duration::hours(if active_window { 2 } else { 6 });
+        let sync_minutes = settings.normal_sync_minutes.clamp(5, 7 * 24 * 60) as i64;
+        let minimum_stale = chrono::Duration::hours(if active_window { 1 } else { 2 });
+        let minimum_failed = chrono::Duration::hours(if active_window { 2 } else { 6 });
+        let scheduled_stale = chrono::Duration::minutes(sync_minutes + 15);
+        let scheduled_failed = chrono::Duration::minutes(sync_minutes * 2 + 30);
+        let stale_after = minimum_stale.max(scheduled_stale);
+        let failed_after = minimum_failed.max(scheduled_failed);
+        let expected_announcement_sources: HashSet<&'static str> = self
+            .events(
+                now.date_naive() - chrono::Duration::days(7),
+                now.date_naive() + chrono::Duration::days(45),
+            )?
+            .into_iter()
+            .filter(|event| settings.exchange_enabled(event.exchange))
+            .filter_map(|event| match event.exchange {
+                Exchange::Shanghai => Some("sse-announcement"),
+                Exchange::Shenzhen => Some("cninfo-announcement"),
+                Exchange::Beijing => Some("bse-announcement"),
+                _ => None,
+            })
+            .collect();
         let connection = self.open()?;
         let mut statement = connection.prepare("SELECT source,last_success_at,last_record_count,consecutive_failures,health_state,last_error FROM source_health ORDER BY source")?;
         let rows = statement.query_map([], |row| {
@@ -537,14 +568,35 @@ impl Database {
                 .as_deref()
                 .and_then(|value| parse_dt(value).ok());
             let age = last_success_at.map(|value| now - value);
-            let state = if HealthState::from_i32(stored_state) == HealthState::Failed
-                || age.is_none_or(|value| value > failed_after)
-            {
-                HealthState::Failed
-            } else if age.is_some_and(|value| value > stale_after) {
-                HealthState::Warning
+            let stored_state = HealthState::from_i32(stored_state);
+            let expected = !source.ends_with("-announcement")
+                || expected_announcement_sources.contains(source.as_str());
+            let state = if !expected {
+                match stored_state {
+                    HealthState::Failed | HealthState::Unknown => HealthState::Warning,
+                    state => state,
+                }
             } else {
-                HealthState::Healthy
+                match stored_state {
+                    HealthState::Failed => HealthState::Failed,
+                    HealthState::Warning => {
+                        if age.is_none_or(|value| value > failed_after) {
+                            HealthState::Failed
+                        } else {
+                            HealthState::Warning
+                        }
+                    }
+                    HealthState::Healthy => {
+                        if age.is_none_or(|value| value > failed_after) {
+                            HealthState::Failed
+                        } else if age.is_some_and(|value| value > stale_after) {
+                            HealthState::Warning
+                        } else {
+                            HealthState::Healthy
+                        }
+                    }
+                    HealthState::Unknown => HealthState::Failed,
+                }
             };
             sources.push(SourceHealthEntry {
                 source,
@@ -1227,7 +1279,17 @@ mod tests {
         );
         let next = test
             .database
-            .record_source_failure("fixture", now_china(), "test")
+            .save_source_run(
+                "fixture",
+                now_china(),
+                HealthState::Failed,
+                0,
+                None,
+                None,
+                None,
+                Some("test"),
+            )
+            .unwrap()
             .unwrap();
         assert!(
             !test
@@ -1238,7 +1300,16 @@ mod tests {
         );
         assert!(next > now_china());
         test.database
-            .record_source_success("fixture", now_china())
+            .save_source_run(
+                "fixture",
+                now_china(),
+                HealthState::Healthy,
+                1,
+                Some("healthy"),
+                None,
+                Some("fixture-v1"),
+                None,
+            )
             .unwrap();
         assert!(
             test.database
@@ -1246,6 +1317,84 @@ mod tests {
                 .unwrap()
                 .0
         );
+    }
+
+    #[test]
+    fn warning_source_run_is_successful_without_losing_diagnostics() {
+        let test = TestDatabase::new();
+        test.database
+            .save_source_run(
+                "fixture-announcement",
+                now_china(),
+                HealthState::Warning,
+                2,
+                Some("attemptedEvents=2, documents=2, issues=1"),
+                None,
+                Some("announcement-run-v2"),
+                Some("一个事件已由备用镜像接管"),
+            )
+            .unwrap();
+        let connection = test.database.open().unwrap();
+        let (state, failures, last_success, last_error): (i32, i32, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT health_state,consecutive_failures,last_success_at,last_error FROM source_health WHERE source='fixture-announcement'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(state, HealthState::Warning as i32);
+        assert_eq!(failures, 0);
+        assert!(last_success.is_some());
+        assert_eq!(last_error.as_deref(), Some("一个事件已由备用镜像接管"));
+        assert!(
+            test.database
+                .source_can_attempt("fixture-announcement", now_china())
+                .unwrap()
+                .0
+        );
+        let successful_run: i32 = connection
+            .query_row(
+                "SELECT success FROM sync_runs WHERE source='fixture-announcement' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(successful_run, 1);
+        assert_eq!(
+            test.database
+                .health_details()
+                .unwrap()
+                .sources
+                .into_iter()
+                .find(|source| source.source == "fixture-announcement")
+                .unwrap()
+                .state,
+            HealthState::Warning
+        );
+    }
+
+    #[test]
+    fn source_freshness_respects_the_configured_sync_interval() {
+        let test = TestDatabase::new();
+        let last_success = now_china() - chrono::Duration::hours(3);
+        test.database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO source_health(source,last_attempt_at,last_success_at,last_record_count,consecutive_failures,health_state) VALUES('eastmoney',?1,?1,10,0,?2)",
+                params![format_dt(last_success), HealthState::Healthy as i32],
+            )
+            .unwrap();
+        let source = test
+            .database
+            .health_details()
+            .unwrap()
+            .sources
+            .into_iter()
+            .find(|source| source.source == "eastmoney")
+            .unwrap();
+        assert_eq!(source.state, HealthState::Healthy);
     }
 
     #[test]

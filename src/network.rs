@@ -336,7 +336,9 @@ pub fn get_text(client: &Client, url: &str, referer: Option<&str>) -> Result<Str
     if let Some(referer) = referer {
         request = request.header("Referer", referer);
     }
-    Ok(request.send()?.error_for_status()?.text()?)
+    let response = request.send()?.error_for_status()?;
+    ensure_allowed(response.url().as_str(), false)?;
+    Ok(response.text()?)
 }
 pub fn ensure_allowed(value: &str, announcement: bool) -> Result<()> {
     let url = url::Url::parse(value)?;
@@ -366,11 +368,16 @@ const DATA_HOSTS: &[&str] = &[
     "www.cloudflare.com",
 ];
 const ANNOUNCEMENT_HOSTS: &[&str] = &[
+    "query.sse.com.cn",
     "www.sse.com.cn",
+    "static.sse.com.cn",
+    "www.cninfo.com.cn",
     "static.cninfo.com.cn",
     "disc.static.szse.cn",
     "www.bseinfo.net",
+    "bseinfo.net",
     "www.bse.cn",
+    "bse.cn",
 ];
 
 pub fn text(item: &Value, key: &str) -> Option<String> {
@@ -505,5 +512,8 @@ mod tests {
         assert!(parse_sse("<html>WAF</html>", crate::core::now_china()).is_err());
         assert!(ensure_allowed("https://example.com/file.pdf", true).is_err());
         assert!(ensure_allowed("http://www.sse.com.cn/file.pdf", true).is_err());
+        assert!(ensure_allowed("https://query.sse.com.cn/query", true).is_ok());
+        assert!(ensure_allowed("https://static.sse.com.cn/file.pdf", true).is_ok());
+        assert!(ensure_allowed("https://www.cninfo.com.cn/query", true).is_ok());
     }
 }
