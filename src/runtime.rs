@@ -20,7 +20,8 @@ use crate::{
     storage::Database,
 };
 
-const AUTOMATIC_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MINIMUM_SYNC_MINUTES: i32 = 5;
+const MAXIMUM_SYNC_MINUTES: i32 = 7 * 24 * 60;
 const DELIVERY_INTERVAL: Duration = Duration::from_secs(10);
 const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -221,7 +222,7 @@ fn run_loop(
     let mut next_sync = if startup_sync {
         Instant::now()
     } else {
-        Instant::now() + AUTOMATIC_SYNC_INTERVAL
+        Instant::now() + automatic_sync_interval(&database)
     };
     let mut next_delivery = Instant::now();
     let mut next_clock = Instant::now();
@@ -234,7 +235,7 @@ fn run_loop(
         if now >= next_sync || requested_reason.is_some() {
             let reason = requested_reason
                 .take()
-                .unwrap_or_else(|| "24 小时定时同步".into());
+                .unwrap_or_else(|| automatic_sync_reason(&database));
             if let Err(error) = synchronize(&database, &client, &data_root, &snapshot, &reason) {
                 let message = format!("{error:#}");
                 operations::log("ERROR", &format!("同步失败（{reason}）：{message}"));
@@ -246,7 +247,7 @@ fn run_loop(
                     value.last_error = Some(message.clone());
                 });
             }
-            next_sync = Instant::now() + AUTOMATIC_SYNC_INTERVAL;
+            next_sync = Instant::now() + automatic_sync_interval(&database);
             refresh_snapshot(&database, &snapshot);
             #[cfg(windows)]
             crate::windows_integration::trim_working_set();
@@ -308,6 +309,31 @@ fn run_loop(
             Ok(RuntimeCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+fn automatic_sync_interval(database: &Database) -> Duration {
+    let settings = database.settings().unwrap_or_default();
+    automatic_sync_interval_for(&settings)
+}
+
+fn automatic_sync_interval_for(settings: &AppSettings) -> Duration {
+    let minutes = settings
+        .normal_sync_minutes
+        .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES) as u64;
+    Duration::from_secs(minutes * 60)
+}
+
+fn automatic_sync_reason(database: &Database) -> String {
+    let minutes = database
+        .settings()
+        .unwrap_or_default()
+        .normal_sync_minutes
+        .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES);
+    if minutes % 60 == 0 {
+        format!("定时自动同步（每 {} 小时）", minutes / 60)
+    } else {
+        format!("定时自动同步（每 {minutes} 分钟）")
     }
 }
 
@@ -708,8 +734,27 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn automatic_sync_is_once_per_day() {
-        assert_eq!(AUTOMATIC_SYNC_INTERVAL, Duration::from_hours(24));
+    fn automatic_sync_uses_the_configured_interval() {
+        let mut settings = AppSettings {
+            normal_sync_minutes: 90,
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            automatic_sync_interval_for(&settings),
+            Duration::from_secs(90 * 60)
+        );
+
+        settings.normal_sync_minutes = 0;
+        assert_eq!(
+            automatic_sync_interval_for(&settings),
+            Duration::from_secs(5 * 60)
+        );
+
+        settings.normal_sync_minutes = i32::MAX;
+        assert_eq!(
+            automatic_sync_interval_for(&settings),
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
     }
 
     #[test]

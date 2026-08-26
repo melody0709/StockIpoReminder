@@ -59,7 +59,8 @@ component ActionButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
     min-width: 104px;
-    height: 38px;
+    min-height: 38px;
+    max-height: 38px;
     border-radius: 8px;
     border-width: 1px;
     border-color: !root.enabled ? #334155 : root.danger ? #dc2626 : root.primary ? #3b82f6 : #334155;
@@ -83,7 +84,8 @@ component NavButton inherits Rectangle {
     in property <bool> selected: false;
     callback clicked();
     min-width: 128px;
-    height: 42px;
+    min-height: 42px;
+    max-height: 42px;
     border-radius: 8px;
     background: root.selected ? #1d4ed8 : touch.has-hover ? #253552 : #111b2e;
     Text {
@@ -100,7 +102,8 @@ component Toggle inherits Rectangle {
     in-out property <bool> checked: false;
     in property <string> label;
     min-width: 174px;
-    height: 34px;
+    min-height: 34px;
+    max-height: 34px;
     background: transparent;
     HorizontalBox {
         spacing: 9px;
@@ -133,7 +136,8 @@ component StatCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
     in property <color> value-color: #f8fafc;
-    height: 82px;
+    min-height: 82px;
+    max-height: 82px;
     border-radius: 10px;
     border-width: 1px;
     border-color: #26334a;
@@ -151,7 +155,8 @@ component LabeledInput inherits Rectangle {
     in-out property <string> value;
     in property <string> placeholder: "";
     min-width: 180px;
-    height: 62px;
+    min-height: 62px;
+    max-height: 62px;
     background: transparent;
     VerticalBox {
         spacing: 4px;
@@ -179,6 +184,7 @@ export component MainWindow inherits Window {
     in-out property <int> repaint-token: 0;
     in-out property <bool> is-synchronizing: false;
     in-out property <int> runtime-level: 0;
+    in property <string> app-version: "";
     in-out property <string> status-text: "正在初始化…";
     in-out property <string> sync-text: "尚未同步";
     in-out property <string> health-text: "正在读取健康状态…";
@@ -213,6 +219,8 @@ export component MainWindow inherits Window {
     in-out property <bool> notification-test-completed: false;
     in-out property <bool> onboarding-completed: false;
     in-out property <string> notification-test-status: "尚未完成提醒通道测试";
+    in-out property <string> sync-interval-value: "24";
+    in-out property <int> sync-interval-unit-index: 1;
 
     in-out property <bool> show-details: false;
     in-out property <string> selected-event-id: "";
@@ -277,25 +285,66 @@ export component MainWindow inherits Window {
         padding: 20px;
         spacing: 12px;
 
-        HorizontalBox {
-            height: 54px;
-            spacing: 12px;
-            VerticalBox {
-                spacing: 3px;
-                Text { text: "A 股新股申购提醒"; font-size: 27px; font-weight: 700; color: #f8fafc; }
+        VerticalBox {
+            min-height: 86px;
+            max-height: 86px;
+            spacing: 8px;
+            HorizontalBox {
+                min-height: 46px;
+                max-height: 46px;
+                spacing: 12px;
+                Text {
+                    text: "A 股新股申购提醒";
+                    min-height: 46px;
+                    max-height: 46px;
+                    font-size: 27px;
+                    font-weight: 700;
+                    color: #f8fafc;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    min-width: 62px;
+                    max-width: 62px;
+                    min-height: 24px;
+                    max-height: 24px;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: #3b82f6;
+                    background: #172554;
+                    Text {
+                        text: "v" + root.app-version;
+                        color: #93c5fd;
+                        font-size: 11px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                ActionButton { label: "立即同步"; primary: true; enabled: !root.is-synchronizing; clicked => { root.sync-now(); } }
+                ActionButton { label: "隐藏到托盘"; clicked => { root.hide-to-tray(); } }
+            }
+            Rectangle {
+                min-height: 32px;
+                max-height: 32px;
+                background: transparent;
                 HorizontalBox {
-                    spacing: 7px;
-                    Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
-                    Text { text: root.status-text + " · " + root.sync-text; color: #94a3b8; font-size: 12px; }
+                    spacing: 8px;
+                    Rectangle { min-width: 10px; max-width: 10px; min-height: 10px; max-height: 10px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
+                    Text {
+                        text: root.status-text + " · " + root.sync-text;
+                        color: #a8b5ca;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
                 }
             }
-            Rectangle { horizontal-stretch: 1; }
-            ActionButton { label: "立即同步"; primary: true; enabled: !root.is-synchronizing; clicked => { root.sync-now(); } }
-            ActionButton { label: "隐藏到托盘"; clicked => { root.hide-to-tray(); } }
         }
 
         HorizontalBox {
-            height: 42px;
+            min-height: 42px;
+            max-height: 42px;
             spacing: 6px;
             NavButton { label: "今日任务"; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
             NavButton { label: "未来 60 天"; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
@@ -572,7 +621,8 @@ export component MainWindow inherits Window {
                     padding: 14px;
                     spacing: 12px;
                     if !root.onboarding-completed : Rectangle {
-                        height: 62px;
+                        min-height: 62px;
+                        max-height: 62px;
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: #d97706;
@@ -586,7 +636,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: 88px;
+                        min-height: 88px;
+                        max-height: 88px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -604,7 +655,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: 176px;
+                        min-height: 176px;
+                        max-height: 176px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -625,7 +677,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: 188px;
+                        min-height: 188px;
+                        max-height: 188px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -653,7 +706,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: 78px;
+                        min-height: 122px;
+                        max-height: 122px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -662,7 +716,15 @@ export component MainWindow inherits Window {
                             padding: 12px;
                             spacing: 7px;
                             Text { text: "同步频率"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: "启动时同步一次，之后每 24 小时自动同步一次；也可以随时手动立即同步。"; color: #94a3b8; }
+                            HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
+                                Text { text: "自动同步间隔"; color: #cbd5e1; vertical-alignment: center; }
+                                LineEdit { width: 110px; text <=> root.sync-interval-value; placeholder-text: "24"; }
+                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.sync-interval-unit-index; }
+                                Text { text: "可设置 5 分钟至 7 天"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                            }
+                            Text { text: "程序启动时同步一次，之后按上述间隔自动同步；也可以随时手动立即同步。"; color: #94a3b8; font-size: 12px; }
                         }
                     }
                     HorizontalBox {

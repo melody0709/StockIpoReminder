@@ -46,6 +46,7 @@ fn main() -> Result<()> {
     let ui = MainWindow::new().context("无法创建 Slint 主窗口")?;
     ui.window()
         .on_close_requested(|| CloseRequestResponse::HideWindow);
+    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_data_root_text(format!("数据目录：{}", options.data_root.display()).into());
     let initial_settings = runtime.settings().unwrap_or_default();
     if initial_settings.onboarding_completed && !options.skip_auto_start_registration {
@@ -224,8 +225,12 @@ fn wire_callbacks(
             settings.daily_health_summary_enabled = ui.get_health_summary_enabled();
             settings.notification_self_test_completed = ui.get_notification_test_completed();
             settings.onboarding_completed = settings.notification_self_test_completed;
-            settings.normal_sync_minutes = 1440;
-            settings.active_day_sync_minutes = 1440;
+            let sync_minutes = parse_sync_interval(
+                ui.get_sync_interval_value().as_str(),
+                ui.get_sync_interval_unit_index(),
+            )?;
+            settings.normal_sync_minutes = sync_minutes;
+            settings.active_day_sync_minutes = sync_minutes;
             settings_runtime.save_settings(&settings)?;
             windows_integration::set_auto_start(
                 settings.auto_start_enabled,
@@ -498,6 +503,22 @@ fn parse_time(value: &str, field: &str) -> Result<NaiveTime> {
         .with_context(|| format!("{field} 必须使用有效的 HH:mm 时间"))
 }
 
+fn parse_sync_interval(value: &str, unit_index: i32) -> Result<i32> {
+    let amount: i32 = value.trim().parse().context("自动同步间隔必须是整数")?;
+    if amount <= 0 {
+        anyhow::bail!("自动同步间隔必须大于 0");
+    }
+    let minutes = match unit_index {
+        0 => amount,
+        1 => amount.checked_mul(60).context("自动同步间隔超出可用范围")?,
+        _ => anyhow::bail!("自动同步间隔单位无效"),
+    };
+    if !(5..=7 * 24 * 60).contains(&minutes) {
+        anyhow::bail!("自动同步间隔应在 5 分钟到 7 天之间");
+    }
+    Ok(minutes)
+}
+
 fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
     ui.set_auto_start(settings.auto_start_enabled);
     ui.set_shanghai_enabled(settings.shanghai_enabled);
@@ -530,6 +551,14 @@ fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
     ui.set_flash_taskbar(settings.flash_taskbar);
     ui.set_toast_enabled(settings.toast_enabled);
     ui.set_health_summary_enabled(settings.daily_health_summary_enabled);
+    let sync_minutes = settings.normal_sync_minutes.clamp(5, 7 * 24 * 60);
+    if sync_minutes % 60 == 0 {
+        ui.set_sync_interval_value((sync_minutes / 60).to_string().into());
+        ui.set_sync_interval_unit_index(1);
+    } else {
+        ui.set_sync_interval_value(sync_minutes.to_string().into());
+        ui.set_sync_interval_unit_index(0);
+    }
     ui.set_notification_test_completed(settings.notification_self_test_completed);
     ui.set_onboarding_completed(settings.onboarding_completed);
     ui.set_notification_test_status(if settings.notification_self_test_completed {
