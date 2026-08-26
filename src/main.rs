@@ -48,6 +48,15 @@ fn main() -> Result<()> {
         .on_close_requested(|| CloseRequestResponse::HideWindow);
     ui.set_data_root_text(format!("数据目录：{}", options.data_root.display()).into());
     let initial_settings = runtime.settings().unwrap_or_default();
+    if initial_settings.onboarding_completed && !options.skip_auto_start_registration {
+        if let Err(error) = windows_integration::set_auto_start(
+            initial_settings.auto_start_enabled,
+            &env::current_exe()?,
+            &options.data_root,
+        ) {
+            operations::log("WARN", &format!("校准开机自启动失败：{error:#}"));
+        }
+    }
     apply_settings(&ui, &initial_settings);
     if !initial_settings.onboarding_completed {
         ui.set_active_page(3);
@@ -1171,6 +1180,7 @@ struct RuntimeOptions {
     background: bool,
     exit_after: Option<Duration>,
     skip_startup_sync: bool,
+    skip_auto_start_registration: bool,
 }
 
 impl RuntimeOptions {
@@ -1186,6 +1196,7 @@ impl RuntimeOptions {
         let mut background = false;
         let mut exit_after = None;
         let mut skip_startup_sync = false;
+        let mut skip_auto_start_registration = false;
         let mut index = 0;
         while index < arguments.len() {
             match arguments[index].as_str() {
@@ -1202,6 +1213,7 @@ impl RuntimeOptions {
                         .map(Duration::from_secs);
                 }
                 "--skip-startup-sync" => skip_startup_sync = true,
+                "--skip-auto-start-registration" => skip_auto_start_registration = true,
                 _ => {}
             }
             index += 1;
@@ -1211,6 +1223,7 @@ impl RuntimeOptions {
             background,
             exit_after,
             skip_startup_sync,
+            skip_auto_start_registration,
         }
     }
 }

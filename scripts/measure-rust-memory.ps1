@@ -12,13 +12,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$executable = Join-Path $workspace "artifacts\release\$Version\StockIpoReminder-Setup-$Version-win-x64.exe"
+$executable = Join-Path $workspace 'build\run\x64-release\StockIpoReminder.exe'
 $stamp = [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss')
 if ([string]::IsNullOrWhiteSpace($DataRoot)) {
-    $DataRoot = Join-Path $workspace "artifacts\memory\data\rust-$Version-$stamp"
+    $DataRoot = Join-Path $workspace "build\artifacts\diagnostics\memory\data\rust-$Version-$stamp"
 }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = Join-Path $workspace "artifacts\memory\rust-$Version-$stamp.json"
+    $OutputPath = Join-Path $workspace "build\artifacts\diagnostics\memory\rust-$Version-$stamp.json"
 }
 
 function Assert-Condition {
@@ -47,7 +47,7 @@ $syncCompleted = $false
 $logPath = Join-Path $DataRoot 'logs\stock-ipo-reminder.log'
 
 try {
-    $process = Start-Process -FilePath $executable -ArgumentList @('--data-root', $DataRoot, '--background') -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $executable -ArgumentList @('--data-root', $DataRoot, '--background', '--skip-auto-start-registration') -PassThru -WindowStyle Hidden
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
 
     do {

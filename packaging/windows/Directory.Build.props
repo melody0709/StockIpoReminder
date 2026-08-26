@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- Keep NuGet/MSBuild restore intermediates out of the source tree. -->
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)..\..\build\cargo\wix\obj\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+  </PropertyGroup>
+</Project>

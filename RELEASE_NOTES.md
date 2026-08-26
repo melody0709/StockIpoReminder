@@ -1,5 +1,14 @@
 # Release notes
 
+## 未发布 — 2026-08-26
+
+### 安装与开机自启动
+
+- 开机自启动从计划任务改为当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册项，并在程序启动时自动校准设置、清理旧计划任务。
+- 发布安装包改为标准 x64 MSI，默认安装到 Program Files，安装界面允许更改目录，升级时会恢复上次选择的位置。
+- MSI 使用稳定 UpgradeCode、按版本生成 ProductCode、Major Upgrade、开始菜单快捷方式和 Windows Installer 事务回滚；普通卸载继续保留用户数据。
+- 生成目录统一收口到 `build/`：Cargo 中间产物、唯一运行载荷、测试/诊断证据、日志和版本化发布包各自归入固定子目录，并增加 `build.bat` 与布局校验。
+
 ## 0.2.2 — 2026-08-25
 
 ### 最终发布与验收

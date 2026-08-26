@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?include ProductIdentity.wxi ?>
+  <?include "$(var.GeneratedWixDirectory)\ProductInstance.generated.wxi" ?>
+
+  <Package
+      Name="A 股新股申购提醒"
+      Manufacturer="StockIpoReminder"
+      Version="$(var.StockIpoReminderProductVersion)"
+      ProductCode="$(var.StockIpoReminderProductCode)"
+      UpgradeCode="$(var.StockIpoReminderUpgradeCode)"
+      Codepage="936"
+      Scope="perMachine"
+      InstallerVersion="500"
+      Compressed="yes">
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        AllowSameVersionUpgrades="no"
+        DowngradeErrorMessage="已安装更高版本的 A 股新股申购提醒。" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <UIRef Id="StockIpoReminderInstallerUi" />
+
+    <!-- Restore the directory selected by the previous MSI before an upgrade. -->
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch
+          Id="SearchStockIpoReminderInstallFolder"
+          Root="HKLM"
+          Key="Software\StockIpoReminder"
+          Name="InstallFolder"
+          Type="raw"
+          Bitness="always64" />
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="StockIpoReminder">
+        <Component
+            Id="cmp_StockIpoReminderRuntime"
+            Guid="$(var.StockIpoReminderRuntimeComponentGuid)"
+            Bitness="always64">
+          <File
+              Id="fil_StockIpoReminderExe"
+              Source="$(var.PayloadRoot)\StockIpoReminder.exe"
+              KeyPath="yes" />
+          <File Id="fil_Readme" Source="$(var.PayloadRoot)\README.md" />
+          <File Id="fil_ReleaseNotes" Source="$(var.PayloadRoot)\RELEASE_NOTES.md" />
+          <File Id="fil_RuntimeManifest" Source="$(var.PayloadRoot)\runtime-manifest.json" />
+        </Component>
+        <Component
+            Id="cmp_StockIpoReminderInstallFolderRegistry"
+            Guid="$(var.StockIpoReminderInstallFolderComponentGuid)"
+            Bitness="always64">
+          <RegistryValue
+              Root="HKLM"
+              Key="Software\StockIpoReminder"
+              Name="InstallFolder"
+              Type="string"
+              Value="[INSTALLFOLDER]"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="StockIpoReminderProgramMenuFolder" Name="A 股新股申购提醒">
+        <Component
+            Id="cmp_StockIpoReminderStartMenuShortcut"
+            Guid="$(var.StockIpoReminderStartMenuComponentGuid)"
+            Bitness="always64">
+          <Shortcut
+              Id="StockIpoReminderStartMenuShortcut"
+              Name="A 股新股申购提醒"
+              Target="[INSTALLFOLDER]StockIpoReminder.exe"
+              WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveStockIpoReminderProgramMenuFolder" On="uninstall" />
+          <RegistryValue
+              Root="HKCU"
+              Key="Software\StockIpoReminder"
+              Name="StartMenuShortcut"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="StockIpoReminderFeature" Title="A 股新股申购提醒" Level="1">
+      <ComponentRef Id="cmp_StockIpoReminderRuntime" />
+      <ComponentRef Id="cmp_StockIpoReminderInstallFolderRegistry" />
+      <ComponentRef Id="cmp_StockIpoReminderStartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

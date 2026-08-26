@@ -11,16 +11,16 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$releaseDirectory = Join-Path $workspace "artifacts\release\$Version"
+$releaseDirectory = Join-Path $workspace "build\packages\$Version"
 $portablePath = Join-Path $releaseDirectory "StockIpoReminder-$Version-win-x64-portable.zip"
-$setupPath = Join-Path $releaseDirectory "StockIpoReminder-Setup-$Version-win-x64.exe"
+$msiPath = Join-Path $releaseDirectory "StockIpoReminder-$Version-win-x64.msi"
 $manifestPath = Join-Path $releaseDirectory 'release-manifest.json'
 $hashPath = Join-Path $releaseDirectory 'SHA256SUMS.txt'
-$auditParent = Join-Path $workspace 'artifacts\.audit-staging'
+$auditParent = Join-Path $workspace 'build\cargo\audit-staging'
 $auditRoot = Join-Path $auditParent ([Guid]::NewGuid().ToString('N'))
 $extractRoot = Join-Path $auditRoot 'portable'
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = Join-Path $workspace ("artifacts\audit\release-rust-$Version-" + [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss') + '.json')
+    $OutputPath = Join-Path $workspace ("build\artifacts\tests\audit\release-rust-$Version-" + [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss') + '.json')
 }
 
 function Assert-Condition { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -44,6 +44,15 @@ function Get-PeMachine {
     }
     finally { $reader.Dispose(); $stream.Dispose() }
 }
+function Test-MsiSignature {
+    param([string]$Path)
+    $expected = [byte[]](0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1)
+    $actual = [System.IO.File]::ReadAllBytes($Path)[0..7]
+    for ($index = 0; $index -lt $expected.Length; $index++) {
+        if ($actual[$index] -ne $expected[$index]) { return $false }
+    }
+    $true
+}
 function Get-WorkspaceRelativePath {
     param([string]$Path)
     $fullPath = [System.IO.Path]::GetFullPath($Path)
@@ -57,16 +66,17 @@ function Add-Check { param([string]$Name, [string]$Detail) $checks.Add([ordered]
 
 New-Item -ItemType Directory -Path $auditRoot -Force | Out-Null
 try {
-    foreach ($path in @($portablePath, $setupPath, $manifestPath, $hashPath)) {
+    foreach ($path in @($portablePath, $msiPath, $manifestPath, $hashPath)) {
         Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) "Missing release file: $path"
     }
-    Add-Check 'release.files' 'Portable ZIP, Rust Setup, manifest, and SHA256SUMS exist.'
+    Add-Check 'release.files' 'Portable ZIP, MSI, manifest, and SHA256SUMS exist.'
 
     $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
     Assert-Condition ([string]$manifest.version -eq $Version) 'Manifest version mismatch.'
     Assert-Condition ([string]$manifest.implementationLanguage -eq 'rust') 'Manifest implementation is not Rust.'
     Assert-Condition (-not [bool]$manifest.dotnetRuntimeRequired) 'Manifest still requires .NET.'
     Assert-Condition ([string]$manifest.ui -eq 'Slint') 'Manifest UI is not Slint.'
+    Assert-Condition ([string]$manifest.installer -eq 'msi-per-machine-selectable-directory') 'Manifest installer contract is not MSI with a selectable directory.'
     foreach ($artifact in $manifest.artifacts) {
         $path = Join-Path $releaseDirectory ([string]$artifact.name)
         Assert-Condition ((Get-Item -LiteralPath $path).Length -eq [long]$artifact.sizeBytes) "Artifact size mismatch: $path"
@@ -85,15 +95,16 @@ try {
     Add-Check 'portable.single-native-exe' "Portable archive contains one Rust EXE and documentation only: $($entries.Count) files."
 
     Assert-Condition ((Get-PeMachine $appPath) -eq 0x8664) 'Portable app is not AMD64 PE.'
-    Assert-Condition ((Get-PeMachine $setupPath) -eq 0x8664) 'Setup is not AMD64 PE.'
-    Add-Check 'pe.amd64' 'App and Setup are AMD64 PE files.'
+    Assert-Condition (Test-MsiSignature $msiPath) 'Installer is not a Windows Installer compound file.'
+    Add-Check 'binary.formats' 'App is AMD64 PE and installer is an MSI compound file.'
 
     $cargoManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'Cargo.toml')
     Assert-Condition ($cargoManifest -match '(?m)^name\s*=\s*"stock-ipo-reminder"') 'Cargo package is not formal stock-ipo-reminder.'
     Assert-Condition ($cargoManifest -match ('(?m)^version\s*=\s*"' + [regex]::Escape($Version) + '"')) 'Cargo version mismatch.'
     $releaseScripts = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-release.ps1')) + (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\smoke-release.ps1'))
-    Assert-Condition ($releaseScripts -notmatch '(?i)Invoke-DotNet|\.tools[\\/]dotnet|\.csproj|StockIpoReminder\.App') 'Formal build/smoke scripts still invoke .NET build inputs.'
-    Add-Check 'source.release-entrypoints' 'Formal build and smoke entrypoints use Cargo artifacts only.'
+    Assert-Condition ($releaseScripts -notmatch '(?i)\.tools[\\/]dotnet|\.csproj|StockIpoReminder\.App') 'Formal build/smoke scripts still invoke legacy .NET application inputs.'
+    Assert-Condition ($releaseScripts -match 'StockIpoReminder\.Installer\.wixproj') 'Formal build does not invoke the WiX MSI project.'
+    Add-Check 'source.release-entrypoints' 'Cargo builds the application and WiX builds the MSI; no .NET application runtime is packaged.'
 
     $legacyExtensions = @('.cs', '.xaml', '.csproj', '.sln')
     $sourceRoots = @('src', 'ui', 'tests', 'scripts', 'assets') | ForEach-Object { Join-Path $workspace $_ }
@@ -109,7 +120,7 @@ try {
     Add-Check 'source.rust-only' 'Active source tree contains no C#, WPF, project, or solution files.'
 
     if ([string]::IsNullOrWhiteSpace($SmokeReportPath)) {
-        $SmokeReportPath = Get-ChildItem -LiteralPath (Join-Path $workspace 'artifacts\smoke') -Filter "windows-rust-$Version-*.json" -File -ErrorAction SilentlyContinue |
+        $SmokeReportPath = Get-ChildItem -LiteralPath (Join-Path $workspace 'build\artifacts\tests\smoke') -Filter "windows-rust-$Version-*.json" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
     }
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($SmokeReportPath)) 'Rust Windows smoke report was not found.'
@@ -117,8 +128,8 @@ try {
     Assert-Condition ([bool]$smoke.success) 'Rust Windows smoke failed.'
     Assert-Condition ([string]$smoke.implementation -eq 'rust') 'Smoke report is not Rust.'
     Assert-Condition ([long]$smoke.memory.privateBytes -lt [long]$smoke.memory.limitBytes) 'Idle memory gate failed.'
-    Assert-Condition ([bool]$smoke.checks.install -and [bool]$smoke.checks.uninstallPreservesData) 'Install/uninstall smoke gates failed.'
-    Add-Check 'evidence.windows-smoke' 'Rust UI, SQLite, install/uninstall, and sub-100MB idle memory smoke passed.'
+    Assert-Condition ([bool]$smoke.checks.msiAdministrativeExtract -and [bool]$smoke.checks.msiPayloadSelfTest -and [bool]$smoke.checks.selectableInstallDirectoryAuthoring) 'MSI smoke gates failed.'
+    Add-Check 'evidence.windows-smoke' 'Rust UI, SQLite, MSI administrative extraction, selectable directory authoring, and sub-100MB idle memory smoke passed.'
 
     $report = [ordered]@{
         schemaVersion = '2'
@@ -127,7 +138,7 @@ try {
         implementation = 'rust'
         version = $Version
         generatedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
-        releaseDirectory = "artifacts/release/$Version"
+        releaseDirectory = "build/packages/$Version"
         smokeReport = Get-WorkspaceRelativePath $SmokeReportPath
         checks = @($checks)
     }

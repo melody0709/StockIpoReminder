@@ -1,0 +1,25 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Cultures>en-US</Cultures>
+    <OutputName Condition="'$(StockIpoReminderMsiOutputName)' != ''">$(StockIpoReminderMsiOutputName)</OutputName>
+    <OutputPath Condition="'$(StockIpoReminderMsiOutputDirectory)' != ''">$(StockIpoReminderMsiOutputDirectory)</OutputPath>
+    <IntermediateOutputPath Condition="'$(StockIpoReminderWixIntermediateDirectory)' != ''">$(StockIpoReminderWixIntermediateDirectory)</IntermediateOutputPath>
+    <DefineConstants>GeneratedWixDirectory=$(GeneratedWixDirectory);PayloadRoot=$(PayloadRoot)</DefineConstants>
+    <EnableDefaultItems>false</EnableDefaultItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="7.0.0" />
+    <Compile Include="Package.wxs" />
+    <Compile Include="InstallerUi.wxs" />
+  </ItemGroup>
+
+  <Target Name="RequirePackageInputs" BeforeTargets="Build">
+    <Error Condition="'$(GeneratedWixDirectory)' == ''" Text="GeneratedWixDirectory is required." />
+    <Error Condition="'$(PayloadRoot)' == ''" Text="PayloadRoot is required." />
+    <Error Condition="'$(StockIpoReminderMsiOutputDirectory)' == ''" Text="StockIpoReminderMsiOutputDirectory is required." />
+    <Error Condition="'$(StockIpoReminderWixIntermediateDirectory)' == ''" Text="StockIpoReminderWixIntermediateDirectory is required." />
+  </Target>
+</Project>

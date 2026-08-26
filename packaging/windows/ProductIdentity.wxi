@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stable x64/per-machine MSI identity. These GUIDs must not be regenerated. -->
+<Include xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?define StockIpoReminderProductLineKey = "stable|x64|perMachine" ?>
+  <?define StockIpoReminderUpgradeCode = "A007780A-97A8-483E-A532-F336649EC5BB" ?>
+  <?define StockIpoReminderProductCodeNamespace = "CCC1062C-ADB0-40B5-B0A7-48CBE2C3C09D" ?>
+  <?define StockIpoReminderRuntimeComponentGuid = "C6EB5C39-FCB6-45AF-9534-949726280A4F" ?>
+  <?define StockIpoReminderInstallFolderComponentGuid = "7B3E8B0A-BA68-459F-AF4E-C83793D95AE2" ?>
+  <?define StockIpoReminderStartMenuComponentGuid = "8A51CD59-3F1E-4201-89C2-5FC0A8A67F13" ?>
+</Include>

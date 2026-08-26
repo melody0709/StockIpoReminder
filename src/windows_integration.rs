@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     mem::size_of,
     path::Path,
     process::{Command, Stdio},
@@ -15,8 +15,8 @@ use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND,
-            LPARAM, WPARAM,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError,
+            GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, WPARAM,
         },
         Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW},
         System::{
@@ -25,6 +25,10 @@ use windows::{
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
             ProcessStatus::EmptyWorkingSet,
+            Registry::{
+                HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+                RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
+            },
             Threading::{CreateMutexW, GetCurrentProcess},
         },
         UI::{
@@ -262,73 +266,83 @@ pub fn flash_window(window: &slint::Window) {
 pub fn set_auto_start(enabled: bool, executable: &Path, data_root: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        let identity = data_root.to_string_lossy().to_ascii_lowercase();
-        let task_name = format!("StockIpoReminder-{}", &sha256(identity.as_bytes())[..12]);
-        if !enabled {
-            let status = Command::new("schtasks.exe")
-                .args(["/Delete", "/F", "/TN", &task_name])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
-                .status()?;
-            if !matches!(status.code(), Some(0 | 1)) {
-                bail!("Windows 计划任务删除失败：exit={:?}", status.code());
+        const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        let value_name = auto_start_value_name(data_root);
+        let run_key = wide_null(RUN_KEY);
+        let value_name_wide = wide_null(&value_name);
+        let mut key = HKEY::default();
+
+        if enabled {
+            let status = unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(run_key.as_ptr()),
+                    None,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_SET_VALUE,
+                    None,
+                    &mut key,
+                    None,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                bail!("无法打开 Windows 开机自启动注册表项：error={}", status.0);
             }
-            return Ok(());
+            let command = auto_start_command(executable, data_root);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(command.as_ptr().cast::<u8>(), command.len() * 2)
+            };
+            let write_status = unsafe {
+                RegSetValueExW(
+                    key,
+                    PCWSTR(value_name_wide.as_ptr()),
+                    None,
+                    REG_SZ,
+                    Some(bytes),
+                )
+            };
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+            if write_status != ERROR_SUCCESS {
+                bail!(
+                    "无法写入 Windows 开机自启动注册表项：error={}",
+                    write_status.0
+                );
+            }
+        } else {
+            let open_status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(run_key.as_ptr()),
+                    None,
+                    KEY_SET_VALUE,
+                    &mut key,
+                )
+            };
+            if open_status != ERROR_FILE_NOT_FOUND && open_status != ERROR_SUCCESS {
+                bail!(
+                    "无法打开 Windows 开机自启动注册表项：error={}",
+                    open_status.0
+                );
+            }
+            if open_status == ERROR_SUCCESS {
+                let delete_status =
+                    unsafe { RegDeleteValueW(key, PCWSTR(value_name_wide.as_ptr())) };
+                unsafe {
+                    let _ = RegCloseKey(key);
+                }
+                if delete_status != ERROR_SUCCESS && delete_status != ERROR_FILE_NOT_FOUND {
+                    bail!(
+                        "无法删除 Windows 开机自启动注册表项：error={}",
+                        delete_status.0
+                    );
+                }
+            }
         }
 
-        let user = format!(
-            "{}\\{}",
-            env::var("USERDOMAIN").unwrap_or_default(),
-            env::var("USERNAME").unwrap_or_default()
-        );
-        let working_directory = executable.parent().unwrap_or_else(|| Path::new("."));
-        let arguments = format!("--background --data-root \"{}\"", data_root.display());
-        let xml = format!(
-            r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Stock IPO Reminder background startup</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
-  <Actions Context="Author"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>
-</Task>"#,
-            xml_escape(&user),
-            xml_escape(&user),
-            xml_escape(&executable.to_string_lossy()),
-            xml_escape(&arguments),
-            xml_escape(&working_directory.to_string_lossy())
-        );
-        let path = env::temp_dir().join(format!(
-            "stock-ipo-reminder-{}.xml",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let mut bytes = Vec::with_capacity(2 + xml.len() * 2);
-        bytes.extend_from_slice(&[0xff, 0xfe]);
-        for unit in xml.encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        fs::write(&path, bytes)?;
-        let status = Command::new("schtasks.exe")
-            .args([
-                "/Create",
-                "/F",
-                "/TN",
-                &task_name,
-                "/XML",
-                path.to_string_lossy().as_ref(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-        let _ = fs::remove_file(&path);
-        let status = status?;
-        if !status.success() {
-            bail!("Windows 计划任务更新失败：exit={:?}", status.code());
-        }
+        remove_legacy_auto_start_task(data_root);
         return Ok(());
     }
     #[cfg(not(windows))]
@@ -338,13 +352,58 @@ pub fn set_auto_start(enabled: bool, executable: &Path, data_root: &Path) -> Res
     }
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn auto_start_value_name(data_root: &Path) -> String {
+    let identity = data_root.to_string_lossy().to_ascii_lowercase();
+    format!("StockIpoReminder-{}", &sha256(identity.as_bytes())[..12])
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn auto_start_command(executable: &Path, data_root: &Path) -> Vec<u16> {
+    let mut command = Vec::new();
+    append_quoted_argument(&mut command, executable.as_os_str());
+    command.extend(" --background --data-root ".encode_utf16());
+    append_quoted_argument(&mut command, data_root.as_os_str());
+    command.push(0);
+    command
+}
+
+#[cfg(windows)]
+fn append_quoted_argument(target: &mut Vec<u16>, value: &std::ffi::OsStr) {
+    target.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for unit in value.encode_wide() {
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if unit == b'"' as u16 {
+            target.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+        } else {
+            target.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        }
+        backslashes = 0;
+        target.push(unit);
+    }
+    target.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    target.push(b'"' as u16);
+}
+
+#[cfg(windows)]
+fn remove_legacy_auto_start_task(data_root: &Path) {
+    let identity = data_root.to_string_lossy().to_ascii_lowercase();
+    let task_name = format!("StockIpoReminder-{}", &sha256(identity.as_bytes())[..12]);
+    let _ = Command::new("schtasks.exe")
+        .args(["/Delete", "/F", "/TN", &task_name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 }
 
 pub fn delete_after_reboot(path: &Path) {

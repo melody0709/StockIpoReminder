@@ -4,7 +4,7 @@
 
 当前版本：`0.2.2`
 
-正式运行版本已经完全迁移到 Rust：界面使用 Slint，Windows 托盘、通知、单实例、声音和登录计划任务使用 `windows-rs`，数据层使用内嵌 SQLite。安装包和便携包都不依赖 .NET Runtime，仓库也已移除旧 C#/.NET 工程。
+正式运行版本已经完全迁移到 Rust：界面使用 Slint，Windows 托盘、通知、单实例、声音和当前用户开机自启动注册使用 `windows-rs`，数据层使用内嵌 SQLite。MSI 安装包和便携包都不依赖 .NET Runtime，仓库也已移除旧 C#/.NET 工程。
 
 程序启动时自动同步一次，之后每 24 小时同步一次，并保留“立即同步”。PDF 由同一 Rust EXE 的短生命周期 Worker 解析；Worker 完成后退出，因此同步期的响应、正文和 PDF 解析内存不会留在常驻主进程中。
 
@@ -57,25 +57,25 @@
 运行：
 
 ```text
-StockIpoReminder-Setup-0.2.2-win-x64.exe
+StockIpoReminder-0.2.2-win-x64.msi
 ```
 
 默认目录：
 
-- 程序：`%LocalAppData%\Programs\StockIpoReminder`
+- 程序：`%ProgramFiles%\StockIpoReminder`（安装时可点击“更改目录”选择其他位置）
 - 数据：`%LocalAppData%\StockIpoReminder`
 
-安装不需要管理员权限。程序完成首次设置且开启“登录 Windows 后自动启动”后，会为当前用户注册登录计划任务。
+MSI 是 64 位按计算机安装，写入 Program Files 时会请求管理员权限；升级会记住上次选择的安装目录。程序启动或保存设置时，会按“登录 Windows 后自动启动”选项写入当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，并清理旧版本遗留的同名计划任务。
 
-升级时，安装器会在替换程序文件前使用 SQLite 在线备份创建一致性数据库备份。程序目录采用同卷暂存和目录替换；替换失败会尝试恢复上一版本。
+MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供事务回滚。用户数据始终保存在 `%LocalAppData%\StockIpoReminder`，不会随程序目录升级而移动。
 
-普通卸载默认保留数据库、设置、公告缓存和备份。只有显式选择删除数据并完成二次确认后，卸载器才会删除数据目录；静默删除还必须同时传入两个确认参数。
+普通 MSI 卸载只删除程序文件、开始菜单入口和安装目录记录，默认保留数据库、设置、公告缓存和备份。
 
 ## 便携版
 
 解压 `StockIpoReminder-0.2.2-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。
 
-便携版不自动注册登录计划任务；如果你在设置中主动开启自启动，程序仍会按当前可执行文件位置注册。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序不会自动删除确认记录。
+便携版如果启用“登录 Windows 后自动启动”，会按当前可执行文件位置写入当前用户 Run 注册项。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序后，应先关闭自启动或重新保存设置以更新路径。
 
 ## 数据、备份和诊断
 
@@ -97,9 +97,9 @@ diagnostics\              用户导出的脱敏诊断包
 StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 ```
 
-也可以使用环境变量 `STOCK_IPO_REMINDER_DATA_ROOT`。命令行参数优先于环境变量。不同数据目录使用不同的单实例互斥量和自启动任务名，避免测试污染正式数据。
+也可以使用环境变量 `STOCK_IPO_REMINDER_DATA_ROOT`。命令行参数优先于环境变量。不同数据目录使用不同的单实例互斥量和 Run 注册值名称，避免测试污染正式数据。
 
-`--skip-startup-sync`、`--self-test-report <path>` 和 `--exit-after-seconds <n>` 是发布 smoke 使用的参数，不建议日常使用。
+`--skip-startup-sync`、`--skip-auto-start-registration`、`--self-test-report <path>` 和 `--exit-after-seconds <n>` 是发布 smoke 使用的参数，不建议日常使用。
 
 ## 默认提醒规则
 
@@ -120,14 +120,17 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 开发与验证
 
-正式版使用 Rust/Cargo；发布脚本只接受 Cargo 生成的 `StockIpoReminder.exe`：
+正式版使用 Rust/Cargo。所有生成内容统一写入 `build/`，日常构建、清理和打包入口为根目录 `build.bat`：
 
 ```powershell
-rtk cargo test --locked
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Version 0.2.2
+rtk build.bat
+rtk build.bat --rebuild
+rtk build.bat --package
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1 -Version 0.2.2
 rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1 -Version 0.2.2
 ```
+
+唯一可直接运行的开发版本位于 `build\run\x64-release\StockIpoReminder.exe`。Cargo 缓存和测试二进制位于 `build\cargo`；MSI 与便携包位于 `build\packages\<version>`。
 
 日常测试使用四来源和正式公告的固定真实响应裁剪，不把随机网络访问混入单元测试。联网端到端验收必须使用独立 `--data-root`，不得污染正式数据。
 
@@ -137,12 +140,15 @@ rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps
 
 ```text
 Cargo.toml / Cargo.lock   Rust 正式项目与锁定依赖
+.cargo/config.toml        将 Cargo 生成目录固定到 build/cargo
+build.bat                 构建、清理和 MSI/便携包统一入口
+build/                    全部本地生成输出；仅 README.txt 纳入版本控制
 src/                      应用、同步、存储、PDF、部署和 Windows 集成
 ui/                       Slint 界面
 assets/                   Windows 应用图标
 tests/fixtures/           四来源与正式公告的离线固定响应样本
 scripts/                  构建、smoke、发布审计和内存测量
-artifacts/                本地生成的发布物与验收报告（不提交）
+packaging/windows/        WiX MSI 项目、可选目录界面和稳定升级标识
 ```
 
 完整迁移、PDF Worker、内存结果和发布闸门见 `.plan/feat/memory-footprint-pdf-rust.md`；产品设计基线见 `.plan/feat/windows-ipo-reminder.md`。

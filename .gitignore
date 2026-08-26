@@ -1,7 +1,6 @@
 # Build output
-/target/
-artifacts/
-publish/
+/build/*
+!/build/README.txt
 
 # IDE and local tooling
 .vs/
