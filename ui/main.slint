@@ -800,8 +800,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        min-height: 378px;
-                        max-height: 378px;
+                        min-height: root.compact-width ? 500px : 456px;
+                        max-height: root.compact-width ? 500px : 456px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -1020,6 +1020,36 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: "仅发送 Watchdog 生成的 JSON；不发送数据库、日志、公告正文、命令行、路径、用户名、设备标识、账户、持仓或凭据。过去 24 小时最多尝试 3 次。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        min-height: root.compact-width ? 148px : 126px;
+                        max-height: root.compact-width ? 148px : 126px;
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: #26334a;
+                        background: #0f172a;
+                        VerticalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: "本地缓存与数据"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
+                            HorizontalBox {
+                                spacing: 10px;
+                                ActionButton {
+                                    label: "打开本地缓存目录";
+                                    compact: root.compact-width;
+                                    clicked => { root.open-data-folder(); }
+                                }
+                                Text {
+                                    text: "包含数据库、公告 PDF、日志、备份和诊断文件；打开目录不会清理或修改数据。";
+                                    color: #64748b;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
                     }
                     Rectangle {
