@@ -157,6 +157,8 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     );
     refresh_ui(&ui, &runtime);
     let available_update = Arc::new(Mutex::new(None::<updater::AvailableUpdate>));
+    let update_check_busy = Arc::new(AtomicBool::new(false));
+    let update_install_busy = Arc::new(AtomicBool::new(false));
     let crash_upload_busy = Arc::new(AtomicBool::new(false));
     let secondary_notification_busy = Arc::new(AtomicBool::new(false));
 
@@ -178,6 +180,8 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         runtime.clone(),
         options.data_root.clone(),
         Arc::clone(&available_update),
+        Arc::clone(&update_check_busy),
+        Arc::clone(&update_install_busy),
         Arc::clone(&crash_upload_busy),
         Arc::clone(&secondary_notification_busy),
         Arc::clone(&tray),
@@ -189,6 +193,8 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         runtime.clone(),
         options.data_root.clone(),
         Arc::clone(&available_update),
+        Arc::clone(&update_check_busy),
+        Arc::clone(&update_install_busy),
         Arc::clone(&crash_upload_busy),
         Arc::clone(&secondary_notification_busy),
     );
@@ -200,6 +206,7 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         runtime.clone(),
         options.data_root.clone(),
         Arc::clone(&available_update),
+        Arc::clone(&update_check_busy),
         Arc::clone(&crash_upload_busy),
         update_configured,
         crash_upload_configured,
@@ -270,6 +277,7 @@ fn install_runtime_ui_bridge(
     runtime: RuntimeHandle,
     data_root: PathBuf,
     available_update: Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    update_check_busy: Arc<AtomicBool>,
     crash_upload_busy: Arc<AtomicBool>,
     update_configured: bool,
     crash_upload_configured: bool,
@@ -292,6 +300,7 @@ fn install_runtime_ui_bridge(
         let runtime = notifier_runtime.clone();
         let data_root = data_root.clone();
         let available_update = Arc::clone(&available_update);
+        let update_check_busy = Arc::clone(&update_check_busy);
         let crash_upload_busy = Arc::clone(&crash_upload_busy);
         let bridge_state = Arc::clone(&bridge_state);
         #[cfg(windows)]
@@ -304,6 +313,7 @@ fn install_runtime_ui_bridge(
                 &runtime,
                 &data_root,
                 &available_update,
+                &update_check_busy,
                 &crash_upload_busy,
                 update_configured,
                 crash_upload_configured,
@@ -328,6 +338,7 @@ fn drain_runtime_ui(
     runtime: &RuntimeHandle,
     data_root: &PathBuf,
     available_update: &Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    update_check_busy: &Arc<AtomicBool>,
     crash_upload_busy: &Arc<AtomicBool>,
     update_configured: bool,
     crash_upload_configured: bool,
@@ -343,7 +354,6 @@ fn drain_runtime_ui(
     let mut refresh = false;
     if let Ok(mut state) = bridge_state.lock() {
         if !state.startup_applied && runtime.is_ready() {
-            state.startup_applied = true;
             apply_startup = true;
         }
         if state.last_ui_revision != Some(snapshot.revision) {
@@ -353,7 +363,18 @@ fn drain_runtime_ui(
     }
 
     if apply_startup {
-        let settings = runtime.settings().unwrap_or_default();
+        let settings = match runtime.settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                let message = format!("读取应用设置失败：{error:#}");
+                operations::log("ERROR", &message);
+                ui.set_status_text(message.into());
+                return;
+            }
+        };
+        if let Ok(mut state) = bridge_state.lock() {
+            state.startup_applied = true;
+        }
         if settings.onboarding_completed && !skip_auto_start_registration {
             match env::current_exe() {
                 Ok(executable) => {
@@ -379,8 +400,14 @@ fn drain_runtime_ui(
         if settings.automatic_updates_enabled && update_configured && !skip_update_check {
             let update_window = ui.as_weak();
             let update_state = Arc::clone(available_update);
+            let update_busy = Arc::clone(update_check_busy);
             Timer::single_shot(Duration::from_secs(3), move || {
-                start_update_check(update_window.clone(), Arc::clone(&update_state), true);
+                start_update_check(
+                    update_window.clone(),
+                    Arc::clone(&update_state),
+                    Arc::clone(&update_busy),
+                    true,
+                );
             });
         }
         if settings.crash_report_upload_enabled && crash_upload_configured && !skip_crash_upload {
@@ -441,7 +468,13 @@ fn drain_runtime_ui(
         reminder_window.set_batch_count(deliveries.len() as i32);
         reminder_window.set_can_acknowledge(batch.can_acknowledge);
         let shown = show_dedicated_reminder(&reminder_window);
-        let settings = runtime.settings().unwrap_or_default();
+        let settings = runtime.settings().unwrap_or_else(|error| {
+            operations::log(
+                "ERROR",
+                &format!("提醒呈现时读取设置失败，使用安全通知默认值：{error:#}"),
+            );
+            AppSettings::default()
+        });
         if settings.sound_enabled {
             windows_integration::play_alert();
         }
@@ -507,7 +540,17 @@ fn drain_runtime_ui(
         reminder_window.set_can_acknowledge(false);
         let _ = show_dedicated_reminder(&reminder_window);
         #[cfg(windows)]
-        if runtime.settings().unwrap_or_default().toast_enabled {
+        if runtime
+            .settings()
+            .map(|settings| settings.toast_enabled)
+            .unwrap_or_else(|error| {
+                operations::log(
+                    "ERROR",
+                    &format!("健康摘要读取通知设置失败，仍尝试 Toast：{error:#}"),
+                );
+                true
+            })
+        {
             tray.notify("A 股打新提醒 · 健康摘要", &text, None);
         }
     }
@@ -630,7 +673,7 @@ fn reminder_batch(
             .entry(delivery.event.id.clone())
             .or_insert_with(|| (delivery.clone(), 0));
         entry.1 += 1;
-        if delivery.level as i32 > entry.0.level as i32 {
+        if reminder_display_priority(delivery.level) > reminder_display_priority(entry.0.level) {
             entry.0 = delivery.clone();
         }
     }
@@ -701,6 +744,14 @@ fn reminder_batch(
         batch.body.push_str(summary);
     }
     batch
+}
+
+fn reminder_display_priority(level: ReminderLevel) -> i32 {
+    match level {
+        ReminderLevel::Final => i32::MAX,
+        ReminderLevel::DataChanged => ReminderLevel::Final as i32 - 1,
+        _ => level as i32,
+    }
 }
 
 fn show_dedicated_reminder(window: &ReminderWindow) -> bool {
@@ -789,6 +840,8 @@ fn wire_callbacks(
     runtime: RuntimeHandle,
     data_root: PathBuf,
     available_update: Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    update_check_busy: Arc<AtomicBool>,
+    update_install_busy: Arc<AtomicBool>,
     crash_upload_busy: Arc<AtomicBool>,
     secondary_notification_busy: Arc<AtomicBool>,
     #[cfg(windows)] tray: Arc<native_tray::NativeTray>,
@@ -803,7 +856,7 @@ fn wire_callbacks(
             {
                 anyhow::bail!("至少需要启用一个市场");
             }
-            let mut settings = settings_runtime.settings().unwrap_or_default();
+            let mut settings = settings_runtime.settings()?;
             settings.auto_start_enabled = ui.get_auto_start();
             settings.shanghai_enabled = ui.get_shanghai_enabled();
             settings.shenzhen_enabled = ui.get_shenzhen_enabled();
@@ -835,21 +888,9 @@ fn wire_callbacks(
                 .get_secondary_notification_secret_entry()
                 .trim()
                 .to_owned();
-            if !secondary_secret.is_empty() {
-                secondary_notification::save_secret(
-                    &settings_data_root,
-                    secondary_provider,
-                    &secondary_secret,
-                )?;
-            }
             settings.secondary_notification_provider = secondary_provider;
             settings.secondary_notification_enabled = ui.get_secondary_notification_enabled()
                 && secondary_provider != SecondaryNotificationProvider::Disabled;
-            if settings.secondary_notification_enabled
-                && !secondary_notification::configured(&settings_data_root, &settings)
-            {
-                anyhow::bail!("启用第二通知通道前必须保存与当前服务商匹配的有效凭据");
-            }
             if settings.notification_tests_started() {
                 settings.notification_self_test_completed = settings.notification_tests_complete();
                 settings.onboarding_completed = settings.notification_self_test_completed;
@@ -869,11 +910,11 @@ fn wire_callbacks(
             }
             settings.normal_sync_minutes = normal_sync_minutes;
             settings.active_day_sync_minutes = active_day_sync_minutes;
-            settings_runtime.save_settings(&settings)?;
-            windows_integration::set_auto_start(
-                settings.auto_start_enabled,
-                &env::current_exe()?,
+            save_settings_with_rollback(
+                &settings_runtime,
                 &settings_data_root,
+                &settings,
+                (!secondary_secret.is_empty()).then_some(secondary_secret.as_str()),
             )?;
             settings_runtime.request_sync("设置变更");
             Ok(())
@@ -883,17 +924,18 @@ fn wire_callbacks(
             Ok(()) => "设置已保存，提醒计划已重算".into(),
             Err(error) => format!("保存设置失败：{error:#}").into(),
         });
-        let saved_settings = settings_runtime.settings().unwrap_or_default();
-        apply_settings(&ui, &saved_settings);
-        if saved {
-            ui.set_secondary_notification_secret_entry("".into());
+        if let Ok(saved_settings) = settings_runtime.settings() {
+            apply_settings(&ui, &saved_settings);
+            if saved {
+                ui.set_secondary_notification_secret_entry("".into());
+            }
+            refresh_secondary_notification_ui(
+                &ui,
+                &settings_data_root,
+                &saved_settings,
+                &settings_runtime,
+            );
         }
-        refresh_secondary_notification_ui(
-            &ui,
-            &settings_data_root,
-            &saved_settings,
-            &settings_runtime,
-        );
         refresh_ui(&ui, &settings_runtime);
     });
 
@@ -1105,10 +1147,13 @@ fn wire_callbacks(
                 if let Err(error) = windows_integration::show_windows_toast(
                     "A 股打新提醒 · Windows Toast 测试",
                     "这是原生 Windows Toast 测试消息；若系统通知被关闭，正式提醒会自动回退到托盘气泡。",
+                    None,
                 ) {
                     let save_result =
                         record_notification_test_result(&test_runtime, channel, false);
-                    apply_settings(&ui, &test_runtime.settings().unwrap_or_default());
+                    if let Ok(settings) = test_runtime.settings() {
+                        apply_settings(&ui, &settings);
+                    }
                     ui.set_status_text(match save_result {
                         Ok(()) => format!(
                             "Windows Toast 未能提交：{error:#}；可继续测试托盘气泡回退"
@@ -1164,7 +1209,9 @@ fn wire_callbacks(
         let Some(ui) = weak.upgrade() else { return };
         let result = record_notification_test_result(&complete_runtime, channel, passed);
         if result.is_ok() {
-            apply_settings(&ui, &complete_runtime.settings().unwrap_or_default());
+            if let Ok(settings) = complete_runtime.settings() {
+                apply_settings(&ui, &settings);
+            }
         } else if let Err(error) = result {
             ui.set_notification_test_status(format!("保存测试结果失败：{error:#}").into());
         }
@@ -1172,19 +1219,30 @@ fn wire_callbacks(
 
     let check_window = ui.as_weak();
     let check_state = Arc::clone(&available_update);
+    let check_busy = Arc::clone(&update_check_busy);
     ui.on_check_for_updates(move || {
         if let Some(ui) = check_window.upgrade() {
             ui.set_update_status("正在下载并验证签名更新清单…".into());
             ui.set_update_available(false);
         }
-        start_update_check(check_window.clone(), Arc::clone(&check_state), false);
+        start_update_check(
+            check_window.clone(),
+            Arc::clone(&check_state),
+            Arc::clone(&check_busy),
+            false,
+        );
     });
 
     let install_window = ui.as_weak();
     let install_state = Arc::clone(&available_update);
+    let install_busy = Arc::clone(&update_install_busy);
     let update_root = data_root.clone();
     ui.on_install_update(move || {
         let Some(ui) = install_window.upgrade() else {
+            return;
+        };
+        let Some(gate) = OperationGate::acquire(Arc::clone(&install_busy)) else {
+            ui.set_update_status("已有更新安装任务正在运行".into());
             return;
         };
         let update = install_state
@@ -1192,6 +1250,7 @@ fn wire_callbacks(
             .ok()
             .and_then(|value| value.as_ref().cloned());
         let Some(update) = update else {
+            drop(gate);
             ui.set_update_status("没有可安装且已验证的更新".into());
             return;
         };
@@ -1200,6 +1259,7 @@ fn wire_callbacks(
         let data_root = update_root.clone();
         std::thread::spawn(move || {
             let result = updater::download_and_request_install(&data_root, &update);
+            drop(gate);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = result_window.upgrade() {
                     match result {
@@ -1249,7 +1309,17 @@ fn wire_callbacks(
     let secondary_test_runtime = runtime.clone();
     let secondary_test_busy = Arc::clone(&secondary_notification_busy);
     ui.on_test_secondary_notification(move || {
-        let settings = secondary_test_runtime.settings().unwrap_or_default();
+        let settings = match secondary_test_runtime.settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                if let Some(ui) = secondary_test_window.upgrade() {
+                    ui.set_secondary_notification_status(
+                        format!("无法读取第二通知通道设置：{error:#}").into(),
+                    );
+                }
+                return;
+            }
+        };
         if let Some(ui) = secondary_test_window.upgrade() {
             ui.set_secondary_notification_status("正在发送用户主动测试消息…".into());
         }
@@ -1270,20 +1340,21 @@ fn wire_callbacks(
             return;
         };
         let result = (|| -> Result<()> {
-            secondary_notification::clear_secret(&secondary_clear_root)?;
-            let mut settings = secondary_clear_runtime.settings().unwrap_or_default();
-            settings.secondary_notification_enabled = false;
-            secondary_clear_runtime.save_settings(&settings)?;
+            clear_secondary_notification_with_rollback(
+                &secondary_clear_runtime,
+                &secondary_clear_root,
+            )?;
             Ok(())
         })();
-        let settings = secondary_clear_runtime.settings().unwrap_or_default();
-        apply_settings(&ui, &settings);
-        refresh_secondary_notification_ui(
-            &ui,
-            &secondary_clear_root,
-            &settings,
-            &secondary_clear_runtime,
-        );
+        if let Ok(settings) = secondary_clear_runtime.settings() {
+            apply_settings(&ui, &settings);
+            refresh_secondary_notification_ui(
+                &ui,
+                &secondary_clear_root,
+                &settings,
+                &secondary_clear_runtime,
+            );
+        }
         ui.set_status_text(match result {
             Ok(()) => "第二通知通道凭据已清除并停止发送".into(),
             Err(error) => format!("清除第二通知通道凭据失败：{error:#}").into(),
@@ -1319,13 +1390,116 @@ fn wire_callbacks(
     });
 }
 
+fn save_settings_with_rollback(
+    runtime: &RuntimeHandle,
+    data_root: &std::path::Path,
+    settings: &AppSettings,
+    secondary_secret: Option<&str>,
+) -> Result<()> {
+    let previous = runtime.settings()?;
+    let secret_snapshot = secondary_notification::snapshot_secret(data_root)?;
+    let executable = env::current_exe()?;
+    let auto_start_snapshot = windows_integration::auto_start_registered(data_root)?;
+
+    if let Some(secret) = secondary_secret {
+        secondary_notification::save_secret(
+            data_root,
+            settings.secondary_notification_provider,
+            secret,
+        )?;
+    }
+    if settings.secondary_notification_enabled
+        && !secondary_notification::configured(data_root, settings)
+    {
+        let error = anyhow::anyhow!("启用第二通知通道前必须保存与当前服务商匹配的有效凭据");
+        return Err(with_rollback_errors(
+            error,
+            [secondary_notification::restore_secret(
+                data_root,
+                &secret_snapshot,
+            )],
+        ));
+    }
+
+    if let Err(error) = runtime.save_settings(settings) {
+        return Err(with_rollback_errors(
+            error.context("无法提交应用设置和提醒计划"),
+            [secondary_notification::restore_secret(
+                data_root,
+                &secret_snapshot,
+            )],
+        ));
+    }
+
+    if let Err(error) =
+        windows_integration::set_auto_start(settings.auto_start_enabled, &executable, data_root)
+    {
+        return Err(with_rollback_errors(
+            error.context("无法提交开机自启动设置"),
+            [
+                runtime.save_settings(&previous),
+                secondary_notification::restore_secret(data_root, &secret_snapshot),
+                windows_integration::set_auto_start(auto_start_snapshot, &executable, data_root),
+            ],
+        ));
+    }
+    Ok(())
+}
+
+fn clear_secondary_notification_with_rollback(
+    runtime: &RuntimeHandle,
+    data_root: &std::path::Path,
+) -> Result<()> {
+    let previous = runtime.settings()?;
+    let secret_snapshot = secondary_notification::snapshot_secret(data_root)?;
+    let mut disabled = previous.clone();
+    disabled.secondary_notification_enabled = false;
+    runtime
+        .save_settings(&disabled)
+        .context("无法停止第二通知通道")?;
+    if let Err(error) = secondary_notification::clear_secret(data_root) {
+        return Err(with_rollback_errors(
+            error,
+            [
+                runtime.save_settings(&previous),
+                secondary_notification::restore_secret(data_root, &secret_snapshot),
+            ],
+        ));
+    }
+    Ok(())
+}
+
+fn with_rollback_errors<const N: usize>(
+    primary: anyhow::Error,
+    rollbacks: [Result<()>; N],
+) -> anyhow::Error {
+    let failures = rollbacks
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        primary
+    } else {
+        anyhow::anyhow!("{primary:#}；回滚未完全成功：{}", failures.join("；"))
+    }
+}
+
 fn start_update_check(
     window: slint::Weak<MainWindow>,
     state: Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    busy: Arc<AtomicBool>,
     automatic: bool,
 ) {
+    let Some(gate) = OperationGate::acquire(busy) else {
+        if !automatic && let Some(ui) = window.upgrade() {
+            ui.set_update_status("已有更新检查正在运行".into());
+        }
+        return;
+    };
     std::thread::spawn(move || {
         let result = updater::check_for_update();
+        drop(gate);
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = window.upgrade() else { return };
             match result {
@@ -1362,6 +1536,22 @@ fn start_update_check(
             }
         });
     });
+}
+
+struct OperationGate(Arc<AtomicBool>);
+
+impl OperationGate {
+    fn acquire(flag: Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for OperationGate {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 fn start_crash_upload(
@@ -1483,7 +1673,7 @@ fn record_notification_test_result(
     channel: i32,
     passed: bool,
 ) -> Result<()> {
-    let mut settings = runtime.settings().unwrap_or_default();
+    let mut settings = runtime.settings()?;
     match channel {
         0 => settings.notification_window_test_passed = Some(passed),
         1 => settings.notification_toast_test_passed = Some(passed),
@@ -1796,7 +1986,13 @@ fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
         return;
     }
 
-    let settings = runtime.settings().unwrap_or_default();
+    let settings = match runtime.settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            ui.set_status_text(format!("读取应用设置失败：{error:#}").into());
+            return;
+        }
+    };
     let today = runtime.today_events().unwrap_or_default();
     let future = runtime.future_events().unwrap_or_default();
     let filter_text = ui.get_task_filter_text().to_string();
@@ -2018,7 +2214,13 @@ fn show_event_details(ui: &MainWindow, runtime: &RuntimeHandle, event_id: &str) 
             let overrides = runtime
                 .manual_overrides(event_id, event.event_version)
                 .unwrap_or_default();
-            let settings = runtime.settings().unwrap_or_default();
+            let settings = match runtime.settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    ui.set_status_text(format!("读取应用设置失败：{error:#}").into());
+                    return;
+                }
+            };
             ui.set_selected_event_id(event.id.clone().into());
             ui.set_selected_event_version(event.event_version);
             ui.set_selected_title(format!("{} · {}", event.name, event.display_code()).into());
@@ -2698,6 +2900,56 @@ mod tests {
             .count();
         assert_eq!(shanghai, 667);
     }
+
+    #[test]
+    fn final_reminder_wins_over_data_changed_for_the_same_event() {
+        let event = filter_event(Exchange::Shanghai, LifecycleStatus::ActiveUnconfirmed);
+        let now = crate::core::now_china();
+        let deliveries = vec![
+            ReminderDelivery {
+                outbox_id: 1,
+                event: event.clone(),
+                due_at: now,
+                level: ReminderLevel::Final,
+                dedupe_key: "final".into(),
+                attempt_count: 1,
+                message: None,
+            },
+            ReminderDelivery {
+                outbox_id: 2,
+                event,
+                due_at: now,
+                level: ReminderLevel::DataChanged,
+                dedupe_key: "changed".into(),
+                attempt_count: 1,
+                message: Some("发行信息变化".into()),
+            },
+        ];
+        let batch = reminder_batch(&deliveries, None);
+        assert!(
+            reminder_display_priority(ReminderLevel::Final)
+                > reminder_display_priority(ReminderLevel::DataChanged)
+        );
+        assert!(
+            batch
+                .body
+                .contains(reminder_level_text(ReminderLevel::Final))
+        );
+        assert!(
+            !batch
+                .body
+                .contains(reminder_level_text(ReminderLevel::DataChanged))
+        );
+    }
+
+    #[test]
+    fn operation_gate_allows_only_one_owner_and_releases_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = OperationGate::acquire(Arc::clone(&flag)).unwrap();
+        assert!(OperationGate::acquire(Arc::clone(&flag)).is_none());
+        drop(first);
+        assert!(OperationGate::acquire(flag).is_some());
+    }
 }
 
 struct RuntimeOptions {
@@ -2882,22 +3134,31 @@ mod native_tray {
             let notification_window = window.clone();
             let settings_window = window.clone();
             let exit_window = window;
+            let show_runtime = runtime.clone();
+            let activation_runtime = runtime.clone();
+            let today_runtime = runtime.clone();
+            let future_runtime = runtime.clone();
+            let settings_runtime = runtime.clone();
             let sync_runtime = runtime.clone();
             let notification_runtime = runtime.clone();
             let recovery_runtime = runtime;
             let _ = CALLBACKS.set(Callbacks {
                 show: Box::new(move || {
                     let weak = show_window.clone();
+                    let runtime = show_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             super::show_and_repaint(&window);
                         }
                     });
                 }),
                 activate: Box::new(move || {
                     let weak = activation_window.clone();
+                    let runtime = activation_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             super::show_and_repaint(&window);
                             let verify = window.as_weak();
                             Timer::single_shot(Duration::from_millis(150), move || {
@@ -2924,8 +3185,10 @@ mod native_tray {
                 }),
                 today: Box::new(move || {
                     let weak = today_window.clone();
+                    let runtime = today_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             window.set_active_page(0);
                             super::show_and_repaint(&window);
                         }
@@ -2933,8 +3196,10 @@ mod native_tray {
                 }),
                 future: Box::new(move || {
                     let weak = future_window.clone();
+                    let runtime = future_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             window.set_active_page(1);
                             super::show_and_repaint(&window);
                         }
@@ -2953,6 +3218,7 @@ mod native_tray {
                     let runtime = notification_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             super::show_and_repaint(&window);
                             if let Some(event_id) = event_id.filter(|value| !value.is_empty()) {
                                 super::show_event_details(&window, &runtime, &event_id);
@@ -2963,8 +3229,10 @@ mod native_tray {
                 sync: Box::new(move || sync_runtime.request_sync("托盘手动同步")),
                 settings: Box::new(move || {
                     let weak = settings_window.clone();
+                    let runtime = settings_runtime.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
+                            super::refresh_ui(&window, &runtime);
                             window.set_active_page(3);
                             super::show_and_repaint(&window);
                         }
@@ -2989,6 +3257,11 @@ mod native_tray {
                     recovery_runtime.recovery();
                 }),
             });
+            windows_integration::set_toast_activation_handler(Arc::new(|event_id| {
+                if let Some(callbacks) = CALLBACKS.get() {
+                    (callbacks.notification)(event_id);
+                }
+            }));
             let hwnd = Arc::new(AtomicIsize::new(0));
             let thread_hwnd = Arc::clone(&hwnd);
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -3011,7 +3284,7 @@ mod native_tray {
         }
 
         pub fn notify(&self, title: &str, body: &str, event_id: Option<&str>) {
-            match windows_integration::show_windows_toast(title, body) {
+            match windows_integration::show_windows_toast(title, body, event_id) {
                 Ok(()) => {
                     TOAST_FALLBACK_LOGGED.store(false, Ordering::Release);
                 }

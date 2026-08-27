@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use sha2::{Digest, Sha256};
@@ -64,7 +64,8 @@ pub fn detect_exchange(code: Option<&str>, market: Option<&str>, beijing: bool) 
         Exchange::Shanghai
     } else if code.is_none() {
         Exchange::Unknown
-    } else if code.is_some_and(|c| c.starts_with('8') || c.starts_with('9')) {
+    } else if code.is_some_and(|c| c.starts_with("43") || c.starts_with('8') || c.starts_with('9'))
+    {
         Exchange::Beijing
     } else {
         Exchange::Shenzhen
@@ -340,12 +341,25 @@ pub fn reconcile_candidates(
     let conflict = conflicts(&usable, |c| c.apply_code.clone())
         || conflicts(&usable, |c| c.apply_date.map(|d| d.to_string()))
         || conflicts(&usable, |c| c.issue_price.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.lot_size.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.max_apply_quantity.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.required_market_value.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.required_cash.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.ballot_date.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.payment_date.map(|v| v.to_string()))
+        || conflicts(&usable, |c| c.listing_date.map(|v| v.to_string()))
+        || conflicts(&usable, candidate_session_signature)
         || conflicts(&usable, |c| {
             (c.status != IssueStatus::Unknown).then(|| format!("{:?}", c.status))
         });
+    let distinct_sources = usable
+        .iter()
+        .map(|candidate| candidate.source.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let quality = if conflict {
         DataQualityStatus::DataConflict
-    } else if usable.len() > 1 {
+    } else if distinct_sources > 1 {
         DataQualityStatus::MultiSourceVerified
     } else {
         DataQualityStatus::SingleSource
@@ -433,6 +447,28 @@ fn conflicts(items: &[&Candidate], selector: impl Fn(&Candidate) -> Option<Strin
     values.sort();
     values.dedup();
     values.len() > 1
+}
+
+fn candidate_session_signature(candidate: &Candidate) -> Option<String> {
+    if candidate.sessions.is_empty() {
+        return None;
+    }
+    let mut sessions = candidate
+        .sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}|{}|{}|{:?}|{}",
+                session.session_number,
+                session.official_start,
+                session.official_end,
+                session.funding_mode,
+                session.allocation_time_sensitive
+            )
+        })
+        .collect::<Vec<_>>();
+    sessions.sort();
+    Some(sessions.join(";"))
 }
 
 pub fn event_hash(event: &IpoEvent) -> String {
@@ -803,5 +839,193 @@ mod tests {
             resolved.data_quality_status,
             DataQualityStatus::DataConflict
         );
+    }
+
+    #[test]
+    fn beijing_43_prefix_is_detected_without_the_optional_market_flag() {
+        assert_eq!(
+            detect_exchange(Some("430001"), None, false),
+            Exchange::Beijing
+        );
+    }
+
+    #[test]
+    fn repeated_rows_from_one_source_do_not_claim_multi_source_verification() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let now = at(date, time(8, 0));
+        let mut first = Candidate {
+            source: "same-source".into(),
+            priority: 100,
+            fetched_at: now,
+            published_at: None,
+            exchange: Exchange::Shanghai,
+            board: Board::Main,
+            security_code: Some("601001".into()),
+            apply_code: Some("780001".into()),
+            legacy_code: None,
+            name: Some("测试股份".into()),
+            apply_date: Some(date),
+            issue_price: Some(10.0),
+            lot_size: Some(500),
+            max_apply_quantity: Some(10_000),
+            required_market_value: Some(100_000.0),
+            required_cash: None,
+            ballot_date: None,
+            payment_date: None,
+            listing_date: None,
+            status: IssueStatus::Active,
+            announcement_url: None,
+            sessions: Vec::new(),
+        };
+        let mut duplicate = first.clone();
+        duplicate.priority = 90;
+        duplicate.fetched_at += chrono::Duration::seconds(1);
+        let resolved = reconcile_candidates(
+            &[first.clone(), duplicate],
+            None,
+            &AppSettings::default(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.data_quality_status,
+            DataQualityStatus::SingleSource
+        );
+
+        first.source = "other-source".into();
+        let verified = reconcile_candidates(
+            &[first, resolved_candidate_fixture(date, now)],
+            None,
+            &AppSettings::default(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.data_quality_status,
+            DataQualityStatus::MultiSourceVerified
+        );
+    }
+
+    fn resolved_candidate_fixture(date: NaiveDate, now: ChinaDateTime) -> Candidate {
+        Candidate {
+            source: "same-source".into(),
+            priority: 100,
+            fetched_at: now,
+            published_at: None,
+            exchange: Exchange::Shanghai,
+            board: Board::Main,
+            security_code: Some("601001".into()),
+            apply_code: Some("780001".into()),
+            legacy_code: None,
+            name: Some("测试股份".into()),
+            apply_date: Some(date),
+            issue_price: Some(10.0),
+            lot_size: Some(500),
+            max_apply_quantity: Some(10_000),
+            required_market_value: Some(100_000.0),
+            required_cash: None,
+            ballot_date: None,
+            payment_date: None,
+            listing_date: None,
+            status: IssueStatus::Active,
+            announcement_url: None,
+            sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn conflicts_cover_quantity_cash_dates_and_session_rules() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let now = at(date, time(8, 0));
+        let base = resolved_candidate_fixture(date, now);
+        let assert_conflict = |mut changed: Candidate| {
+            changed.source = "other-source".into();
+            let resolved =
+                reconcile_candidates(&[base.clone(), changed], None, &AppSettings::default(), now)
+                    .unwrap();
+            assert!(resolved.data_conflict);
+        };
+
+        let mut changed = base.clone();
+        changed.lot_size = Some(1_000);
+        assert_conflict(changed);
+        let mut changed = base.clone();
+        changed.max_apply_quantity = Some(20_000);
+        assert_conflict(changed);
+        let mut changed = base.clone();
+        changed.required_market_value = Some(200_000.0);
+        assert_conflict(changed);
+        let mut original_cash = base.clone();
+        original_cash.required_cash = Some(40_000.0);
+        let mut changed_cash = base.clone();
+        changed_cash.source = "other-source".into();
+        changed_cash.required_cash = Some(50_000.0);
+        assert!(
+            reconcile_candidates(
+                &[original_cash, changed_cash],
+                None,
+                &AppSettings::default(),
+                now,
+            )
+            .unwrap()
+            .data_conflict
+        );
+        let mut changed = base.clone();
+        changed.ballot_date = Some(date + Duration::days(1));
+        let mut original_with_date = base.clone();
+        original_with_date.ballot_date = Some(date + Duration::days(2));
+        original_with_date.source = "third-source".into();
+        let resolved = reconcile_candidates(
+            &[original_with_date, changed],
+            None,
+            &AppSettings::default(),
+            now,
+        )
+        .unwrap();
+        assert!(resolved.data_conflict);
+        let mut first_payment = base.clone();
+        first_payment.payment_date = Some(date + Duration::days(2));
+        let mut changed_payment = first_payment.clone();
+        changed_payment.source = "other-source".into();
+        changed_payment.payment_date = Some(date + Duration::days(3));
+        assert!(
+            reconcile_candidates(
+                &[first_payment, changed_payment],
+                None,
+                &AppSettings::default(),
+                now,
+            )
+            .unwrap()
+            .data_conflict
+        );
+        let mut first_listing = base.clone();
+        first_listing.listing_date = Some(date + Duration::days(7));
+        let mut changed_listing = first_listing.clone();
+        changed_listing.source = "other-source".into();
+        changed_listing.listing_date = Some(date + Duration::days(8));
+        assert!(
+            reconcile_candidates(
+                &[first_listing, changed_listing],
+                None,
+                &AppSettings::default(),
+                now,
+            )
+            .unwrap()
+            .data_conflict
+        );
+
+        let mut first_session = base.clone();
+        first_session.sessions = default_sessions(Exchange::Shanghai, &AppSettings::default());
+        let mut changed_session = first_session.clone();
+        changed_session.source = "other-source".into();
+        changed_session.sessions[0].official_start = time(9, 15);
+        let resolved = reconcile_candidates(
+            &[first_session, changed_session],
+            None,
+            &AppSettings::default(),
+            now,
+        )
+        .unwrap();
+        assert!(resolved.data_conflict);
     }
 }

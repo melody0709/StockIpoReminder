@@ -282,9 +282,17 @@ pub fn redact(value: &str) -> String {
         Regex::new(r"(?i)(authorization|cookie|set-cookie)\s*[:=]\s*[^\s,;]+(?:[;,][^\s]+)*")
             .unwrap();
     let query = Regex::new(r"(https://[^\s?]+)\?[^\s]+").unwrap();
-    let windows_path = Regex::new(r"(?i)[A-Z]:\\(?:[^\\\s]+\\)+[^\s]+").unwrap();
+    let data_root =
+        Regex::new(r#"(?i)(--data-root(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s]+)"#).unwrap();
+    let unc_path = Regex::new(
+        r#"(?i)(?:\\\\\?\\UNC\\|\\\\)[^\\/\s"'<>|]+[\\/][^\\/\s"'<>|]+(?:[\\/][^\s"'<>|]+)*"#,
+    )
+    .unwrap();
+    let windows_path = Regex::new(r#"(?i)\b[A-Z]:[\\/](?:[^\s"'<>|]+[\\/]?)*"#).unwrap();
     let value = authorization.replace_all(value, "$1:<redacted>");
     let value = query.replace_all(&value, "$1?<redacted>");
+    let value = data_root.replace_all(&value, "$1<local-path>");
+    let value = unc_path.replace_all(&value, "<local-path>");
     windows_path
         .replace_all(&value, "<local-path>")
         .into_owned()
@@ -308,7 +316,12 @@ pub fn create_diagnostic_bundle(data_root: &Path, database: &Database) -> Result
     let (health_state, health_text) = database
         .health_text()
         .unwrap_or((crate::model::HealthState::Unknown, "unavailable".into()));
-    let settings = database.settings().unwrap_or_default();
+    let settings_result = database.settings();
+    let settings_error = settings_result
+        .as_ref()
+        .err()
+        .map(|error| redact(&format!("{error:#}")));
+    let settings = settings_result.ok();
     let mut toast_diagnostics = crate::windows_integration::toast_diagnostics();
     toast_diagnostics.error = toast_diagnostics.error.as_deref().map(redact);
     toast_diagnostics.shortcut_error = toast_diagnostics.shortcut_error.as_deref().map(redact);
@@ -358,6 +371,7 @@ pub fn create_diagnostic_bundle(data_root: &Path, database: &Database) -> Result
         "todayEventCount": database.today_events().map(|events| events.len()).unwrap_or_default(),
         "pendingCount": database.pending_count().unwrap_or_default(),
         "settings": settings,
+        "settingsError": settings_error,
         "windowsToast": toast_diagnostics,
         "note": "诊断包不包含 SQLite 数据库、公告原文、Cookie、Authorization、第二通知通道凭据或绝对路径"
     });
@@ -401,11 +415,15 @@ mod tests {
     #[test]
     fn redacts_headers_queries_and_paths() {
         let value = redact(
-            "Authorization: Bearer-secret https://example.com/a?token=secret C:\\Users\\name\\file.txt",
+            "Authorization: Bearer-secret https://example.com/a?token=secret C:\\Users\\name\\file.txt C:/Users/name/data.db \\\\server\\share\\private\\report.txt --data-root=\"D:\\IPO Data\\account\" --data-root //server/share/profile",
         );
         assert!(!value.contains("Bearer-secret"));
         assert!(!value.contains("token=secret"));
         assert!(!value.contains("Users\\name"));
+        assert!(!value.contains("Users/name"));
+        assert!(!value.contains("server"));
+        assert!(!value.contains("IPO Data"));
+        assert!(value.matches("<local-path>").count() >= 5);
     }
 
     #[test]

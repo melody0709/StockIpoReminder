@@ -7,10 +7,10 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 
 use crate::{
@@ -36,6 +36,14 @@ const DAILY_MAINTENANCE_HOUR: u32 = 5;
 const DAILY_MAINTENANCE_MINUTE: u32 = 30;
 const MANAGED_BACKUP_LIMIT: usize = 7;
 const MANAGED_BACKUP_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const RUNTIME_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const RUNTIME_FAILURE_RESET_AFTER: Duration = Duration::from_secs(10 * 60);
+const RUNTIME_RESTART_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
 
 #[derive(Debug, Clone)]
 struct AutomaticSyncSchedule {
@@ -164,10 +172,16 @@ pub enum UiEvent {
 }
 
 enum RuntimeCommand {
-    Sync(String),
+    Sync(SyncRequest),
     Wake,
     Recovery,
     Stop,
+}
+
+#[derive(Debug, Clone)]
+struct SyncRequest {
+    reason: String,
+    allow_outside_window: bool,
 }
 
 type UiNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -210,9 +224,10 @@ pub struct RuntimeHandle {
 
 impl RuntimeHandle {
     pub fn request_sync(&self, reason: impl Into<String>) {
-        let _ = self
-            .command_sender
-            .send(RuntimeCommand::Sync(reason.into()));
+        let _ = self.command_sender.send(RuntimeCommand::Sync(SyncRequest {
+            reason: reason.into(),
+            allow_outside_window: true,
+        }));
     }
     pub fn wake(&self) {
         let _ = self.command_sender.send(RuntimeCommand::Wake);
@@ -266,8 +281,7 @@ impl RuntimeHandle {
     }
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         self.ensure_ready()?;
-        self.database.save_settings(settings)?;
-        self.database.replan_all()?;
+        self.database.save_settings_and_replan(settings)?;
         self.wake();
         Ok(())
     }
@@ -429,35 +443,98 @@ where
             if stop_requested.load(Ordering::Acquire) {
                 return;
             }
-            if let Err(error) = run_loop(
-                database,
-                data_root,
-                startup_sync,
-                command_receiver,
-                event_sender,
-                ui_state.clone(),
-            ) {
-                crate::operations::log("ERROR", &format!("后台运行时异常：{error:#}"));
-                update_snapshot(&ui_state, |value| {
-                    value.is_synchronizing = false;
-                    value.status_text = "后台运行时异常，继续使用本地数据".into();
-                    value.last_error = Some(format!("{error:#}"));
-                });
+            let mut initial_reason = startup_sync.then(|| SyncRequest {
+                reason: "程序启动".to_owned(),
+                allow_outside_window: false,
+            });
+            let mut first_attempt = true;
+            let mut failure_count = 0usize;
+            let mut last_failure = None::<Instant>;
+            loop {
+                if stop_requested.load(Ordering::Acquire) {
+                    return;
+                }
+                let suppress_overdue_initial_sync = first_attempt && !startup_sync;
+                first_attempt = false;
+                match run_loop(
+                    &database,
+                    &data_root,
+                    initial_reason.take(),
+                    suppress_overdue_initial_sync,
+                    &command_receiver,
+                    &event_sender,
+                    &ui_state,
+                    &stop_requested,
+                ) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        let failure_now = Instant::now();
+                        if last_failure.is_none_or(|previous| {
+                            failure_now.duration_since(previous) > RUNTIME_FAILURE_RESET_AFTER
+                        }) {
+                            failure_count = 0;
+                        }
+                        last_failure = Some(failure_now);
+                        failure_count = failure_count.saturating_add(1);
+                        let delay = RUNTIME_RESTART_DELAYS[failure_count
+                            .saturating_sub(1)
+                            .min(RUNTIME_RESTART_DELAYS.len() - 1)];
+                        let message = format!("{error:#}");
+                        crate::operations::log(
+                            "ERROR",
+                            &format!(
+                                "后台运行时异常，将在 {} 秒后重启本地服务：{message}",
+                                delay.as_secs()
+                            ),
+                        );
+                        if let Err(health_error) = database.save_operation_health(
+                            "runtime",
+                            HealthState::Failed,
+                            Some(&message),
+                        ) {
+                            crate::operations::log(
+                                "WARN",
+                                &format!("后台运行时失败状态写入失败：{health_error:#}"),
+                            );
+                        }
+                        update_snapshot(&ui_state, |value| {
+                            value.is_synchronizing = false;
+                            value.health_state = HealthState::Failed;
+                            value.status_text = format!(
+                                "后台服务异常，{} 秒后自动恢复；本地数据仍可查看",
+                                delay.as_secs()
+                            );
+                            value.health_text = "提醒与同步服务正在自动恢复".into();
+                            value.last_error = Some(message.clone());
+                        });
+                        match command_receiver.recv_timeout(delay) {
+                            Ok(RuntimeCommand::Sync(request)) => initial_reason = Some(request),
+                            Ok(RuntimeCommand::Wake) | Ok(RuntimeCommand::Recovery) => {}
+                            Ok(RuntimeCommand::Stop)
+                            | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                }
             }
         })?;
     Ok((handle, thread))
 }
 
 fn run_loop(
-    database: Database,
-    data_root: PathBuf,
-    startup_sync: bool,
-    commands: mpsc::Receiver<RuntimeCommand>,
-    events: mpsc::Sender<UiEvent>,
-    ui_state: RuntimeUiState,
+    database: &Database,
+    data_root: &Path,
+    initial_reason: Option<SyncRequest>,
+    suppress_overdue_initial_sync: bool,
+    commands: &mpsc::Receiver<RuntimeCommand>,
+    events: &mpsc::Sender<UiEvent>,
+    ui_state: &RuntimeUiState,
+    stop_requested: &AtomicBool,
 ) -> Result<()> {
     let client = network::client()?;
-    let mut requested_reason = startup_sync.then(|| "程序启动".to_owned());
+    let time_client = network::time_client()?;
+    database.save_operation_health("runtime", HealthState::Healthy, None)?;
+    let mut requested_reason = initial_reason;
     let mut forced_sync_retry = None::<ChinaDateTime>;
     let mut last_health_date = database
         .health_summary_sent_on(now_china().date_naive())
@@ -467,12 +544,18 @@ fn run_loop(
     let mut last_maintenance_date = None::<NaiveDate>;
     let initial_now = now_china();
     let initial_schedule = automatic_sync_schedule(&database, initial_now);
-    let mut automatic_sync_not_before = (!startup_sync && initial_schedule.due_at <= initial_now)
+    let mut automatic_sync_not_before = (suppress_overdue_initial_sync
+        && initial_schedule.due_at <= initial_now)
         .then(|| next_workday_at(initial_now.date_naive(), DAILY_DISCOVERY_HOUR));
     let mut refresh_requested = true;
 
     loop {
+        if stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let now = now_china();
+        database.touch_heartbeat("scheduler", now)?;
+        database.touch_heartbeat("delivery", now)?;
         let lifecycle_due = database.next_lifecycle_transition_at(now)?;
         if lifecycle_due.is_some_and(|due_at| due_at <= now) {
             if database.refresh_lifecycle()? {
@@ -485,12 +568,12 @@ fn run_loop(
         if local_delivery_due.is_some_and(|due_at| due_at <= now)
             || secondary_delivery_due.is_some_and(|due_at| due_at <= now)
         {
-            if run_delivery_cycle(&database, &events, &ui_state, &data_root)? {
+            if run_delivery_cycle(database, events, ui_state, data_root)? {
                 refresh_requested = true;
             }
         }
 
-        let settings = database.settings().unwrap_or_default();
+        let settings = database.settings()?;
         let mut sync_schedule = automatic_sync_schedule(&database, now);
         apply_sync_not_before(&mut sync_schedule, automatic_sync_not_before);
         if let Some(retry_at) = forced_sync_retry {
@@ -499,12 +582,18 @@ fn run_loop(
                 reason: "上次同步异常后的必要重试".into(),
             };
         }
-        if requested_reason.is_some() || sync_schedule.due_at <= now {
-            let reason = requested_reason
-                .take()
-                .unwrap_or_else(|| sync_schedule.reason.clone());
-            match synchronize(&database, &client, &ui_state, &reason) {
+        let requested_due = requested_reason
+            .as_ref()
+            .is_some_and(|request| request.allow_outside_window || in_sync_window(now));
+        if requested_due || sync_schedule.due_at <= now {
+            let reason = if requested_due {
+                requested_reason.take().unwrap().reason
+            } else {
+                sync_schedule.reason.clone()
+            };
+            match synchronize(database, &client, ui_state, &reason, stop_requested) {
                 Ok(()) => forced_sync_retry = None,
+                Err(_) if stop_requested.load(Ordering::Acquire) => return Ok(()),
                 Err(error) => {
                     let message = format!("{error:#}");
                     operations::log("ERROR", &format!("同步失败（{reason}）：{message}"));
@@ -519,23 +608,29 @@ fn run_loop(
                         .normal_sync_minutes
                         .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES)
                         as i64;
-                    forced_sync_retry =
-                        Some(now_china() + chrono::Duration::minutes(retry_minutes));
+                    forced_sync_retry = Some(normalize_sync_window(
+                        now_china() + chrono::Duration::minutes(retry_minutes),
+                        true,
+                    ));
                 }
             }
             automatic_sync_not_before = None;
-            let (clock_state, clock_text) = check_clock(&client, "同步后的时间校验");
-            update_snapshot(&ui_state, |value| {
+            if stop_requested.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let (clock_state, clock_text) =
+                check_clock(&time_client, "同步后的时间校验", Some(stop_requested));
+            update_snapshot(ui_state, |value| {
                 value.clock_state = clock_state;
                 value.clock_text = clock_text;
             });
-            refresh_snapshot(&database, &ui_state);
+            refresh_snapshot(database, ui_state);
             #[cfg(windows)]
             crate::windows_integration::trim_working_set();
         }
 
         let summary_now = now_china();
-        let summary_settings = database.settings().unwrap_or_default();
+        let summary_settings = database.settings()?;
         let visible_snapshot = ui_state
             .snapshot
             .read()
@@ -548,31 +643,29 @@ fn run_loop(
             summary_now,
         );
         if health_due.is_some_and(|due_at| due_at <= summary_now) {
-            last_health_date = Some(summary_now.date_naive());
-            if let Ok(details) = database.health_details() {
-                let should_send = details.today_task_count > 0
-                    || matches!(
-                        details.overall_state,
-                        HealthState::Warning | HealthState::Failed
-                    );
-                if should_send
-                    && database
-                        .try_mark_health_summary_sent(summary_now.date_naive(), summary_now)?
-                    && let Ok((state, text)) = database.health_text()
-                {
-                    send_ui_event(&events, &ui_state, UiEvent::Health { state, text })?;
-                }
+            let details = database.health_details()?;
+            let should_send = details.today_task_count > 0
+                || matches!(
+                    details.overall_state,
+                    HealthState::Warning | HealthState::Failed
+                );
+            if should_send {
+                let (state, text) = database.health_text()?;
+                send_ui_event(events, ui_state, UiEvent::Health { state, text })?;
+                let date = summary_now.date_naive();
+                let _ = database.try_mark_health_summary_sent(date, summary_now)?;
+                last_health_date = Some(date);
             }
         }
 
         let maintenance_now = now_china();
         if next_maintenance_at(maintenance_now, last_maintenance_date) <= maintenance_now {
-            run_daily_maintenance(&database, &data_root);
+            run_daily_maintenance(database, data_root);
             last_maintenance_date = Some(maintenance_now.date_naive());
         }
 
         if refresh_requested {
-            refresh_snapshot(&database, &ui_state);
+            refresh_snapshot(database, ui_state);
             refresh_requested = false;
         }
 
@@ -585,13 +678,19 @@ fn run_loop(
                 reason: "上次同步异常后的必要重试".into(),
             };
         }
-        let settings = database.settings().unwrap_or_default();
+        let settings = database.settings()?;
         let visible_snapshot = ui_state
             .snapshot
             .read()
             .map(|value| value.clone())
             .unwrap_or_default();
         let mut deadline = WakeDeadline::new(next_sync.due_at, next_sync.reason);
+        if let Some(request) = requested_reason.as_ref()
+            && !request.allow_outside_window
+            && !in_sync_window(now)
+        {
+            deadline.consider(Some(next_sync_window_start(now)), "等待自动同步窗口");
+        }
         deadline.consider(database.next_local_delivery_at()?, "本地提醒到期");
         deadline.consider(
             database.next_secondary_delivery_at(now)?,
@@ -609,20 +708,20 @@ fn run_loop(
             Some(next_maintenance_at(now, last_maintenance_date)),
             "工作日数据库维护",
         );
-        update_snapshot(&ui_state, |value| {
+        update_snapshot(ui_state, |value| {
             value.next_wake_text = format!(
                 "后台正常休眠 · 下一次唤醒 {}（{}）",
                 deadline.at.format("%Y-%m-%d %H:%M:%S"),
                 deadline.reason
             );
         });
-        let wait = duration_until(deadline.at, now);
+        let wait = duration_until(deadline.at, now).min(RUNTIME_HEARTBEAT_INTERVAL);
         match commands.recv_timeout(wait) {
-            Ok(RuntimeCommand::Sync(reason)) => {
-                requested_reason = Some(reason);
+            Ok(RuntimeCommand::Sync(request)) => {
+                requested_reason = Some(request);
                 while let Ok(command) = commands.try_recv() {
                     match command {
-                        RuntimeCommand::Sync(reason) => requested_reason = Some(reason),
+                        RuntimeCommand::Sync(request) => requested_reason = Some(request),
                         RuntimeCommand::Wake | RuntimeCommand::Recovery => refresh_requested = true,
                         RuntimeCommand::Stop => return Ok(()),
                     }
@@ -832,7 +931,7 @@ fn consider_fixed_sync(
         return;
     }
     let (due_at, reason) = if anchor <= now {
-        (now, format!("补做{reason}"))
+        (normalize_sync_window(now, true), format!("补做{reason}"))
     } else {
         (anchor, reason.to_owned())
     };
@@ -860,6 +959,14 @@ fn normalize_sync_window(value: ChinaDateTime, allow_weekend: bool) -> ChinaDate
         normalized = next_workday_at(normalized.date_naive(), SYNC_WINDOW_START_HOUR);
     }
     normalized
+}
+
+fn in_sync_window(value: ChinaDateTime) -> bool {
+    value.hour() >= SYNC_WINDOW_START_HOUR && value.hour() < SYNC_WINDOW_END_HOUR
+}
+
+fn next_sync_window_start(value: ChinaDateTime) -> ChinaDateTime {
+    normalize_sync_window(value, true)
 }
 
 fn sync_jitter_seconds(identity: &str, now: ChinaDateTime, active_day: bool) -> i64 {
@@ -969,7 +1076,9 @@ fn synchronize(
     client: &reqwest::blocking::Client,
     ui_state: &RuntimeUiState,
     reason: &str,
+    stop_requested: &AtomicBool,
 ) -> Result<()> {
+    ensure_not_stopping(stop_requested)?;
     update_snapshot(ui_state, |value| {
         value.is_synchronizing = true;
         value.status_text = format!("正在同步：{reason}");
@@ -980,7 +1089,7 @@ fn synchronize(
     let mut candidates = Vec::<Candidate>::new();
     let collectors: [(
         &str,
-        fn(&reqwest::blocking::Client) -> Result<CollectorOutput>,
+        fn(&reqwest::blocking::Client, &dyn Fn() -> bool) -> Result<CollectorOutput>,
     ); 4] = [
         ("eastmoney", network::collect_eastmoney),
         ("sse", network::collect_sse),
@@ -990,13 +1099,17 @@ fn synchronize(
     let mut successful_sources = 0usize;
     let mut failed_sources = 0usize;
     let mut successful_source_names = HashSet::<&'static str>::new();
+    let cancelled = || stop_requested.load(Ordering::Acquire);
     for (source, collect) in collectors {
+        ensure_not_stopping(stop_requested)?;
         let now = now_china();
         if !database.source_can_attempt(source, now)?.0 {
-            probe_backed_off_source(database, client, source, now)?;
+            probe_backed_off_source(database, client, source, now, stop_requested)?;
             continue;
         }
-        match collect(client) {
+        let collected = collect(client, &cancelled);
+        ensure_not_stopping(stop_requested)?;
+        match collected {
             Ok(output) => {
                 let record_count = output.candidates.len();
                 let audit_state = output.audit.state();
@@ -1117,6 +1230,7 @@ fn synchronize(
     let mut announcement_attempts = HashMap::<&'static str, bool>::new();
     let mut announcement_runs = HashMap::<&'static str, AnnouncementRunStats>::new();
     for group in groups {
+        ensure_not_stopping(stop_requested)?;
         let identity = group.first().and_then(Candidate::stable_identity);
         let existing = identity
             .as_deref()
@@ -1141,7 +1255,7 @@ fn synchronize(
             } else {
                 let can_attempt = database.source_can_attempt(provider, now)?.0;
                 if !can_attempt {
-                    probe_backed_off_source(database, client, provider, now)?;
+                    probe_backed_off_source(database, client, provider, now, stop_requested)?;
                 }
                 announcement_attempts.insert(provider, can_attempt);
                 can_attempt
@@ -1155,7 +1269,9 @@ fn synchronize(
                     provisional.apply_date.unwrap_or(now.date_naive()) - chrono::Duration::days(14);
                 let to =
                     provisional.apply_date.unwrap_or(now.date_naive()) + chrono::Duration::days(7);
-                match announcement::search(client, &provisional, from, to) {
+                let search = announcement::search(client, &provisional, from, to, &cancelled);
+                ensure_not_stopping(stop_requested)?;
+                match search {
                     Ok(output) => {
                         stats.successful_searches += 1;
                         stats.references_found += output.references.len();
@@ -1172,7 +1288,7 @@ fn synchronize(
                                 ),
                             );
                         }
-                        for reference in output.references.into_iter().take(5) {
+                        for reference in output.references {
                             documents
                                 .push(announcement::metadata_document(&provisional, reference));
                             stats.metadata_records += 1;
@@ -1209,6 +1325,7 @@ fn synchronize(
         "cninfo-announcement",
         "bse-announcement",
     ] {
+        ensure_not_stopping(stop_requested)?;
         let Some(stats) = announcement_runs.remove(provider) else {
             continue;
         };
@@ -1276,6 +1393,13 @@ fn synchronize(
     Ok(())
 }
 
+fn ensure_not_stopping(stop_requested: &AtomicBool) -> Result<()> {
+    if stop_requested.load(Ordering::Acquire) {
+        bail!("同步已取消")
+    }
+    Ok(())
+}
+
 fn missing_required_sources(
     settings: &AppSettings,
     successful_sources: &HashSet<&'static str>,
@@ -1301,12 +1425,16 @@ fn probe_backed_off_source(
     client: &reqwest::blocking::Client,
     source: &str,
     now: ChinaDateTime,
+    stop_requested: &AtomicBool,
 ) -> Result<()> {
+    ensure_not_stopping(stop_requested)?;
     if !database.try_claim_source_probe(source, now)? {
         return Ok(());
     }
     let started_at = now_china();
-    match network::probe_source(client, source) {
+    let result = network::probe_source(client, source);
+    ensure_not_stopping(stop_requested)?;
+    match result {
         Ok(()) => {
             database.save_source_probe_run(source, started_at, true, None)?;
             operations::log(
@@ -1541,11 +1669,18 @@ fn run_daily_maintenance(database: &Database, data_root: &Path) {
     }
 }
 
-fn check_clock(client: &reqwest::blocking::Client, reason: &str) -> (HealthState, String) {
+fn check_clock(
+    client: &reqwest::blocking::Client,
+    reason: &str,
+    stop_requested: Option<&AtomicBool>,
+) -> (HealthState, String) {
     let windows_time = windows_integration::windows_time_service_running();
     let endpoints = ["https://www.microsoft.com/", "https://www.cloudflare.com/"];
     let mut offsets = Vec::new();
     for endpoint in endpoints {
+        if stop_requested.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            break;
+        }
         let start = Utc::now();
         let url = format!("{endpoint}?clock_probe={}", start.timestamp_millis());
         let response = client
@@ -1657,7 +1792,10 @@ fn refresh_snapshot(database: &Database, ui_state: &RuntimeUiState) {
         value.pending_count = pending;
         value.health_state = health.0;
         value.health_text = health.1;
-        if !value.is_synchronizing && value.status_text.starts_with("正在初始化") {
+        if !value.is_synchronizing
+            && (value.status_text == "正在后台准备本地数据库…"
+                || value.status_text.starts_with("本地数据已就绪"))
+        {
             value.status_text = "后台提醒服务已就绪".into();
         }
     });
@@ -1928,6 +2066,22 @@ mod tests {
         assert_eq!(
             normal_jitter,
             sync_jitter_seconds("fixture-a", before_evening_check, false)
+        );
+
+        let after_window = crate::core::at(date, crate::model::time(23, 30));
+        let schedule = automatic_sync_schedule_for(
+            &settings,
+            after_window,
+            true,
+            false,
+            false,
+            Some(&old_sync),
+            None,
+            "fixture-after-window",
+        );
+        assert_eq!(
+            schedule.due_at,
+            crate::core::at(date + chrono::Duration::days(1), crate::model::time(6, 0))
         );
     }
 
@@ -2280,6 +2434,14 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(runtime.snapshot().health_state, HealthState::Failed);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_signal_is_observed_by_sync_cancellation_boundaries() {
+        let stop = AtomicBool::new(false);
+        assert!(ensure_not_stopping(&stop).is_ok());
+        stop.store(true, Ordering::Release);
+        assert!(ensure_not_stopping(&stop).is_err());
     }
 
     #[test]

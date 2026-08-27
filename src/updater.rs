@@ -139,18 +139,9 @@ pub fn download_and_request_install(data_root: &Path, update: &AvailableUpdate) 
     let client = update_client()?;
     let directory = data_root.join("temp").join("updates");
     fs::create_dir_all(&directory).context("无法创建更新下载目录")?;
-    let installer = directory.join(format!(
-        "StockIpoReminder-{}-win-x64.msi",
-        update.manifest.version
-    ));
-    let partial = installer.with_extension("msi.part");
-    if partial.exists() {
-        let _ = fs::remove_file(&partial);
-    }
+    let (partial, installer) =
+        update_download_paths(&directory, &update.manifest.version, Uuid::new_v4());
     download_installer(&client, update, &partial)?;
-    if installer.exists() {
-        fs::remove_file(&installer).context("无法替换旧的更新安装包")?;
-    }
     fs::rename(&partial, &installer).context("无法提交已验证的更新安装包")?;
     verify_authenticode(&installer, TRUSTED_UPDATE_SIGNER_SHA256)?;
     dispatch_install_helper(data_root, &installer, &update.manifest.installer.sha256)?;
@@ -158,6 +149,22 @@ pub fn download_and_request_install(data_root: &Path, update: &AvailableUpdate) 
         "{} 已下载并通过签名校验；程序退出后将启动 Windows Installer",
         update.manifest.version
     ))
+}
+
+fn update_download_paths(
+    directory: &Path,
+    version: &str,
+    operation_id: Uuid,
+) -> (PathBuf, PathBuf) {
+    let operation_id = operation_id.simple();
+    (
+        directory.join(format!(
+            ".StockIpoReminder-{version}-win-x64-{operation_id}.msi.part"
+        )),
+        directory.join(format!(
+            "StockIpoReminder-{version}-win-x64-{operation_id}.msi"
+        )),
+    )
 }
 
 pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
@@ -714,10 +721,8 @@ fn current_windows_build() -> Result<u32> {
 
 #[cfg(windows)]
 fn wait_for_parent_exit(parent_pid: u32) -> Result<()> {
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }) else {
-        thread::sleep(Duration::from_millis(1500));
-        return Ok(());
-    };
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }
+        .context("无法打开主程序进程，已取消更新安装")?;
     let wait = unsafe { WaitForSingleObject(handle, 30_000) };
     unsafe {
         let _ = CloseHandle(handle);
@@ -796,6 +801,30 @@ mod tests {
         assert!(
             validate_installer_path(&root, &root.join("temp").join("..").join("malicious.msi"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn each_update_operation_uses_distinct_partial_and_committed_paths() {
+        let directory = PathBuf::from(r"C:\Data\temp\updates");
+        let first = update_download_paths(
+            &directory,
+            "0.3.1",
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        );
+        let second = update_download_paths(
+            &directory,
+            "0.3.1",
+            Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        );
+        assert_ne!(first, second);
+        assert_eq!(
+            first.0.extension().and_then(|value| value.to_str()),
+            Some("part")
+        );
+        assert_eq!(
+            first.1.extension().and_then(|value| value.to_str()),
+            Some("msi")
         );
     }
 }

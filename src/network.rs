@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
+    io::Read,
     time::Duration,
 };
 
@@ -9,6 +10,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::{
     blocking::{Client, ClientBuilder, Response},
     header::{RANGE, RETRY_AFTER},
+    redirect::Policy,
 };
 use serde_json::Value;
 
@@ -19,6 +21,10 @@ const IPO_WINDOW_FUTURE_DAYS: i64 = 60;
 const MAX_BOUNDED_PAGES: usize = 5;
 const EASTMONEY_PAGE_SIZE: usize = 100;
 const SSE_PAGE_SIZE: usize = 100;
+const MAX_DATA_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ANNOUNCEMENT_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 10;
+const MAX_RETRY_AFTER_SECONDS: i64 = 24 * 60 * 60;
 const EASTMONEY_COLUMNS: &str = "SECURITY_CODE,SECURITY_NAME,MARKET_TYPE_NEW,IS_BEIJING,APPLY_DATE,ISSUE_STATE,APPLY_CODE,ISSUE_PRICE,EACHBALLOT_SHARES,ONLINE_APPLY_UPPER,TOP_APPLY_MARKETCAP,BALLOT_NUM_DATE,BALLOT_PAY_DATE,LISTING_DATE";
 const BSE_COLUMNS: &str = "id,fxCode,stockCode,stockName,purchaseDate,issuePrice,issueResultDate,enterPremiumDate,suspendDate,terminationDate";
 
@@ -86,8 +92,26 @@ impl fmt::Display for HttpStatusError {
 impl std::error::Error for HttpStatusError {}
 
 pub fn client() -> Result<Client> {
+    build_client(business_redirect_allowed)
+}
+
+pub fn time_client() -> Result<Client> {
+    build_client(time_redirect_allowed)
+}
+
+fn build_client(redirect_allowed: fn(&url::Url) -> bool) -> Result<Client> {
     Ok(ClientBuilder::new()
         .timeout(Duration::from_secs(45))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("重定向次数超过上限")
+            } else if redirect_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("重定向目标不在 HTTPS 白名单内")
+            }
+        }))
         .cookie_store(true)
         .user_agent(concat!(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StockIpoReminder-Rust/",
@@ -161,7 +185,7 @@ fn sse_url(page: usize) -> Result<String> {
     Ok(url.into())
 }
 
-pub fn collect_eastmoney(client: &Client) -> Result<CollectorOutput> {
+pub fn collect_eastmoney(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<CollectorOutput> {
     let started = now_china();
     let mut page = 1usize;
     let mut total_pages = 1usize;
@@ -170,8 +194,10 @@ pub fn collect_eastmoney(client: &Client) -> Result<CollectorOutput> {
     let mut raws = Vec::new();
     let mut candidates = Vec::new();
     while page <= total_pages && page <= MAX_BOUNDED_PAGES {
+        ensure_not_cancelled(cancelled)?;
         let url = eastmoney_url(started.date_naive(), page)?;
         let raw = get_text(client, &url, None)?;
+        ensure_not_cancelled(cancelled)?;
         let (page_declared, page_details, pages) = eastmoney_page_counts(&raw)?;
         declared_count = declared_count.or(page_declared);
         detail_count += page_details;
@@ -189,7 +215,7 @@ pub fn collect_eastmoney(client: &Client) -> Result<CollectorOutput> {
         detail_count,
     ))
 }
-pub fn collect_sse(client: &Client) -> Result<CollectorOutput> {
+pub fn collect_sse(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<CollectorOutput> {
     let started = now_china();
     let mut page = 1usize;
     let mut total_pages = 1usize;
@@ -198,8 +224,10 @@ pub fn collect_sse(client: &Client) -> Result<CollectorOutput> {
     let mut raws = Vec::new();
     let mut candidates = Vec::new();
     while page <= total_pages && page <= MAX_BOUNDED_PAGES {
+        ensure_not_cancelled(cancelled)?;
         let url = sse_url(page)?;
         let raw = get_text(client, &url, Some("https://www.sse.com.cn/ipo/listing/"))?;
+        ensure_not_cancelled(cancelled)?;
         let (page_declared, page_details, pages) = sse_page_counts(&raw)?;
         declared_count = declared_count.or(page_declared);
         detail_count += page_details;
@@ -217,23 +245,27 @@ pub fn collect_sse(client: &Client) -> Result<CollectorOutput> {
         detail_count,
     ))
 }
-pub fn collect_cninfo(client: &Client) -> Result<CollectorOutput> {
+pub fn collect_cninfo(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<CollectorOutput> {
     let started = now_china();
     let url = "https://www.cninfo.com.cn/neweipo/index/ipoListQuery";
+    ensure_not_cancelled(cancelled)?;
     let raw = get_text(client, url, Some("https://www.cninfo.com.cn/new/index"))?;
+    ensure_not_cancelled(cancelled)?;
     let candidates = parse_cninfo(&raw, started)?;
     Ok(output("cninfo", started, raw, candidates))
 }
-pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
+pub fn collect_bse(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<CollectorOutput> {
     let started = now_china();
     let (from, to) = ipo_window(started.date_naive());
     let from = from.format("%Y-%m-%d").to_string();
     let to = to.format("%Y-%m-%d").to_string();
+    ensure_not_cancelled(cancelled)?;
     let _ = get_text(
         client,
         "https://www.bseinfo.net/newshare/listofissues.html",
         None,
     )?;
+    ensure_not_cancelled(cancelled)?;
     let mut page = 0;
     let mut total = 1;
     let mut raws = Vec::new();
@@ -241,6 +273,7 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
     let mut detail_count = 0usize;
     let mut declared_count = None;
     while page < total && page < MAX_BOUNDED_PAGES {
+        ensure_not_cancelled(cancelled)?;
         let page_number = page.to_string();
         let response = client
             .post("https://www.bseinfo.net/newShareController/infoResult.do?callback=ipoCb")
@@ -259,6 +292,7 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
                 ("needFields", BSE_COLUMNS),
             ])
             .send()?;
+        ensure_not_cancelled(cancelled)?;
         let raw = response_text(response, false)?;
         let parsed = parse_bse_page_with_meta(&raw, started)?;
         detail_count += parsed.detail_count;
@@ -277,6 +311,13 @@ pub fn collect_bse(client: &Client) -> Result<CollectorOutput> {
         declared_count,
         detail_count,
     ))
+}
+
+fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        bail!("同步已取消")
+    }
+    Ok(())
 }
 
 fn output(
@@ -692,8 +733,33 @@ pub fn retry_after_from_error(error: &anyhow::Error) -> Option<ChinaDateTime> {
         .and_then(|failure| failure.retry_after)
 }
 
-fn response_text(response: Response, announcement: bool) -> Result<String> {
-    Ok(checked_response(response, announcement)?.text()?)
+pub(crate) fn response_text(response: Response, announcement: bool) -> Result<String> {
+    let mut response = checked_response(response, announcement)?;
+    let limit = if announcement {
+        MAX_ANNOUNCEMENT_RESPONSE_BYTES
+    } else {
+        MAX_DATA_RESPONSE_BYTES
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        bail!("远端响应超过 {} MiB 大小上限", limit / 1024 / 1024);
+    }
+    let bytes = read_limited(&mut response, limit)?;
+    String::from_utf8(bytes).context("远端响应不是有效 UTF-8")
+}
+
+fn read_limited(reader: &mut impl Read, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .context("无法读取远端响应")?;
+    if bytes.len() as u64 > limit {
+        bail!("远端响应超过 {} MiB 大小上限", limit / 1024 / 1024);
+    }
+    Ok(bytes)
 }
 
 fn parse_retry_after(
@@ -702,11 +768,17 @@ fn parse_retry_after(
 ) -> Option<ChinaDateTime> {
     let value = value?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<i64>() {
-        return (seconds >= 0).then(|| now + chrono::Duration::seconds(seconds));
+        if !(0..=MAX_RETRY_AFTER_SECONDS).contains(&seconds) {
+            return None;
+        }
+        return chrono::Duration::try_seconds(seconds)
+            .and_then(|delay| now.checked_add_signed(delay));
     }
-    DateTime::parse_from_rfc2822(value)
+    let retry_at = DateTime::parse_from_rfc2822(value)
         .ok()
-        .map(|value| value.with_timezone(&china_offset()))
+        .map(|value| value.with_timezone(&china_offset()))?;
+    let maximum = now.checked_add_signed(chrono::Duration::seconds(MAX_RETRY_AFTER_SECONDS))?;
+    (retry_at >= now && retry_at <= maximum).then_some(retry_at)
 }
 pub fn ensure_allowed(value: &str, announcement: bool) -> Result<()> {
     let url = url::Url::parse(value)?;
@@ -733,9 +805,8 @@ const DATA_HOSTS: &[&str] = &[
     "disc.static.szse.cn",
     "www.bseinfo.net",
     "www.bse.cn",
-    "www.microsoft.com",
-    "www.cloudflare.com",
 ];
+const TIME_HOSTS: &[&str] = &["www.microsoft.com", "www.cloudflare.com"];
 const ANNOUNCEMENT_HOSTS: &[&str] = &[
     "query.sse.com.cn",
     "www.sse.com.cn",
@@ -748,6 +819,20 @@ const ANNOUNCEMENT_HOSTS: &[&str] = &[
     "www.bse.cn",
     "bse.cn",
 ];
+
+fn business_redirect_allowed(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| DATA_HOSTS.contains(&host) || ANNOUNCEMENT_HOSTS.contains(&host))
+}
+
+fn time_redirect_allowed(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| TIME_HOSTS.contains(&host))
+}
 
 pub fn text(item: &Value, key: &str) -> Option<String> {
     let value = item.get(key)?;
@@ -794,7 +879,11 @@ fn unwrap_jsonp(raw: &str) -> Result<&str> {
     }
     let start = trimmed.find('(').context("无效 JSONP")?;
     let end = trimmed.rfind(')').context("无效 JSONP")?;
-    Ok(&trimmed[start + 1..end])
+    let content_start = start + 1;
+    if end < content_start {
+        bail!("无效 JSONP：右括号位于左括号之前");
+    }
+    Ok(&trimmed[content_start..end])
 }
 
 fn parse_payload(raw: &str) -> Result<Value> {
@@ -993,6 +1082,40 @@ mod tests {
             parse_retry_after(Some(&HeaderValue::from_static("-1")), now),
             None
         );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("86401")), now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(
+                Some(&HeaderValue::from_static("Wed, 02 Sep 2026 04:05:00 GMT")),
+                now,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_jsonp_and_oversized_streams_return_errors_without_panicking() {
+        assert!(unwrap_jsonp(")(").is_err());
+        assert!(unwrap_jsonp("foo)bar(baz").is_err());
+
+        let mut exact = std::io::Cursor::new(b"1234".to_vec());
+        assert_eq!(read_limited(&mut exact, 4).unwrap(), b"1234");
+        let mut oversized = std::io::Cursor::new(b"12345".to_vec());
+        assert!(read_limited(&mut oversized, 4).is_err());
+    }
+
+    #[test]
+    fn time_probe_hosts_are_not_business_data_hosts() {
+        assert!(ensure_allowed("https://www.microsoft.com/", false).is_err());
+        assert!(ensure_allowed("https://www.cloudflare.com/", true).is_err());
+        assert!(!business_redirect_allowed(
+            &url::Url::parse("https://www.microsoft.com/").unwrap()
+        ));
+        assert!(time_redirect_allowed(
+            &url::Url::parse("https://www.microsoft.com/").unwrap()
+        ));
     }
 
     #[test]

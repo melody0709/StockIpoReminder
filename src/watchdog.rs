@@ -59,14 +59,32 @@ pub fn supervise(arguments: &[String], data_root: &Path) -> Result<()> {
             let restart_index = crashes.len().saturating_sub(1);
             let restart_scheduled = crashes.len() <= MAX_RESTARTS_IN_WINDOW;
             let delay = restart_scheduled.then(|| RESTART_DELAYS[restart_index]);
-            let report =
-                write_crash_report(data_root, &status, crashes.len(), restart_scheduled, delay)?;
+            let report = match write_crash_report(
+                data_root,
+                &status,
+                crashes.len(),
+                restart_scheduled,
+                delay,
+            ) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    operations::log(
+                        "WARN",
+                        &format!("无法写入 Watchdog 崩溃恢复报告，将继续执行重启策略：{error:#}"),
+                    );
+                    None
+                }
+            };
+            let report_text = report
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "未写入（请检查磁盘空间和目录权限）".into());
             operations::log(
                 "ERROR",
                 &format!(
                     "检测到主程序异常退出（exit={}），恢复报告：{}",
                     exit_code(&status),
-                    report.display()
+                    report_text
                 ),
             );
 

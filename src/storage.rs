@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, NaiveTime};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::{
     core::{
@@ -29,9 +29,11 @@ const SECONDARY_ATTEMPT_RETENTION_DAYS: i64 = 30;
 const SECONDARY_OUTBOX_RETENTION_DAYS: i64 = 90;
 const SECONDARY_MAX_ATTEMPT_RECORDS: i64 = 2000;
 const LOCAL_DELIVERY_PERSISTENT_FAILURE_MINUTES: i64 = 15;
+const RUNTIME_HEARTBEAT_WARNING_MINUTES: i64 = 3;
+const RUNTIME_HEARTBEAT_FAILED_MINUTES: i64 = 15;
 const BACKUP_PAGES_PER_STEP: i32 = 1024;
 const BACKUP_STEP_PAUSE: StdDuration = StdDuration::from_millis(1);
-pub const LATEST_SCHEMA_VERSION: i64 = 9;
+pub const LATEST_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone)]
 pub struct Database {
@@ -68,6 +70,7 @@ impl Database {
         migrate_outbox_messages_v7(&connection)?;
         migrate_secondary_notifications_v8(&connection)?;
         migrate_raw_payload_metadata_v9(&connection)?;
+        migrate_secondary_notification_identity_v10(&connection)?;
         Ok(())
     }
 
@@ -91,48 +94,38 @@ impl Database {
     }
 
     pub fn settings(&self) -> Result<AppSettings> {
-        let connection = self.open()?;
-        let json: Option<String> = connection
-            .query_row(
-                "SELECT json_value FROM app_settings WHERE id=1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(json
-            .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_default())
+        settings_from_connection(&self.open()?)
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
-        let json = serde_json::to_string(settings)?;
         let now = now_china();
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
-        let previous: AppSettings = transaction
-            .query_row(
-                "SELECT json_value FROM app_settings WHERE id=1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .unwrap_or_default();
-        transaction.execute("INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET json_value=excluded.json_value,updated_at=excluded.updated_at", params![json, format_dt(now)])?;
-        if !settings.secondary_notification_enabled
-            || settings.secondary_notification_provider != previous.secondary_notification_provider
-        {
-            transaction.execute(
-                "UPDATE secondary_notification_outbox SET state=?1,lease_until=NULL,updated_at=?2 WHERE state IN (?3,?4,?5)",
-                params![
-                    SECONDARY_CANCELLED,
-                    format_dt(now),
-                    SECONDARY_PENDING,
-                    SECONDARY_LEASED,
-                    SECONDARY_RETRYING,
-                ],
+        let previous = settings_from_connection(&transaction)?;
+        save_settings_tx(&transaction, settings, &previous, now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn save_settings_and_replan(&self, settings: &AppSettings) -> Result<()> {
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let previous = settings_from_connection(&transaction)?;
+        save_settings_tx(&transaction, settings, &previous, now)?;
+        let from = format_date(now.date_naive() - chrono::Duration::days(60));
+        let to = format_date(now.date_naive() + chrono::Duration::days(60));
+        let mut events = {
+            let mut statement = transaction.prepare(
+                "SELECT * FROM ipo_events WHERE apply_date>=?1 AND apply_date<=?2 ORDER BY apply_date,id",
             )?;
+            statement
+                .query_map(params![from, to], map_event)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for event in &mut events {
+            apply_manual_overrides(&transaction, event)?;
+            reconcile_schedule_tx(&transaction, event, settings, now)?;
         }
         transaction.commit()?;
         Ok(())
@@ -140,13 +133,7 @@ impl Database {
 
     pub fn event(&self, id: &str) -> Result<Option<IpoEvent>> {
         let connection = self.open()?;
-        let mut event = connection
-            .query_row("SELECT * FROM ipo_events WHERE id=?1", [id], map_event)
-            .optional()?;
-        if let Some(value) = &mut event {
-            apply_manual_overrides(&connection, value)?;
-        }
-        Ok(event)
+        event_from_connection(&connection, id)
     }
 
     pub fn events(&self, from: NaiveDate, to: NaiveDate) -> Result<Vec<IpoEvent>> {
@@ -239,13 +226,7 @@ impl Database {
                 format_dt(event.updated_at)
             ],
         )?;
-        let settings: AppSettings = transaction
-            .query_row("SELECT json_value FROM app_settings WHERE id=1", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
+        let settings = settings_from_connection(&transaction)?;
         transaction.execute(
             "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE ipo_event_id=?3 AND event_version<>?4 AND delivery_state IN (?5,?6,?7)",
             params![
@@ -272,36 +253,14 @@ impl Database {
         Ok(event)
     }
 
-    pub fn replan_all(&self) -> Result<()> {
-        let settings = self.settings()?;
-        let now = now_china();
-        for event in self.events(
-            now.date_naive() - chrono::Duration::days(60),
-            now.date_naive() + chrono::Duration::days(60),
-        )? {
-            self.reconcile_schedule(&event, &settings, now)?;
-        }
-        Ok(())
-    }
-    pub fn reconcile_schedule(
-        &self,
-        event: &IpoEvent,
-        settings: &AppSettings,
-        now: ChinaDateTime,
-    ) -> Result<()> {
-        let mut connection = self.open()?;
-        let tx = connection.transaction()?;
-        reconcile_schedule_tx(&tx, event, settings, now)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn acknowledge(&self, event_id: &str, version: i32) -> Result<()> {
         self.acknowledge_at(event_id, version, now_china())
     }
 
     fn acknowledge_at(&self, event_id: &str, version: i32, now: ChinaDateTime) -> Result<()> {
-        let mut event = self.event(event_id)?.context("申购任务不存在")?;
+        let mut connection = self.open()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut event = event_from_connection(&tx, event_id)?.context("申购任务不存在")?;
         if event.event_version != version {
             bail!("申购数据已更新，请刷新后确认")
         }
@@ -320,22 +279,15 @@ impl Database {
         ) {
             bail!("当前任务状态不能确认已申购")
         }
-        let mut connection = self.open()?;
-        let tx = connection.transaction()?;
         tx.execute("INSERT INTO acknowledgements(ipo_event_id,event_version,confirmed_at,confirmed_data_hash) VALUES(?1,?2,?3,?4) ON CONFLICT(ipo_event_id,event_version) DO UPDATE SET confirmed_at=excluded.confirmed_at,confirmed_data_hash=excluded.confirmed_data_hash,reconfirmed_at=excluded.confirmed_at,revoked_at=NULL,needs_review_at=NULL,review_reason=NULL",params![event_id,version,format_dt(now),event_hash(&event)])?;
-        tx.execute("UPDATE ipo_events SET lifecycle_status=?1,updated_at=?2 WHERE id=?3 AND event_version=?4",params![LifecycleStatus::Acknowledged as i32,format_dt(now),event_id,version])?;
+        let event_changed = tx.execute("UPDATE ipo_events SET lifecycle_status=?1,updated_at=?2 WHERE id=?3 AND event_version=?4 AND lifecycle_status IN (?5,?6,?7,?8)",params![LifecycleStatus::Acknowledged as i32,format_dt(now),event_id,version,LifecycleStatus::Scheduled as i32,LifecycleStatus::ActiveUnconfirmed as i32,LifecycleStatus::Acknowledged as i32,LifecycleStatus::AcknowledgedNeedsReview as i32])?;
+        if event_changed != 1 {
+            bail!("申购任务状态已变化，请刷新后重试");
+        }
         tx.execute("UPDATE reminder_outbox SET delivery_state=?1,acknowledged_at=?2,updated_at=?2 WHERE ipo_event_id=?3 AND event_version=?4 AND delivery_state IN (0,1,5)",params![DeliveryState::Cancelled as i32,format_dt(now),event_id,version])?;
         event.lifecycle_status = LifecycleStatus::Acknowledged;
         event.updated_at = now;
-        let settings: AppSettings = tx
-            .query_row(
-                "SELECT json_value FROM app_settings WHERE id=1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
+        let settings = settings_from_connection(&tx)?;
         reconcile_schedule_tx(&tx, &event, &settings, now)?;
         tx.commit()?;
         Ok(())
@@ -351,12 +303,14 @@ impl Database {
         version: i32,
         now: ChinaDateTime,
     ) -> Result<()> {
-        let mut event = self.event(event_id)?.context("申购任务不存在")?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut event = event_from_connection(&transaction, event_id)?.context("申购任务不存在")?;
         if event.event_version != version || event.lifecycle_status != LifecycleStatus::Acknowledged
         {
             bail!("当前没有可撤销的有效确认");
         }
-        let settings = self.settings()?;
+        let settings = settings_from_connection(&transaction)?;
         let date = event.apply_date.context("任务缺少申购日期")?;
         if now >= crate::core::at(date, crate::core::effective_cutoff(&event, &settings)) {
             bail!("已超过安全截止时间，不能撤销确认");
@@ -369,8 +323,6 @@ impl Database {
         };
         event.lifecycle_status = restored_status;
         event.updated_at = now;
-        let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
         let acknowledgement_changed = transaction.execute(
             "UPDATE acknowledgements SET revoked_at=?1 WHERE ipo_event_id=?2 AND event_version=?3 AND revoked_at IS NULL",
             params![format_dt(now), event_id, version],
@@ -624,15 +576,7 @@ impl Database {
         for id in ids {
             deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.* FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?);
         }
-        let settings: AppSettings = tx
-            .query_row(
-                "SELECT json_value FROM app_settings WHERE id=1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .unwrap_or_default();
+        let settings = settings_from_connection(&tx)?;
         if settings.secondary_notification_enabled
             && !matches!(
                 settings.secondary_notification_provider,
@@ -641,12 +585,31 @@ impl Database {
         {
             for delivery in &deliveries {
                 tx.execute(
-                    "INSERT OR IGNORE INTO secondary_notification_outbox(reminder_outbox_id,provider,state,attempt_count,next_attempt_at,created_at,updated_at) VALUES(?1,?2,?3,0,?4,?4,?4)",
+                    "INSERT INTO secondary_notification_outbox(
+                        reminder_outbox_id,provider,state,attempt_count,next_attempt_at,created_at,updated_at
+                     ) VALUES(?1,?2,?3,0,?4,?4,?4)
+                     ON CONFLICT(reminder_outbox_id,provider) DO UPDATE SET
+                        state=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                   THEN excluded.state ELSE secondary_notification_outbox.state END,
+                        attempt_count=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                           THEN 0 ELSE secondary_notification_outbox.attempt_count END,
+                        next_attempt_at=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                             THEN excluded.next_attempt_at ELSE secondary_notification_outbox.next_attempt_at END,
+                        lease_until=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                         THEN NULL ELSE secondary_notification_outbox.lease_until END,
+                        last_error=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                        THEN NULL ELSE secondary_notification_outbox.last_error END,
+                        delivered_at=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                          THEN NULL ELSE secondary_notification_outbox.delivered_at END,
+                        updated_at=CASE WHEN secondary_notification_outbox.state IN (?5,?6)
+                                        THEN excluded.updated_at ELSE secondary_notification_outbox.updated_at END",
                     params![
                         delivery.outbox_id,
                         settings.secondary_notification_provider as i32,
                         SECONDARY_PENDING,
                         format_dt(now),
+                        SECONDARY_CANCELLED,
+                        SECONDARY_EXHAUSTED,
                     ],
                 )?;
             }
@@ -1670,6 +1633,26 @@ impl Database {
         };
         let scheduler_heartbeat = heartbeat("scheduler")?;
         let delivery_heartbeat = heartbeat("delivery")?;
+        let runtime_heartbeat_state = [scheduler_heartbeat, delivery_heartbeat]
+            .into_iter()
+            .map(|heartbeat| match heartbeat {
+                None => HealthState::Failed,
+                Some(value)
+                    if value
+                        <= now - chrono::Duration::minutes(RUNTIME_HEARTBEAT_FAILED_MINUTES) =>
+                {
+                    HealthState::Failed
+                }
+                Some(value)
+                    if value
+                        <= now - chrono::Duration::minutes(RUNTIME_HEARTBEAT_WARNING_MINUTES) =>
+                {
+                    HealthState::Warning
+                }
+                Some(_) => HealthState::Healthy,
+            })
+            .max_by_key(|state| *state as i32)
+            .unwrap_or(HealthState::Failed);
         let operations = self.operation_health()?;
         let reminder_state = self.reminder_state_summary()?;
         let persistent_delivery_failure = reminder_state.failed > 0
@@ -1691,6 +1674,7 @@ impl Database {
             || operations
                 .iter()
                 .any(|operation| operation.state == HealthState::Failed)
+            || runtime_heartbeat_state == HealthState::Failed
             || persistent_delivery_failure
         {
             HealthState::Failed
@@ -1699,6 +1683,7 @@ impl Database {
             .any(|source| source.state != HealthState::Healthy)
             || quality_warning
             || reminder_state.failed > 0
+            || runtime_heartbeat_state == HealthState::Warning
             || operations
                 .iter()
                 .any(|operation| operation.state == HealthState::Warning)
@@ -1824,7 +1809,8 @@ impl Database {
                 status: ExtractionStatus::from_i32(row.get(10)?),
                 text_hash: row.get(11)?,
                 parser_version: row.get(12)?,
-                fields: serde_json::from_str(&fields_json).unwrap_or_default(),
+                fields: serde_json::from_str(&fields_json)
+                    .map_err(|error| to_sql_error(error.into()))?,
                 downloaded_at: parse_dt(&downloaded_at).map_err(to_sql_error)?,
             })
         })?;
@@ -1867,17 +1853,20 @@ impl Database {
         reason: &str,
         announcement_id: Option<&str>,
     ) -> Result<()> {
-        let event = self.event(event_id)?.context("发行任务不存在")?;
-        if event.event_version != version {
-            bail!("发行任务版本已变化，请刷新后重试");
-        }
         let value = normalize_manual_override(field, value)?;
         let reason = reason.trim();
         if reason.is_empty() {
             bail!("人工覆盖必须填写核验理由");
         }
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut event = event_from_connection(&transaction, event_id)?.context("发行任务不存在")?;
+        if event.event_version != version {
+            bail!("发行任务版本已变化，请刷新后重试");
+        }
         if let Some(announcement_id) = announcement_id.filter(|value| !value.trim().is_empty()) {
-            let belongs_to_event = self.open()?.query_row(
+            let belongs_to_event = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM announcement_documents WHERE id=?1 AND ipo_event_id=?2)",
                 params![announcement_id, event_id],
                 |row| row.get::<_, i32>(0),
@@ -1886,13 +1875,14 @@ impl Database {
                 bail!("所选依据公告不存在或不属于当前发行任务");
             }
         }
-        self.open()?.execute(
+        transaction.execute(
             "INSERT INTO manual_overrides(ipo_event_id,event_version,field_name,override_value,reason,announcement_document_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![event_id, version, field, limit(&value, 200), limit(reason, 500), announcement_id, format_dt(now_china())],
+            params![event_id, version, field, limit(&value, 200), limit(reason, 500), announcement_id, format_dt(now)],
         )?;
-        if let Some(event) = self.event(event_id)? {
-            self.reconcile_schedule(&event, &self.settings()?, now_china())?;
-        }
+        apply_manual_overrides(&transaction, &mut event)?;
+        let settings = settings_from_connection(&transaction)?;
+        reconcile_schedule_tx(&transaction, &event, &settings, now)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1902,16 +1892,24 @@ impl Database {
         version: i32,
         override_id: i64,
     ) -> Result<()> {
-        let changed = self.open()?.execute(
+        let now = now_china();
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut event = event_from_connection(&transaction, event_id)?.context("发行任务不存在")?;
+        if event.event_version != version {
+            bail!("发行任务版本已变化，请刷新后重试");
+        }
+        let changed = transaction.execute(
             "UPDATE manual_overrides SET revoked_at=?1 WHERE id=?2 AND ipo_event_id=?3 AND event_version=?4 AND revoked_at IS NULL",
-            params![format_dt(now_china()), override_id, event_id, version],
+            params![format_dt(now), override_id, event_id, version],
         )?;
         if changed == 0 {
             bail!("人工覆盖记录不存在、已经撤销或属于旧的数据版本");
         }
-        if let Some(event) = self.event(event_id)? {
-            self.reconcile_schedule(&event, &self.settings()?, now_china())?;
-        }
+        apply_manual_overrides(&transaction, &mut event)?;
+        let settings = settings_from_connection(&transaction)?;
+        reconcile_schedule_tx(&transaction, &event, &settings, now)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2432,6 +2430,192 @@ fn migrate_raw_payload_metadata_v9(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_secondary_notification_identity_v10(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let now = now_china();
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE secondary_notification_outbox_v10(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reminder_outbox_id INTEGER NOT NULL REFERENCES reminder_outbox(id) ON DELETE CASCADE,
+            provider INTEGER NOT NULL,
+            state INTEGER NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            lease_until TEXT NULL,
+            last_error TEXT NULL,
+            delivered_at TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(reminder_outbox_id,provider)
+        );
+        INSERT INTO secondary_notification_outbox_v10(
+            id,reminder_outbox_id,provider,state,attempt_count,next_attempt_at,lease_until,last_error,
+            delivered_at,created_at,updated_at
+        )
+        SELECT id,reminder_outbox_id,provider,state,attempt_count,next_attempt_at,lease_until,last_error,
+               delivered_at,created_at,updated_at
+        FROM secondary_notification_outbox;
+        DROP TABLE secondary_notification_outbox;
+        ALTER TABLE secondary_notification_outbox_v10 RENAME TO secondary_notification_outbox;
+        CREATE INDEX ix_secondary_notification_due
+            ON secondary_notification_outbox(state,next_attempt_at,provider);",
+    )?;
+
+    let settings = settings_from_connection(&transaction)?;
+    if settings.secondary_notification_enabled
+        && !matches!(
+            settings.secondary_notification_provider,
+            SecondaryNotificationProvider::Disabled | SecondaryNotificationProvider::Unknown
+        )
+    {
+        transaction.execute(
+            "INSERT OR IGNORE INTO secondary_notification_outbox(
+                reminder_outbox_id,provider,state,attempt_count,next_attempt_at,created_at,updated_at
+             )
+             SELECT s.reminder_outbox_id,?1,?2,0,?3,?3,?3
+             FROM secondary_notification_outbox s
+             JOIN reminder_outbox r ON r.id=s.reminder_outbox_id
+             WHERE s.provider<>?1 AND s.state=?4
+               AND r.delivery_state NOT IN (?5,?6)
+               AND r.due_at>=?7
+               AND NOT EXISTS(
+                   SELECT 1 FROM secondary_notification_outbox delivered
+                   WHERE delivered.reminder_outbox_id=s.reminder_outbox_id
+                     AND delivered.state=?8
+               )",
+            params![
+                settings.secondary_notification_provider as i32,
+                SECONDARY_PENDING,
+                format_dt(now),
+                SECONDARY_CANCELLED,
+                DeliveryState::Cancelled as i32,
+                DeliveryState::Collapsed as i32,
+                format_dt(now - chrono::Duration::days(1)),
+                SECONDARY_DELIVERED,
+            ],
+        )?;
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?1)",
+        [format_dt(now)],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn save_settings_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    settings: &AppSettings,
+    previous: &AppSettings,
+    now: ChinaDateTime,
+) -> Result<()> {
+    let json = serde_json::to_string(settings)?;
+    transaction.execute(
+        "INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,?1,?2)
+         ON CONFLICT(id) DO UPDATE SET json_value=excluded.json_value,updated_at=excluded.updated_at",
+        params![json, format_dt(now)],
+    )?;
+
+    let new_provider = settings.secondary_notification_provider;
+    let new_enabled = settings.secondary_notification_enabled
+        && !matches!(
+            new_provider,
+            SecondaryNotificationProvider::Disabled | SecondaryNotificationProvider::Unknown
+        );
+    let provider_changed = new_provider != previous.secondary_notification_provider;
+    let channel_activated =
+        new_enabled && (!previous.secondary_notification_enabled || provider_changed);
+    if channel_activated {
+        transaction.execute(
+            "INSERT INTO secondary_notification_outbox(
+                reminder_outbox_id,provider,state,attempt_count,next_attempt_at,lease_until,last_error,
+                delivered_at,created_at,updated_at
+             )
+             SELECT DISTINCT s.reminder_outbox_id,?1,?2,0,?3,NULL,NULL,NULL,?3,?3
+             FROM secondary_notification_outbox s
+             JOIN reminder_outbox r ON r.id=s.reminder_outbox_id
+             WHERE s.state IN (?4,?5,?6,?7,?8)
+               AND r.delivery_state NOT IN (?9,?10)
+               AND r.due_at>=?11
+               AND NOT EXISTS(
+                   SELECT 1 FROM secondary_notification_outbox delivered
+                   WHERE delivered.reminder_outbox_id=s.reminder_outbox_id
+                     AND delivered.state=?12
+               )
+             ON CONFLICT(reminder_outbox_id,provider) DO UPDATE SET
+                state=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                           THEN excluded.state ELSE secondary_notification_outbox.state END,
+                attempt_count=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                   THEN 0 ELSE secondary_notification_outbox.attempt_count END,
+                next_attempt_at=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                     THEN excluded.next_attempt_at ELSE secondary_notification_outbox.next_attempt_at END,
+                lease_until=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                 THEN NULL ELSE secondary_notification_outbox.lease_until END,
+                last_error=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                THEN NULL ELSE secondary_notification_outbox.last_error END,
+                delivered_at=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                  THEN NULL ELSE secondary_notification_outbox.delivered_at END,
+                updated_at=CASE WHEN secondary_notification_outbox.state IN (?13,?14)
+                                THEN excluded.updated_at ELSE secondary_notification_outbox.updated_at END",
+            params![
+                new_provider as i32,
+                SECONDARY_PENDING,
+                format_dt(now),
+                SECONDARY_PENDING,
+                SECONDARY_LEASED,
+                SECONDARY_RETRYING,
+                SECONDARY_CANCELLED,
+                SECONDARY_EXHAUSTED,
+                DeliveryState::Cancelled as i32,
+                DeliveryState::Collapsed as i32,
+                format_dt(now - chrono::Duration::days(1)),
+                SECONDARY_DELIVERED,
+                SECONDARY_CANCELLED,
+                SECONDARY_EXHAUSTED,
+            ],
+        )?;
+    }
+
+    if !new_enabled {
+        transaction.execute(
+            "UPDATE secondary_notification_outbox
+             SET state=?1,lease_until=NULL,updated_at=?2
+             WHERE state IN (?3,?4,?5)",
+            params![
+                SECONDARY_CANCELLED,
+                format_dt(now),
+                SECONDARY_PENDING,
+                SECONDARY_LEASED,
+                SECONDARY_RETRYING,
+            ],
+        )?;
+    } else if provider_changed {
+        transaction.execute(
+            "UPDATE secondary_notification_outbox
+             SET state=?1,lease_until=NULL,updated_at=?2
+             WHERE provider<>?3 AND state IN (?4,?5,?6)",
+            params![
+                SECONDARY_CANCELLED,
+                format_dt(now),
+                new_provider as i32,
+                SECONDARY_PENDING,
+                SECONDARY_LEASED,
+                SECONDARY_RETRYING,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn source_backoff_delay(source: &str, failures: i32, now: ChinaDateTime) -> chrono::Duration {
     let base_minutes = match failures {
         1 => 1,
@@ -2519,6 +2703,13 @@ fn reconcile_schedule_tx(
 
 fn map_event(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
     let sessions_json: String = row.get("sessions_json")?;
+    let sessions = serde_json::from_str(&sessions_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            row.as_ref().column_index("sessions_json").unwrap_or(22),
+            rusqlite::types::Type::Text,
+            error.into(),
+        )
+    })?;
     Ok(IpoEvent {
         id: row.get("id")?,
         exchange: Exchange::from_i32(row.get("exchange")?),
@@ -2543,11 +2734,22 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
         data_quality_status: DataQualityStatus::from_i32(row.get("data_quality_status")?),
         data_conflict: row.get::<_, i32>("data_conflict")? != 0,
         manual_override_fields: Vec::new(),
-        sessions: serde_json::from_str(&sessions_json).unwrap_or_default(),
+        sessions,
         first_seen_at: parse_dt(&row.get::<_, String>("first_seen_at")?).map_err(to_sql_error)?,
         updated_at: parse_dt(&row.get::<_, String>("updated_at")?).map_err(to_sql_error)?,
     })
 }
+
+fn event_from_connection(connection: &Connection, id: &str) -> Result<Option<IpoEvent>> {
+    let mut event = connection
+        .query_row("SELECT * FROM ipo_events WHERE id=?1", [id], map_event)
+        .optional()?;
+    if let Some(value) = &mut event {
+        apply_manual_overrides(connection, value)?;
+    }
+    Ok(event)
+}
+
 fn map_delivery(row: &Row<'_>) -> rusqlite::Result<ReminderDelivery> {
     let event = map_event_offset(row, 6)?;
     Ok(ReminderDelivery {
@@ -2615,6 +2817,13 @@ fn prune_secondary_notification_history(connection: &Connection, now: ChinaDateT
 }
 fn map_event_offset(row: &Row<'_>, offset: usize) -> rusqlite::Result<IpoEvent> {
     let sessions: String = row.get(offset + 22)?;
+    let sessions = serde_json::from_str(&sessions).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 22,
+            rusqlite::types::Type::Text,
+            error.into(),
+        )
+    })?;
     Ok(IpoEvent {
         id: row.get(offset)?,
         exchange: Exchange::from_i32(row.get(offset + 1)?),
@@ -2639,7 +2848,7 @@ fn map_event_offset(row: &Row<'_>, offset: usize) -> rusqlite::Result<IpoEvent> 
         data_quality_status: DataQualityStatus::from_i32(row.get(offset + 20)?),
         data_conflict: row.get::<_, i32>(offset + 21)? != 0,
         manual_override_fields: Vec::new(),
-        sessions: serde_json::from_str(&sessions).unwrap_or_default(),
+        sessions,
         first_seen_at: parse_dt(&row.get::<_, String>(offset + 23)?).map_err(to_sql_error)?,
         updated_at: parse_dt(&row.get::<_, String>(offset + 24)?).map_err(to_sql_error)?,
     })
@@ -2814,6 +3023,19 @@ pub fn format_dt(value: ChinaDateTime) -> String {
 pub fn parse_dt(value: &str) -> Result<ChinaDateTime> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&crate::core::china_offset()))
 }
+fn settings_from_connection(connection: &Connection) -> Result<AppSettings> {
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT json_value FROM app_settings WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match json {
+        Some(value) => serde_json::from_str(&value).context("应用设置 JSON 已损坏"),
+        None => Ok(AppSettings::default()),
+    }
+}
 fn to_sql_error(error: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
 }
@@ -2840,6 +3062,25 @@ mod tests {
                 .join(format!("stock-ipo-rust-test-{}", Uuid::new_v4().simple()));
             let database = Database::new(&root);
             database.initialize().unwrap();
+            Self { root, database }
+        }
+        fn new_at_v9() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "stock-ipo-rust-v9-test-{}",
+                Uuid::new_v4().simple()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let database = Database::new(&root);
+            let connection = database.open().unwrap();
+            connection.execute_batch(MIGRATION_SQL).unwrap();
+            migrate_sync_schedule_v3(&connection).unwrap();
+            migrate_sync_conclusions_v4(&connection).unwrap();
+            migrate_operation_health_v5(&connection).unwrap();
+            migrate_source_probes_v6(&connection).unwrap();
+            migrate_outbox_messages_v7(&connection).unwrap();
+            migrate_secondary_notifications_v8(&connection).unwrap();
+            migrate_raw_payload_metadata_v9(&connection).unwrap();
+            drop(connection);
             Self { root, database }
         }
         fn event(&self) -> IpoEvent {
@@ -3064,6 +3305,156 @@ mod tests {
         assert_eq!(summary.retrying, 0);
         assert_eq!(summary.requests_last_hour, 2);
         assert!(summary.latest_success_at.is_some());
+    }
+
+    #[test]
+    fn secondary_provider_switch_and_same_provider_reenable_revive_pending_work() {
+        let test = TestDatabase::new();
+        let mut settings = AppSettings {
+            secondary_notification_enabled: true,
+            secondary_notification_provider: SecondaryNotificationProvider::PushPlus,
+            ..AppSettings::default()
+        };
+        test.database.save_settings(&settings).unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+        let now = now_china();
+        assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
+
+        settings.secondary_notification_enabled = false;
+        test.database.save_settings(&settings).unwrap();
+        settings.secondary_notification_enabled = true;
+        test.database.save_settings(&settings).unwrap();
+        let reenabled = test
+            .database
+            .claim_secondary_due_at(50, now + chrono::Duration::seconds(1))
+            .unwrap();
+        assert!(!reenabled.is_empty());
+        assert!(
+            reenabled
+                .iter()
+                .all(|delivery| { delivery.provider == SecondaryNotificationProvider::PushPlus })
+        );
+        test.database
+            .fail_secondary_deliveries(&reenabled, "switch fixture")
+            .unwrap();
+
+        settings.secondary_notification_provider = SecondaryNotificationProvider::WeCom;
+        test.database.save_settings(&settings).unwrap();
+        let switched = test
+            .database
+            .claim_secondary_due_at(50, now + chrono::Duration::minutes(2))
+            .unwrap();
+        assert!(!switched.is_empty());
+        assert!(
+            switched
+                .iter()
+                .all(|delivery| { delivery.provider == SecondaryNotificationProvider::WeCom })
+        );
+    }
+
+    #[test]
+    fn v10_migration_changes_secondary_identity_to_reminder_and_provider() {
+        let test = TestDatabase::new_at_v9();
+        assert_eq!(test.database.schema_version().unwrap(), 9);
+        let settings = AppSettings {
+            secondary_notification_enabled: true,
+            secondary_notification_provider: SecondaryNotificationProvider::PushPlus,
+            ..AppSettings::default()
+        };
+        test.database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,?1,?2)",
+                params![
+                    serde_json::to_string(&settings).unwrap(),
+                    format_dt(now_china())
+                ],
+            )
+            .unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+        let now = now_china();
+        let connection = test.database.open().unwrap();
+        let reminder_id: i64 = connection
+            .query_row(
+                "SELECT id FROM reminder_outbox ORDER BY due_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO secondary_notification_outbox(
+                    reminder_outbox_id,provider,state,attempt_count,next_attempt_at,created_at,updated_at
+                 ) VALUES(?1,?2,?3,0,?4,?4,?4)",
+                params![
+                    reminder_id,
+                    SecondaryNotificationProvider::PushPlus as i32,
+                    SECONDARY_PENDING,
+                    format_dt(now),
+                ],
+            )
+            .unwrap();
+        migrate_secondary_notification_identity_v10(&connection).unwrap();
+        drop(connection);
+
+        let mut switched = settings;
+        switched.secondary_notification_provider = SecondaryNotificationProvider::WeCom;
+        test.database.save_settings(&switched).unwrap();
+        let providers: i64 = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(DISTINCT provider) FROM secondary_notification_outbox WHERE reminder_outbox_id=?1",
+                [reminder_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(providers, 2);
+        assert_eq!(test.database.schema_version().unwrap(), 10);
+        test.database.integrity_check().unwrap();
+    }
+
+    #[test]
+    fn settings_and_replanning_roll_back_together_on_sql_failure() {
+        let test = TestDatabase::new();
+        let original = AppSettings::default();
+        test.database.save_settings(&original).unwrap();
+        test.database.upsert_event(test.event()).unwrap();
+        test.database
+            .open()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_reminder_insert BEFORE INSERT ON reminder_outbox
+                 BEGIN SELECT RAISE(ABORT,'fixture replan failure'); END;
+                 CREATE TRIGGER fail_reminder_update BEFORE UPDATE ON reminder_outbox
+                 BEGIN SELECT RAISE(ABORT,'fixture replan failure'); END;",
+            )
+            .unwrap();
+        let mut changed = original.clone();
+        changed.safety_cutoff = NaiveTime::from_hms_opt(14, 54, 0).unwrap();
+        assert!(test.database.save_settings_and_replan(&changed).is_err());
+        assert_eq!(
+            test.database.settings().unwrap().safety_cutoff,
+            original.safety_cutoff
+        );
+    }
+
+    #[test]
+    fn malformed_settings_json_is_reported_and_does_not_partially_upsert_events() {
+        let test = TestDatabase::new();
+        test.database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(id,json_value,updated_at) VALUES(1,'{broken',?1)",
+                [format_dt(now_china())],
+            )
+            .unwrap();
+        assert!(test.database.settings().is_err());
+        assert!(test.database.upsert_event(test.event()).is_err());
+        assert!(test.database.event("shanghai:601001").unwrap().is_none());
     }
 
     #[test]
@@ -3706,7 +4097,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_idle_runtime_does_not_require_sqlite_heartbeats() {
+    fn runtime_heartbeat_health_transitions_from_healthy_to_warning_and_failed() {
         let test = TestDatabase::new();
         let now = now_china();
         test.database
@@ -3721,10 +4112,33 @@ mod tests {
             )
             .unwrap();
 
-        let health = test.database.health_details().unwrap();
-        assert_eq!(health.overall_state, HealthState::Healthy);
-        assert!(health.scheduler_heartbeat.is_none());
-        assert!(health.delivery_heartbeat.is_none());
+        let missing = test.database.health_details().unwrap();
+        assert_eq!(missing.overall_state, HealthState::Failed);
+        assert!(missing.scheduler_heartbeat.is_none());
+        assert!(missing.delivery_heartbeat.is_none());
+
+        test.database.touch_heartbeat("scheduler", now).unwrap();
+        test.database.touch_heartbeat("delivery", now).unwrap();
+        assert_eq!(
+            test.database.health_details().unwrap().overall_state,
+            HealthState::Healthy
+        );
+
+        test.database
+            .touch_heartbeat("scheduler", now - chrono::Duration::minutes(5))
+            .unwrap();
+        assert_eq!(
+            test.database.health_details().unwrap().overall_state,
+            HealthState::Warning
+        );
+
+        test.database
+            .touch_heartbeat("scheduler", now - chrono::Duration::minutes(16))
+            .unwrap();
+        assert_eq!(
+            test.database.health_details().unwrap().overall_state,
+            HealthState::Failed
+        );
     }
 
     #[test]

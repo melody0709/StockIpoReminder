@@ -4,7 +4,7 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +20,7 @@ use std::os::windows::{
 #[cfg(windows)]
 use windows::{
     Data::Xml::Dom::XmlDocument,
+    Foundation::TypedEventHandler,
     UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager},
     Win32::{
         Foundation::{
@@ -40,7 +41,8 @@ use windows::{
             ProcessStatus::EmptyWorkingSet,
             Registry::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-                RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
+                RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW,
+                RegOpenKeyExW, RegSetValueExW,
             },
             Services::{
                 CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
@@ -70,7 +72,7 @@ use windows::{
             },
         },
     },
-    core::{GUID, HSTRING, PCWSTR, w},
+    core::{GUID, HSTRING, IInspectable, PCWSTR, w},
 };
 
 #[cfg(windows)]
@@ -87,6 +89,8 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
 
 #[cfg(windows)]
 static PROCESS_APP_IDENTITY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+type ToastActivationHandler = Arc<dyn Fn(Option<String>) + Send + Sync + 'static>;
+static TOAST_ACTIVATION_HANDLER: OnceLock<Mutex<Option<ToastActivationHandler>>> = OnceLock::new();
 
 #[cfg(windows)]
 thread_local! {
@@ -138,7 +142,16 @@ pub fn initialize_notification_platform() -> Result<()> {
     Ok(())
 }
 
-pub fn show_windows_toast(title: &str, body: &str) -> Result<()> {
+pub fn set_toast_activation_handler(handler: ToastActivationHandler) {
+    if let Ok(mut target) = TOAST_ACTIVATION_HANDLER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *target = Some(handler);
+    }
+}
+
+pub fn show_windows_toast(title: &str, body: &str, event_id: Option<&str>) -> Result<()> {
     #[cfg(windows)]
     {
         initialize_notification_platform()?;
@@ -157,10 +170,24 @@ pub fn show_windows_toast(title: &str, body: &str) -> Result<()> {
 
         let document = XmlDocument::new().context("无法创建 Windows Toast XML 文档")?;
         document
-            .LoadXml(&HSTRING::from(toast_xml(title, body)))
+            .LoadXml(&HSTRING::from(toast_xml(title, body, event_id)))
             .context("无法解析 Windows Toast 内容")?;
         let notification = ToastNotification::CreateToastNotification(&document)
             .context("无法创建 Windows Toast 通知")?;
+        let activated_event_id = event_id.map(str::to_owned);
+        let activated = TypedEventHandler::<ToastNotification, IInspectable>::new(move |_, _| {
+            let callback = TOAST_ACTIVATION_HANDLER
+                .get()
+                .and_then(|target| target.lock().ok())
+                .and_then(|target| target.as_ref().cloned());
+            if let Some(callback) = callback {
+                callback(activated_event_id.clone());
+            }
+            Ok(())
+        });
+        notification
+            .Activated(&activated)
+            .context("无法注册 Windows Toast 点击处理器")?;
         notifier
             .Show(&notification)
             .context("Windows 拒绝显示 Toast 通知")?;
@@ -168,7 +195,7 @@ pub fn show_windows_toast(title: &str, body: &str) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (title, body);
+        let _ = (title, body, event_id);
         bail!("当前平台不支持 Windows Toast")
     }
 }
@@ -348,9 +375,18 @@ fn user_notification_state_name(
     .to_owned()
 }
 
-fn toast_xml(title: &str, body: &str) -> String {
+fn toast_xml(title: &str, body: &str, event_id: Option<&str>) -> String {
+    let launch = event_id
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                " launch=\"eventId={}\"",
+                xml_escape(&truncate_chars(value, 256))
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "<toast duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+        "<toast duration=\"long\"{launch}><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         xml_escape(&truncate_chars(title.trim(), 96)),
         xml_escape(&truncate_chars(body.trim(), 512)),
     )
@@ -978,6 +1014,39 @@ pub fn set_auto_start(enabled: bool, executable: &Path, data_root: &Path) -> Res
     }
 }
 
+pub fn auto_start_registered(data_root: &Path) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        let run_key = wide_null(RUN_KEY);
+        let value_name = wide_null(&auto_start_value_name(data_root));
+        let mut size = 0u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(run_key.as_ptr()),
+                PCWSTR(value_name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                None,
+                Some(&mut size),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            return Ok(true);
+        }
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(false);
+        }
+        bail!("无法读取 Windows 开机自启动注册表状态：error={}", status.0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = data_root;
+        Ok(false)
+    }
+}
+
 fn auto_start_value_name(data_root: &Path) -> String {
     let identity = data_root.to_string_lossy().to_ascii_lowercase();
     format!("StockIpoReminder-{}", &sha256(identity.as_bytes())[..12])
@@ -1067,11 +1136,16 @@ mod tests {
 
     #[test]
     fn toast_xml_escapes_untrusted_text_and_limits_payload_size() {
-        let xml = toast_xml("A&B <测试>", &format!("'\"{}", "字".repeat(600)));
+        let xml = toast_xml(
+            "A&B <测试>",
+            &format!("'\"{}", "字".repeat(600)),
+            Some("shanghai:601001&version=2"),
+        );
         assert!(xml.contains("A&amp;B &lt;测试&gt;"));
         assert!(xml.contains("&apos;&quot;"));
         assert!(!xml.contains("A&B"));
         assert!(xml.chars().count() < 800);
         assert!(xml.contains('…'));
+        assert!(xml.contains("launch=\"eventId=shanghai:601001&amp;version=2\""));
     }
 }

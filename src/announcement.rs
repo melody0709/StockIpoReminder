@@ -13,10 +13,32 @@ use serde_json::Value;
 use crate::{
     core::{at, china_offset, now_china, parse_date, sha256},
     model::*,
-    network::{checked_response, encode_query, ensure_allowed, text},
+    network::{checked_response, encode_query, ensure_allowed, response_text, text},
 };
 
 const METADATA_VERSION: &str = "announcement-metadata-v1";
+const ANNOUNCEMENT_PAGE_SIZE: usize = 100;
+const MAX_ANNOUNCEMENT_PAGES: usize = 10;
+
+struct ReferenceSearch {
+    references: Vec<AnnouncementRef>,
+    truncated: bool,
+}
+
+impl ReferenceSearch {
+    fn output(self, provider: &str) -> SearchOutput {
+        SearchOutput {
+            references: self.references,
+            warning: self.truncated.then(|| {
+                format!(
+                    "{provider} 公告结果超过 {} 页安全上限，本轮结果已明确标记为不完整",
+                    MAX_ANNOUNCEMENT_PAGES
+                )
+            }),
+            used_mirror: false,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SearchOutput {
@@ -40,14 +62,24 @@ pub fn search(
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<SearchOutput> {
+    ensure_not_cancelled(cancelled)?;
     match event.exchange {
-        Exchange::Shanghai => search_sse(client, event, from, to),
-        Exchange::Shenzhen => {
-            search_cninfo_market(client, event, from, to, "szse", "cninfo-announcement")
-                .map(SearchOutput::direct)
+        Exchange::Shanghai => search_sse(client, event, from, to, cancelled),
+        Exchange::Shenzhen => search_cninfo_market(
+            client,
+            event,
+            from,
+            to,
+            "szse",
+            "cninfo-announcement",
+            cancelled,
+        )
+        .map(|result| result.output("巨潮")),
+        Exchange::Beijing => {
+            search_bse(client, event, from, to, cancelled).map(|result| result.output("北交所"))
         }
-        Exchange::Beijing => search_bse(client, event, from, to).map(SearchOutput::direct),
         _ => Ok(SearchOutput::direct(Vec::new())),
     }
 }
@@ -57,31 +89,52 @@ fn search_sse(
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<SearchOutput> {
-    let official = search_sse_official(client, event, from, to);
-    let mirror = search_cninfo_market(client, event, from, to, "sse", "sse-announcement");
+    let official = search_sse_official(client, event, from, to, cancelled);
+    ensure_not_cancelled(cancelled)?;
+    let mirror = search_cninfo_market(
+        client,
+        event,
+        from,
+        to,
+        "sse",
+        "sse-announcement",
+        cancelled,
+    );
+    ensure_not_cancelled(cancelled)?;
     match (official, mirror) {
-        (Ok(_official), Ok(mirror)) if !mirror.is_empty() => Ok(SearchOutput {
-            references: mirror,
-            warning: None,
-            used_mirror: true,
-        }),
-        (Ok(official), Ok(_)) => Ok(SearchOutput {
-            warning: (!official.is_empty())
-                .then(|| "巨潮沪市公告镜像未命中，已回退上交所公告直链".to_owned()),
-            references: official,
-            used_mirror: false,
-        }),
+        (Ok(official), Ok(mirror)) => {
+            let used_mirror = !mirror.references.is_empty();
+            let truncated = official.truncated || mirror.truncated;
+            let mut references = official.references;
+            references.extend(mirror.references);
+            Ok(SearchOutput {
+                references: deduplicate(references)?,
+                warning: truncated.then(|| {
+                    format!(
+                        "上交所或巨潮公告结果超过 {} 页安全上限，本轮结果已明确标记为不完整",
+                        MAX_ANNOUNCEMENT_PAGES
+                    )
+                }),
+                used_mirror,
+            })
+        }
         (Ok(official), Err(error)) => Ok(SearchOutput {
-            references: official,
+            references: official.references,
             warning: Some(format!("巨潮沪市公告镜像不可用：{error:#}")),
             used_mirror: false,
         }),
         (Err(error), Ok(mirror)) => Ok(SearchOutput {
-            references: mirror,
-            warning: Some(format!(
-                "上交所公告检索失败，已由巨潮沪市镜像接管：{error:#}"
-            )),
+            references: mirror.references,
+            warning: Some(if mirror.truncated {
+                format!(
+                    "上交所公告检索失败，巨潮镜像超过 {} 页安全上限：{error:#}",
+                    MAX_ANNOUNCEMENT_PAGES
+                )
+            } else {
+                format!("上交所公告检索失败，已由巨潮沪市镜像接管：{error:#}")
+            }),
             used_mirror: true,
         }),
         (Err(official_error), Err(mirror_error)) => bail!(
@@ -95,42 +148,62 @@ fn search_sse_official(
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
-) -> Result<Vec<AnnouncementRef>> {
-    let values = HashMap::from([
-        ("isPagination", "true".to_owned()),
-        ("productId", event.security_code.clone()),
-        ("keyWord", String::new()),
-        (
-            "securityType",
-            "0101,120100,020100,020200,120200".to_owned(),
-        ),
-        ("reportType2", "DQGG".to_owned()),
-        ("reportType", "ALL".to_owned()),
-        ("beginDate", from.format("%Y-%m-%d").to_string()),
-        ("endDate", to.format("%Y-%m-%d").to_string()),
-        ("pageHelp.pageSize", "100".to_owned()),
-        ("pageHelp.pageNo", "1".to_owned()),
-        ("pageHelp.beginPage", "1".to_owned()),
-        ("pageHelp.cacheSize", "1".to_owned()),
-        ("pageHelp.endPage", "5".to_owned()),
-    ]);
-    let url = format!(
-        "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do?{}",
-        encode_query(&values)
-    );
-    ensure_allowed(&url, true)?;
-    let response = checked_response(
-        client
-            .get(url)
-            .header("Referer", "https://www.sse.com.cn/")
-            .send()?,
-        true,
-    )?;
-    let raw = response.text()?;
-    parse_sse_references(&raw)
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceSearch> {
+    let mut references = Vec::new();
+    let mut page = 1usize;
+    let mut total_pages = 1usize;
+    while page <= total_pages && page <= MAX_ANNOUNCEMENT_PAGES {
+        ensure_not_cancelled(cancelled)?;
+        let values = HashMap::from([
+            ("isPagination", "true".to_owned()),
+            ("productId", event.security_code.clone()),
+            ("keyWord", String::new()),
+            (
+                "securityType",
+                "0101,120100,020100,020200,120200".to_owned(),
+            ),
+            ("reportType2", "DQGG".to_owned()),
+            ("reportType", "ALL".to_owned()),
+            ("beginDate", from.format("%Y-%m-%d").to_string()),
+            ("endDate", to.format("%Y-%m-%d").to_string()),
+            ("pageHelp.pageSize", ANNOUNCEMENT_PAGE_SIZE.to_string()),
+            ("pageHelp.pageNo", page.to_string()),
+            ("pageHelp.beginPage", page.to_string()),
+            ("pageHelp.cacheSize", "1".to_owned()),
+            ("pageHelp.endPage", page.to_string()),
+        ]);
+        let url = format!(
+            "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do?{}",
+            encode_query(&values)
+        );
+        ensure_allowed(&url, true)?;
+        let response = checked_response(
+            client
+                .get(url)
+                .header("Referer", "https://www.sse.com.cn/")
+                .send()?,
+            true,
+        )?;
+        ensure_not_cancelled(cancelled)?;
+        let raw = response_text(response, true)?;
+        let (rows, total) = parse_sse_reference_page(&raw)?;
+        references.extend(rows);
+        total_pages = total.div_ceil(ANNOUNCEMENT_PAGE_SIZE).max(1);
+        page += 1;
+    }
+    Ok(ReferenceSearch {
+        references: deduplicate(references)?,
+        truncated: total_pages > MAX_ANNOUNCEMENT_PAGES,
+    })
 }
 
+#[cfg(test)]
 pub fn parse_sse_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
+    parse_sse_reference_page(raw).map(|value| value.0)
+}
+
+fn parse_sse_reference_page(raw: &str) -> Result<(Vec<AnnouncementRef>, usize)> {
     let root: Value = serde_json::from_str(raw)?;
     let rows = root
         .pointer("/pageHelp/data")
@@ -176,7 +249,16 @@ pub fn parse_sse_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
             announcement_type: Some(announcement_type(&title)),
         });
     }
-    Ok(result)
+    let total = root
+        .pointer("/pageHelp/total")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            root.pointer("/pageHelp/total")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(rows.len() as u64) as usize;
+    Ok((deduplicate(result)?, total))
 }
 
 fn search_cninfo_market(
@@ -186,39 +268,57 @@ fn search_cninfo_market(
     to: NaiveDate,
     column: &str,
     provider: &str,
-) -> Result<Vec<AnnouncementRef>> {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceSearch> {
     let landing = "https://www.cninfo.com.cn/new/index";
     ensure_allowed(landing, true)?;
+    ensure_not_cancelled(cancelled)?;
     let _landing_response = checked_response(client.get(landing).send()?, true)?;
+    ensure_not_cancelled(cancelled)?;
     thread::sleep(Duration::from_millis(350));
+    ensure_not_cancelled(cancelled)?;
     let url = "https://www.cninfo.com.cn/new/hisAnnouncement/query";
     ensure_allowed(url, true)?;
-    let response = checked_response(
-        client
-            .post(url)
-            .header("Referer", landing)
-            .form(&[
-                ("pageNum", "1"),
-                ("pageSize", "100"),
-                ("column", column),
-                ("tabName", "fulltext"),
-                ("searchkey", event.security_code.as_str()),
-                (
-                    "seDate",
-                    &format!("{}~{}", from.format("%Y-%m-%d"), to.format("%Y-%m-%d")),
-                ),
-                ("plate", ""),
-                ("stock", ""),
-                ("category", ""),
-                ("trade", ""),
-                ("sortName", ""),
-                ("sortType", ""),
-            ])
-            .send()?,
-        true,
-    )?;
-    let raw = response.text()?;
-    parse_cninfo_references_for_event(&raw, Some(&event.security_code), provider)
+    let date_range = format!("{}~{}", from.format("%Y-%m-%d"), to.format("%Y-%m-%d"));
+    let mut references = Vec::new();
+    let mut page = 1usize;
+    let mut total_pages = 1usize;
+    while page <= total_pages && page <= MAX_ANNOUNCEMENT_PAGES {
+        ensure_not_cancelled(cancelled)?;
+        let form = HashMap::from([
+            ("pageNum", page.to_string()),
+            ("pageSize", ANNOUNCEMENT_PAGE_SIZE.to_string()),
+            ("column", column.to_owned()),
+            ("tabName", "fulltext".to_owned()),
+            ("searchkey", event.security_code.clone()),
+            ("seDate", date_range.clone()),
+            ("plate", String::new()),
+            ("stock", String::new()),
+            ("category", String::new()),
+            ("trade", String::new()),
+            ("sortName", String::new()),
+            ("sortType", String::new()),
+        ]);
+        let response = checked_response(
+            client
+                .post(url)
+                .header("Referer", landing)
+                .form(&form)
+                .send()?,
+            true,
+        )?;
+        ensure_not_cancelled(cancelled)?;
+        let raw = response_text(response, true)?;
+        let (rows, total) =
+            parse_cninfo_reference_page_for_event(&raw, Some(&event.security_code), provider)?;
+        references.extend(rows);
+        total_pages = total.div_ceil(ANNOUNCEMENT_PAGE_SIZE).max(1);
+        page += 1;
+    }
+    Ok(ReferenceSearch {
+        references: deduplicate(references)?,
+        truncated: total_pages > MAX_ANNOUNCEMENT_PAGES,
+    })
 }
 
 #[cfg(test)]
@@ -226,23 +326,32 @@ fn parse_cninfo_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
     parse_cninfo_references_for_event(raw, None, "cninfo-announcement")
 }
 
+#[cfg(test)]
 fn parse_cninfo_references_for_event(
     raw: &str,
     expected_code: Option<&str>,
     provider: &str,
 ) -> Result<Vec<AnnouncementRef>> {
+    parse_cninfo_reference_page_for_event(raw, expected_code, provider).map(|value| value.0)
+}
+
+fn parse_cninfo_reference_page_for_event(
+    raw: &str,
+    expected_code: Option<&str>,
+    provider: &str,
+) -> Result<(Vec<AnnouncementRef>, usize)> {
     let root: Value = serde_json::from_str(raw).context("巨潮公告响应不是有效 JSON")?;
+    let total_announcements = cninfo_count(&root, "totalAnnouncement")?;
+    let total_records = cninfo_count(&root, "totalRecordNum")?;
     let Some(value) = root.get("announcements") else {
         bail!("巨潮公告响应缺少 announcements")
     };
     if value.is_null() {
-        let total_announcements = cninfo_count(&root, "totalAnnouncement")?;
-        let total_records = cninfo_count(&root, "totalRecordNum")?;
-        if total_announcements == 0 && total_records == 0 {
-            return Ok(Vec::new());
+        if total_announcements == Some(0) && total_records == Some(0) {
+            return Ok((Vec::new(), 0));
         }
         bail!(
-            "巨潮公告响应 announcements=null，但计数非零：totalAnnouncement={total_announcements}, totalRecordNum={total_records}"
+            "巨潮公告响应 announcements=null，但健康空结果计数缺失或非零：totalAnnouncement={total_announcements:?}, totalRecordNum={total_records:?}"
         );
     }
     let rows = value
@@ -293,16 +402,22 @@ fn parse_cninfo_references_for_event(
             announcement_type: Some(announcement_type(&title)),
         });
     }
-    deduplicate(result)
+    let total = total_announcements
+        .into_iter()
+        .chain(total_records)
+        .max()
+        .unwrap_or(rows.len() as u64) as usize;
+    Ok((deduplicate(result)?, total.max(rows.len())))
 }
 
-fn cninfo_count(root: &Value, key: &str) -> Result<u64> {
-    let value = root
-        .get(key)
-        .with_context(|| format!("巨潮公告健康空结果缺少 {key}"))?;
+fn cninfo_count(root: &Value, key: &str) -> Result<Option<u64>> {
+    let Some(value) = root.get(key) else {
+        return Ok(None);
+    };
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .map(Some)
         .with_context(|| format!("巨潮公告 {key} 不是非负整数"))
 }
 
@@ -311,11 +426,12 @@ fn search_bse(
     event: &IpoEvent,
     from: NaiveDate,
     to: NaiveDate,
-) -> Result<Vec<AnnouncementRef>> {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceSearch> {
     let mut errors = Vec::new();
     if let Some(detail_id) = event.announcement_url.as_deref().and_then(detail_id) {
-        match search_bse_pages(client, event, from, to, true, &detail_id) {
-            Ok(rows) if !rows.is_empty() => return Ok(rows),
+        match search_bse_pages(client, event, from, to, true, &detail_id, cancelled) {
+            Ok(rows) if !rows.references.is_empty() => return Ok(rows),
             Ok(_) => {}
             Err(error) => errors.push(error),
         }
@@ -328,10 +444,11 @@ fn search_bse(
     ];
     let mut attempted = false;
     for term in terms.into_iter().flatten() {
-        match search_bse_pages(client, event, from, to, false, term) {
+        ensure_not_cancelled(cancelled)?;
+        match search_bse_pages(client, event, from, to, false, term, cancelled) {
             Ok(rows) => {
                 attempted = true;
-                if !rows.is_empty() {
+                if !rows.references.is_empty() {
                     return Ok(rows);
                 }
             }
@@ -341,7 +458,10 @@ fn search_bse(
     if !attempted && !errors.is_empty() {
         bail!("北交所公告检索失败：{}", errors[0]);
     }
-    Ok(Vec::new())
+    Ok(ReferenceSearch {
+        references: Vec::new(),
+        truncated: false,
+    })
 }
 
 fn search_bse_pages(
@@ -351,11 +471,13 @@ fn search_bse_pages(
     to: NaiveDate,
     detail: bool,
     value: &str,
-) -> Result<Vec<AnnouncementRef>> {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReferenceSearch> {
     let mut result = Vec::new();
     let mut page = 0usize;
     let mut total_pages = 1usize;
-    while page < total_pages && page < 10 {
+    while page < total_pages && page < MAX_ANNOUNCEMENT_PAGES {
+        ensure_not_cancelled(cancelled)?;
         let mut query: HashMap<&str, String> = if detail {
             HashMap::from([
                 ("callback", "ipoDetailCb".into()),
@@ -393,13 +515,24 @@ fn search_bse_pages(
                 .send()?,
             true,
         )?;
-        let raw = response.text()?;
+        ensure_not_cancelled(cancelled)?;
+        let raw = response_text(response, true)?;
         let (rows, pages) = parse_bse_references(&raw, event, from, to)?;
         result.extend(rows);
         total_pages = pages;
         page += 1;
     }
-    deduplicate(result)
+    Ok(ReferenceSearch {
+        references: deduplicate(result)?,
+        truncated: total_pages > MAX_ANNOUNCEMENT_PAGES,
+    })
+}
+
+fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        bail!("同步已取消")
+    }
+    Ok(())
 }
 
 pub fn parse_bse_references(
@@ -563,7 +696,11 @@ fn unwrap_jsonp(raw: &str) -> Result<&str> {
     }
     let start = trimmed.find('(').context("无效 JSONP")?;
     let end = trimmed.rfind(')').context("无效 JSONP")?;
-    Ok(&trimmed[start + 1..end])
+    let content_start = start + 1;
+    if end < content_start {
+        bail!("无效 JSONP：右括号位于左括号之前");
+    }
+    Ok(&trimmed[content_start..end])
 }
 
 fn deduplicate(rows: Vec<AnnouncementRef>) -> Result<Vec<AnnouncementRef>> {
@@ -749,8 +886,14 @@ mod tests {
             parse_cninfo_references(inconsistent)
                 .unwrap_err()
                 .to_string()
-                .contains("计数非零")
+                .contains("计数缺失或非零")
         );
+    }
+
+    #[test]
+    fn malformed_jsonp_is_rejected_without_panicking() {
+        assert!(unwrap_jsonp(")(").is_err());
+        assert!(unwrap_jsonp("foo)bar(baz").is_err());
     }
 
     #[test]

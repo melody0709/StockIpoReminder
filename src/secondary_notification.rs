@@ -127,6 +127,37 @@ pub fn clear_secret(data_root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub struct SecretSnapshot(Option<Vec<u8>>);
+
+pub fn snapshot_secret(data_root: &Path) -> Result<SecretSnapshot> {
+    let path = secret_path(data_root);
+    let bytes = if path.exists() {
+        Some(fs::read(&path).context("无法读取现有第二通知通道凭据以准备回滚")?)
+    } else {
+        None
+    };
+    Ok(SecretSnapshot(bytes))
+}
+
+pub fn restore_secret(data_root: &Path, snapshot: &SecretSnapshot) -> Result<()> {
+    let path = secret_path(data_root);
+    let Some(bytes) = snapshot.0.as_deref() else {
+        return clear_secret(data_root);
+    };
+    let parent = path.parent().context("第二通知通道凭据目录无效")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        "secondary-notification-restore-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    fs::write(&temporary, bytes)?;
+    if let Err(error) = operations::atomic_replace_file(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("无法恢复第二通知通道加密凭据");
+    }
+    Ok(())
+}
+
 pub fn send_test(data_root: &Path, provider: SecondaryNotificationProvider) -> Result<SendReceipt> {
     let secret = load_matching_secret(data_root, provider)?;
     send_message(

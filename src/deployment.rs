@@ -255,10 +255,8 @@ fn run_msi_uninstall_helper(
 fn wait_for_parent_exit(parent_pid: u32) -> Result<()> {
     #[cfg(windows)]
     {
-        let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }) else {
-            thread::sleep(Duration::from_millis(1500));
-            return Ok(());
-        };
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }
+            .context("无法打开主程序进程，已取消卸载")?;
         let wait = unsafe { WaitForSingleObject(handle, 30_000) };
         unsafe {
             let _ = CloseHandle(handle);
