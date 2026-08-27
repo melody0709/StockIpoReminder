@@ -430,16 +430,19 @@ export component MainWindow inherits Window {
                 width: root.compact-width ? 180px : 280px;
                 text <=> root.task-filter-text;
                 placeholder-text: "简称、股票代码或申购代码";
+                edited => { root.refresh-data(); }
             }
             ComboBox {
                 width: root.compact-width ? 100px : 120px;
                 model: ["全部市场", "沪市", "深市", "北交所"];
                 current-index <=> root.task-market-filter-index;
+                selected => { root.refresh-data(); }
             }
             ComboBox {
                 width: root.compact-width ? 100px : 120px;
                 model: ["全部状态", "待确认", "已确认", "需核验"];
                 current-index <=> root.task-status-filter-index;
+                selected => { root.refresh-data(); }
             }
             Text {
                 text: root.active-page == 0
@@ -457,6 +460,7 @@ export component MainWindow inherits Window {
                     root.task-filter-text = "";
                     root.task-market-filter-index = 0;
                     root.task-status-filter-index = 0;
+                    root.refresh-data();
                 }
             }
         }
@@ -1601,11 +1605,14 @@ export component ReminderWindow inherits Window {
     preferred-height: 360px;
     min-width: 460px;
     min-height: 300px;
-    background: #3a2510;
+    // Keep the complete reminder surface invalidatable after its native
+    // no-activate window is shown and moved into the work area.
+    background: Math.mod(root.repaint-token, 2) == 0 ? #3a2510 : #3a2511;
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 14px;
     always-on-top: true;
 
+    in-out property <int> repaint-token: 0;
     in-out property <string> reminder-title: "打新提醒";
     in-out property <string> reminder-body: "";
     in-out property <string> reminder-event-id: "";

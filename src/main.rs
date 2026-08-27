@@ -209,6 +209,10 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     let polling_timer = Timer::default();
     let mut secondary_status_tick = 0_u8;
     let mut runtime_startup_applied = false;
+    let mut last_ui_revision = runtime.snapshot().revision;
+    let mut main_window_was_visible = false;
+    #[cfg(windows)]
+    let mut last_tray_status = None::<(i64, bool)>;
     polling_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
         let Some(ui) = weak.upgrade() else { return };
         if !runtime_startup_applied && polling_runtime.is_ready() {
@@ -261,9 +265,16 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
             }
             runtime_startup_applied = true;
         }
-        refresh_ui(&ui, &polling_runtime);
+        let window_visible = ui.window().is_visible();
+        let snapshot = polling_runtime.snapshot();
+        if window_visible && (!main_window_was_visible || snapshot.revision != last_ui_revision) {
+            refresh_ui(&ui, &polling_runtime);
+            last_ui_revision = snapshot.revision;
+        }
+        main_window_was_visible = window_visible;
         secondary_status_tick = (secondary_status_tick + 1) % 5;
-        if ui.get_active_page() == 3
+        if window_visible
+            && ui.get_active_page() == 3
             && secondary_status_tick == 0
             && !polling_secondary_busy.load(Ordering::Acquire)
         {
@@ -272,12 +283,15 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         }
         #[cfg(windows)]
         {
-            let snapshot = polling_runtime.snapshot();
-            polling_tray.set_status(
+            let tray_status = (
                 snapshot.pending_count,
                 snapshot.last_sync_succeeded == Some(false)
                     || snapshot.health_state == HealthState::Failed,
             );
+            if last_tray_status != Some(tray_status) {
+                polling_tray.set_status(tray_status.0, tray_status.1);
+                last_tray_status = Some(tray_status);
+            }
         }
         let Some(reminder_window) = reminder_weak.upgrade() else {
             return;
@@ -608,7 +622,7 @@ fn reminder_batch(
 }
 
 fn show_dedicated_reminder(window: &ReminderWindow) -> bool {
-    match windows_integration::show_reminder_window(window.window()) {
+    let shown = match windows_integration::show_reminder_window(window.window()) {
         Ok(()) => {
             let _ = windows_integration::install_window_icon(window.window());
             true
@@ -617,7 +631,26 @@ fn show_dedicated_reminder(window: &ReminderWindow) -> bool {
             operations::log("ERROR", &format!("专用提醒窗口无激活显示失败：{error:#}"));
             window.show().is_ok()
         }
+    };
+    if shown {
+        force_reminder_repaint(window);
+
+        // SetWindowPos and the software renderer can finish the first native
+        // show on different Windows messages. Invalidate the whole reminder
+        // once more after that transition so no stale backing buffer remains.
+        let weak = window.as_weak();
+        Timer::single_shot(Duration::from_millis(50), move || {
+            if let Some(window) = weak.upgrade() {
+                force_reminder_repaint(&window);
+            }
+        });
     }
+    shown
+}
+
+fn force_reminder_repaint(window: &ReminderWindow) {
+    window.set_repaint_token(window.get_repaint_token().wrapping_add(1));
+    window.window().request_redraw();
 }
 
 fn wire_reminder_callbacks(

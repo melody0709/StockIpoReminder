@@ -50,9 +50,7 @@ impl Database {
     fn open(&self) -> Result<Connection> {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(StdDuration::from_secs(10))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         Ok(connection)
     }
 
@@ -61,6 +59,7 @@ impl Database {
             fs::create_dir_all(parent)?;
         }
         let connection = self.open()?;
+        connection.execute_batch("PRAGMA journal_mode=WAL;")?;
         connection.execute_batch(MIGRATION_SQL)?;
         migrate_sync_schedule_v3(&connection)?;
         migrate_sync_conclusions_v4(&connection)?;
@@ -392,12 +391,14 @@ impl Database {
         Ok(())
     }
 
-    pub fn refresh_lifecycle(&self) -> Result<()> {
+    pub fn refresh_lifecycle(&self) -> Result<bool> {
         let now = now_china();
         let settings = self.settings()?;
+        let mut changed = false;
         for event in self.future_events(60)? {
             if event.lifecycle_status == LifecycleStatus::Acknowledged {
                 self.revoke_acknowledgement_at(&event.id, event.event_version, now)?;
+                changed = true;
             }
         }
         for mut event in self.today_events()? {
@@ -420,9 +421,10 @@ impl Database {
                 event.lifecycle_status = status;
                 event.updated_at = now;
                 self.open()?.execute("UPDATE ipo_events SET lifecycle_status=?1,updated_at=?2 WHERE id=?3 AND event_version=?4",params![status as i32,format_dt(now),event.id,event.event_version])?;
+                changed = true;
             }
         }
-        self.touch_heartbeat("scheduler", now)
+        Ok(changed)
     }
 
     pub fn claim_due(&self, limit: usize) -> Result<Vec<ReminderDelivery>> {
@@ -430,10 +432,27 @@ impl Database {
     }
 
     fn claim_due_at(&self, limit: usize, now: ChinaDateTime) -> Result<Vec<ReminderDelivery>> {
-        let lease = now + chrono::Duration::minutes(2);
         let mut connection = self.open()?;
-        let tx = connection.transaction()?;
         let formatted_now = format_dt(now);
+        let has_due_work = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM reminder_outbox
+                WHERE (delivery_state=?1 AND lease_until<=?2)
+                   OR (delivery_state IN (?3,?4) AND due_at<=?2 AND (lease_until IS NULL OR lease_until<=?2))
+            )",
+            params![
+                DeliveryState::Leased as i32,
+                &formatted_now,
+                DeliveryState::Pending as i32,
+                DeliveryState::Failed as i32,
+            ],
+            |row| row.get::<_, i32>(0),
+        )? != 0;
+        if !has_due_work {
+            return Ok(Vec::new());
+        }
+        let lease = now + chrono::Duration::minutes(2);
+        let tx = connection.transaction()?;
         tx.execute("UPDATE reminder_outbox SET delivery_state=0,lease_until=NULL,updated_at=?1 WHERE delivery_state=1 AND lease_until<=?1",[&formatted_now])?;
         tx.execute(
             "UPDATE reminder_outbox AS stale
@@ -549,9 +568,27 @@ impl Database {
         now: ChinaDateTime,
     ) -> Result<Vec<SecondaryNotificationDelivery>> {
         let mut connection = self.open()?;
+        let formatted_now = format_dt(now);
+        let has_due_work = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM secondary_notification_outbox
+                WHERE (state=?1 AND lease_until<=?2)
+                   OR (state IN (?3,?4) AND attempt_count<?5 AND next_attempt_at<=?2)
+            )",
+            params![
+                SECONDARY_LEASED,
+                &formatted_now,
+                SECONDARY_PENDING,
+                SECONDARY_RETRYING,
+                SECONDARY_MAX_ATTEMPTS,
+            ],
+            |row| row.get::<_, i32>(0),
+        )? != 0;
+        if !has_due_work {
+            return Ok(Vec::new());
+        }
         let transaction = connection.transaction()?;
         prune_secondary_notification_history(&transaction, now)?;
-        let formatted_now = format_dt(now);
         transaction.execute(
             "UPDATE secondary_notification_outbox SET state=?1,lease_until=NULL,next_attempt_at=?2,updated_at=?2 WHERE state=?3 AND lease_until<=?2",
             params![SECONDARY_RETRYING, formatted_now, SECONDARY_LEASED],
@@ -1157,7 +1194,24 @@ impl Database {
         Ok(())
     }
     pub fn touch_heartbeat(&self, component: &str, now: ChinaDateTime) -> Result<()> {
-        self.open()?.execute("INSERT INTO app_heartbeat(component,heartbeat_at) VALUES(?1,?2) ON CONFLICT(component) DO UPDATE SET heartbeat_at=excluded.heartbeat_at",params![component,format_dt(now)])?;
+        self.open()?.execute(
+            "INSERT INTO app_heartbeat(component,heartbeat_at) VALUES(?1,?2) ON CONFLICT(component) DO UPDATE SET heartbeat_at=excluded.heartbeat_at",
+            params![component, format_dt(now)],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_runtime_heartbeats(&self, now: ChinaDateTime) -> Result<()> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        let heartbeat_at = format_dt(now);
+        for component in ["scheduler", "delivery"] {
+            transaction.execute(
+                "INSERT INTO app_heartbeat(component,heartbeat_at) VALUES(?1,?2) ON CONFLICT(component) DO UPDATE SET heartbeat_at=excluded.heartbeat_at",
+                params![component, &heartbeat_at],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1650,18 +1704,20 @@ impl Database {
 
     pub fn maintenance(&self, data_root: &Path) -> Result<()> {
         let connection = self.open()?;
+        let now = now_china();
         connection.execute(
             "DELETE FROM raw_payloads WHERE fetched_at < ?1",
-            [format_dt(now_china() - chrono::Duration::days(14))],
+            [format_dt(now - chrono::Duration::days(14))],
         )?;
         connection.execute(
             "DELETE FROM sync_runs WHERE finished_at < ?1",
-            [format_dt(now_china() - chrono::Duration::days(90))],
+            [format_dt(now - chrono::Duration::days(90))],
         )?;
         connection.execute(
             "DELETE FROM reminder_log WHERE shown_at < ?1",
-            [format_dt(now_china() - chrono::Duration::days(180))],
+            [format_dt(now - chrono::Duration::days(180))],
         )?;
+        prune_secondary_notification_history(&connection, now)?;
         let temporary = data_root.join("temp");
         if temporary.exists() {
             for entry in fs::read_dir(temporary)? {
@@ -3036,7 +3092,7 @@ mod tests {
             )
             .unwrap();
 
-        test.database.refresh_lifecycle().unwrap();
+        assert!(test.database.refresh_lifecycle().unwrap());
 
         assert_eq!(
             test.database
@@ -3053,6 +3109,27 @@ mod tests {
         ).unwrap();
         assert_eq!(revoked, 1);
         assert!(pending > 0);
+        assert!(!test.database.refresh_lifecycle().unwrap());
+    }
+
+    #[test]
+    fn runtime_heartbeats_are_committed_together() {
+        let test = TestDatabase::new();
+        let now = now_china();
+
+        test.database.touch_runtime_heartbeats(now).unwrap();
+
+        let connection = test.database.open().unwrap();
+        let (count, minimum, maximum): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*),MIN(heartbeat_at),MAX(heartbeat_at) FROM app_heartbeat WHERE component IN ('scheduler','delivery')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(minimum, format_dt(now));
+        assert_eq!(maximum, format_dt(now));
     }
 
     #[test]

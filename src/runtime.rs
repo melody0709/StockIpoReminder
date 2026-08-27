@@ -30,6 +30,10 @@ use crate::{
 const MINIMUM_SYNC_MINUTES: i32 = 5;
 const MAXIMUM_SYNC_MINUTES: i32 = 7 * 24 * 60;
 const DELIVERY_INTERVAL: Duration = Duration::from_secs(10);
+const LIFECYCLE_INTERVAL: Duration = Duration::from_secs(30);
+const HEALTH_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SYNC_WINDOW_START_HOUR: u32 = 6;
 const SYNC_WINDOW_END_HOUR: u32 = 22;
@@ -117,8 +121,9 @@ impl AnnouncementRunStats {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeSnapshot {
+    pub revision: u64,
     pub is_synchronizing: bool,
     pub status_text: String,
     pub last_sync_text: String,
@@ -135,6 +140,7 @@ pub struct RuntimeSnapshot {
 impl Default for RuntimeSnapshot {
     fn default() -> Self {
         Self {
+            revision: 0,
             is_synchronizing: true,
             status_text: "正在后台准备本地数据库…".into(),
             last_sync_text: "尚未同步".into(),
@@ -413,6 +419,10 @@ fn run_loop(
     };
     let mut next_sync_reason = initial_schedule.reason;
     let mut next_delivery = Instant::now();
+    let mut next_lifecycle = Instant::now();
+    let mut next_health_summary = Instant::now();
+    let mut next_heartbeat = Instant::now();
+    let mut next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
     let mut next_clock = Instant::now();
     let mut next_maintenance = Instant::now();
     let mut last_health_date = None;
@@ -444,7 +454,18 @@ fn run_loop(
             crate::windows_integration::trim_working_set();
         }
         if Instant::now() >= next_delivery {
-            let _ = run_delivery_cycle(&database, &events, &snapshot, &data_root);
+            let _ = run_delivery_cycle(&database, &events, &data_root);
+            next_delivery = Instant::now() + DELIVERY_INTERVAL;
+        }
+
+        if Instant::now() >= next_lifecycle {
+            if database.refresh_lifecycle().unwrap_or(false) {
+                next_snapshot = Instant::now();
+            }
+            next_lifecycle = Instant::now() + LIFECYCLE_INTERVAL;
+        }
+
+        if Instant::now() >= next_health_summary {
             let china_now = now_china();
             if last_health_date != Some(china_now.date_naive())
                 && let Ok(settings) = database.settings()
@@ -465,7 +486,17 @@ fn run_loop(
                     ),
                 }
             }
-            next_delivery = Instant::now() + DELIVERY_INTERVAL;
+            next_health_summary = Instant::now() + HEALTH_SUMMARY_INTERVAL;
+        }
+
+        if Instant::now() >= next_heartbeat {
+            let _ = database.touch_runtime_heartbeats(now_china());
+            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+        }
+
+        if Instant::now() >= next_snapshot {
+            refresh_snapshot(&database, &snapshot);
+            next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
         }
 
         if Instant::now() >= next_maintenance {
@@ -484,6 +515,10 @@ fn run_loop(
 
         let wait = next_sync
             .min(next_delivery)
+            .min(next_lifecycle)
+            .min(next_health_summary)
+            .min(next_heartbeat)
+            .min(next_snapshot)
             .min(next_clock)
             .min(next_maintenance)
             .saturating_duration_since(Instant::now())
@@ -494,18 +529,34 @@ fn run_loop(
                 while let Ok(command) = commands.try_recv() {
                     match command {
                         RuntimeCommand::Sync(reason) => requested_reason = Some(reason),
-                        RuntimeCommand::Wake => next_delivery = Instant::now(),
+                        RuntimeCommand::Wake => {
+                            next_delivery = Instant::now();
+                            next_lifecycle = Instant::now();
+                            next_snapshot = Instant::now();
+                        }
                         RuntimeCommand::Recovery => {
                             next_delivery = Instant::now();
+                            next_lifecycle = Instant::now();
+                            next_health_summary = Instant::now();
+                            next_heartbeat = Instant::now();
+                            next_snapshot = Instant::now();
                             next_clock = Instant::now();
                         }
                         RuntimeCommand::Stop => return Ok(()),
                     }
                 }
             }
-            Ok(RuntimeCommand::Wake) => next_delivery = Instant::now(),
+            Ok(RuntimeCommand::Wake) => {
+                next_delivery = Instant::now();
+                next_lifecycle = Instant::now();
+                next_snapshot = Instant::now();
+            }
             Ok(RuntimeCommand::Recovery) => {
                 next_delivery = Instant::now();
+                next_lifecycle = Instant::now();
+                next_health_summary = Instant::now();
+                next_heartbeat = Instant::now();
+                next_snapshot = Instant::now();
                 next_clock = Instant::now();
             }
             Ok(RuntimeCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1129,11 +1180,8 @@ fn should_check_announcements(event: &IpoEvent) -> bool {
 fn run_delivery_cycle(
     database: &Database,
     events: &mpsc::Sender<UiEvent>,
-    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     data_root: &Path,
 ) -> Result<()> {
-    database.touch_heartbeat("delivery", now_china())?;
-    database.refresh_lifecycle()?;
     for delivery in database.claim_due(20)? {
         if let Err(error) = events.send(UiEvent::Reminder(delivery.clone())) {
             database.fail_delivery(delivery.outbox_id, &error.to_string())?;
@@ -1156,7 +1204,6 @@ fn run_delivery_cycle(
             }
         }
     }
-    refresh_snapshot(database, snapshot);
     Ok(())
 }
 
@@ -1350,7 +1397,13 @@ fn update_snapshot(
     update: impl FnOnce(&mut RuntimeSnapshot),
 ) {
     if let Ok(mut value) = snapshot.write() {
+        let previous = value.clone();
+        let revision = value.revision;
         update(&mut value);
+        value.revision = revision;
+        if *value != previous {
+            value.revision = revision.wrapping_add(1);
+        }
     }
 }
 
@@ -1719,6 +1772,24 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(runtime.snapshot().health_state, HealthState::Failed);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_revision_only_changes_when_visible_state_changes() {
+        let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
+
+        update_snapshot(&snapshot, |_| {});
+        assert_eq!(snapshot.read().unwrap().revision, 0);
+
+        update_snapshot(&snapshot, |value| {
+            value.status_text = "后台提醒服务已就绪".into();
+        });
+        assert_eq!(snapshot.read().unwrap().revision, 1);
+
+        update_snapshot(&snapshot, |value| {
+            value.status_text = "后台提醒服务已就绪".into();
+        });
+        assert_eq!(snapshot.read().unwrap().revision, 1);
     }
 
     #[test]
