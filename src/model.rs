@@ -31,7 +31,7 @@ numeric_enum!(HealthState { Unknown = 0, Healthy = 1, Warning = 2, Failed = 3 })
 numeric_enum!(ExtractionStatus { Unknown = -1, Pending = 0, Extracted = 1, LowConfidence = 2, Failed = 3, Unsupported = 4 });
 numeric_enum!(SyncConclusionKind { Unknown = 0, HealthyNonempty = 1, HealthyEmpty = 2, DegradedCached = 3 });
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionSession {
     pub session_number: i32,

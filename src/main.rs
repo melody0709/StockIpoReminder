@@ -33,7 +33,7 @@ use model::{
     ReminderDelivery, ReminderLevel, SecondaryNotificationProvider,
 };
 use runtime::{RuntimeHandle, UiEvent};
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
+use slint::{CloseRequestResponse, ComponentHandle, ModelRc, Timer, VecModel};
 
 slint::include_modules!();
 
@@ -194,197 +194,21 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     );
     wire_reminder_callbacks(&reminder_window, &ui, runtime.clone());
 
-    let weak = ui.as_weak();
-    let reminder_weak = reminder_window.as_weak();
-    let polling_runtime = runtime.clone();
-    #[cfg(windows)]
-    let polling_tray = Arc::clone(&tray);
-    let polling_data_root = options.data_root.clone();
-    let polling_secondary_busy = Arc::clone(&secondary_notification_busy);
-    let polling_available_update = Arc::clone(&available_update);
-    let polling_crash_upload_busy = Arc::clone(&crash_upload_busy);
-    let polling_skip_auto_start_registration = options.skip_auto_start_registration;
-    let polling_skip_update_check = options.skip_update_check;
-    let polling_skip_crash_upload = options.skip_crash_upload;
-    let polling_timer = Timer::default();
-    let mut secondary_status_tick = 0_u8;
-    let mut runtime_startup_applied = false;
-    let mut last_ui_revision = runtime.snapshot().revision;
-    let mut main_window_was_visible = false;
-    #[cfg(windows)]
-    let mut last_tray_status = None::<(i64, bool)>;
-    polling_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if !runtime_startup_applied && polling_runtime.is_ready() {
-            let settings = polling_runtime.settings().unwrap_or_default();
-            if settings.onboarding_completed && !polling_skip_auto_start_registration {
-                match env::current_exe() {
-                    Ok(executable) => {
-                        if let Err(error) = windows_integration::set_auto_start(
-                            settings.auto_start_enabled,
-                            &executable,
-                            &polling_data_root,
-                        ) {
-                            operations::log("WARN", &format!("校准开机自启动失败：{error:#}"));
-                        }
-                    }
-                    Err(error) => operations::log(
-                        "WARN",
-                        &format!("读取当前程序路径失败，无法校准开机自启动：{error:#}"),
-                    ),
-                }
-            }
-            apply_settings(&ui, &settings);
-            refresh_secondary_notification_ui(&ui, &polling_data_root, &settings, &polling_runtime);
-            if !settings.onboarding_completed {
-                ui.set_active_page(3);
-            }
-            if settings.automatic_updates_enabled && update_configured && !polling_skip_update_check
-            {
-                let update_window = ui.as_weak();
-                let update_state = Arc::clone(&polling_available_update);
-                Timer::single_shot(Duration::from_secs(3), move || {
-                    start_update_check(update_window.clone(), Arc::clone(&update_state), true);
-                });
-            }
-            if settings.crash_report_upload_enabled
-                && crash_upload_configured
-                && !polling_skip_crash_upload
-            {
-                let upload_window = ui.as_weak();
-                let upload_root = polling_data_root.clone();
-                let upload_busy = Arc::clone(&polling_crash_upload_busy);
-                Timer::single_shot(Duration::from_secs(5), move || {
-                    start_crash_upload(
-                        upload_window.clone(),
-                        upload_root.clone(),
-                        Arc::clone(&upload_busy),
-                        true,
-                    );
-                });
-            }
-            runtime_startup_applied = true;
-        }
-        let window_visible = ui.window().is_visible();
-        let snapshot = polling_runtime.snapshot();
-        if window_visible && (!main_window_was_visible || snapshot.revision != last_ui_revision) {
-            refresh_ui(&ui, &polling_runtime);
-            last_ui_revision = snapshot.revision;
-        }
-        main_window_was_visible = window_visible;
-        secondary_status_tick = (secondary_status_tick + 1) % 5;
-        if window_visible
-            && ui.get_active_page() == 3
-            && secondary_status_tick == 0
-            && !polling_secondary_busy.load(Ordering::Acquire)
-        {
-            let settings = polling_runtime.settings().unwrap_or_default();
-            refresh_secondary_notification_ui(&ui, &polling_data_root, &settings, &polling_runtime);
-        }
+    install_runtime_ui_bridge(
+        ui.as_weak(),
+        reminder_window.as_weak(),
+        runtime.clone(),
+        options.data_root.clone(),
+        Arc::clone(&available_update),
+        Arc::clone(&crash_upload_busy),
+        update_configured,
+        crash_upload_configured,
+        options.skip_auto_start_registration,
+        options.skip_update_check,
+        options.skip_crash_upload,
         #[cfg(windows)]
-        {
-            let tray_status = (
-                snapshot.pending_count,
-                snapshot.last_sync_succeeded == Some(false)
-                    || snapshot.health_state == HealthState::Failed,
-            );
-            if last_tray_status != Some(tray_status) {
-                polling_tray.set_status(tray_status.0, tray_status.1);
-                last_tray_status = Some(tray_status);
-            }
-        }
-        let Some(reminder_window) = reminder_weak.upgrade() else {
-            return;
-        };
-        let mut deliveries = Vec::new();
-        let mut health_summary = None;
-        while let Some(event) = polling_runtime.try_event() {
-            match event {
-                UiEvent::Reminder(delivery) => deliveries.push(delivery),
-                UiEvent::Health { state, text } => health_summary = Some((state, text)),
-            }
-        }
-        if !deliveries.is_empty() {
-            let batch = reminder_batch(&deliveries, health_summary.as_ref().map(|value| &value.1));
-            reminder_window.set_reminder_title(batch.title.clone().into());
-            reminder_window.set_reminder_body(batch.body.clone().into());
-            reminder_window.set_reminder_event_id(batch.event_id.clone().into());
-            reminder_window.set_reminder_event_version(batch.event_version);
-            reminder_window.set_batch_count(deliveries.len() as i32);
-            reminder_window.set_can_acknowledge(batch.can_acknowledge);
-            let shown = show_dedicated_reminder(&reminder_window);
-            let settings = polling_runtime.settings().unwrap_or_default();
-            if settings.sound_enabled {
-                windows_integration::play_alert();
-            }
-            if settings.flash_taskbar {
-                windows_integration::flash_window(reminder_window.window());
-            }
-            #[cfg(windows)]
-            if settings.toast_enabled {
-                polling_tray.notify(
-                    &batch.title,
-                    &batch.body,
-                    (!batch.event_id.is_empty()).then_some(batch.event_id.as_str()),
-                );
-            }
-            if shown {
-                let completion_runtime = polling_runtime.clone();
-                let visibility_window = reminder_window.as_weak();
-                Timer::single_shot(Duration::from_millis(150), move || {
-                    let visibility = visibility_window
-                        .upgrade()
-                        .context("专用提醒窗口已被销毁")
-                        .and_then(|window| {
-                            windows_integration::confirm_window_visible(window.window())
-                        });
-                    match visibility {
-                        Ok(()) => {
-                            for delivery in deliveries {
-                                if let Err(error) = completion_runtime.complete_delivery(&delivery)
-                                {
-                                    operations::log(
-                                        "ERROR",
-                                        &format!("提醒可见后完成 Outbox 投递状态失败：{error:#}"),
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("提醒窗口可见性确认失败：{error:#}");
-                            operations::log("ERROR", &message);
-                            for delivery in deliveries {
-                                if let Err(fail_error) =
-                                    completion_runtime.fail_delivery(&delivery, &message)
-                                {
-                                    operations::log(
-                                        "ERROR",
-                                        &format!("记录提醒投递失败状态时出错：{fail_error:#}"),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        } else if let Some((state, text)) = health_summary {
-            reminder_window.set_reminder_title(match state {
-                HealthState::Failed => "每日健康摘要 · 需要处理".into(),
-                HealthState::Warning => "每日健康摘要 · 存在警告".into(),
-                _ => "每日健康摘要".into(),
-            });
-            reminder_window.set_reminder_body(text.clone().into());
-            reminder_window.set_reminder_event_id("".into());
-            reminder_window.set_reminder_event_version(0);
-            reminder_window.set_batch_count(0);
-            reminder_window.set_can_acknowledge(false);
-            let _ = show_dedicated_reminder(&reminder_window);
-            #[cfg(windows)]
-            if polling_runtime.settings().unwrap_or_default().toast_enabled {
-                polling_tray.notify("A 股打新提醒 · 健康摘要", &text, None);
-            }
-        }
-    });
+        Arc::clone(&tray),
+    );
 
     ui.show().context("无法显示主窗口")?;
     operations::log(
@@ -425,10 +249,268 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     let run_result = slint::run_event_loop_until_quit().context("Slint 事件循环异常");
     let _ = ui.hide();
     let _ = reminder_window.hide();
+    runtime.remove_ui_notifier();
     runtime.stop();
     let _ = runtime_thread.join();
-    drop(polling_timer);
     run_result
+}
+
+#[derive(Default)]
+struct RuntimeUiBridgeState {
+    startup_applied: bool,
+    last_ui_revision: Option<u64>,
+    #[cfg(windows)]
+    last_tray_status: Option<(i64, bool)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_runtime_ui_bridge(
+    window: slint::Weak<MainWindow>,
+    reminder_window: slint::Weak<ReminderWindow>,
+    runtime: RuntimeHandle,
+    data_root: PathBuf,
+    available_update: Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    crash_upload_busy: Arc<AtomicBool>,
+    update_configured: bool,
+    crash_upload_configured: bool,
+    skip_auto_start_registration: bool,
+    skip_update_check: bool,
+    skip_crash_upload: bool,
+    #[cfg(windows)] tray: Arc<native_tray::NativeTray>,
+) {
+    let callback_pending = Arc::new(AtomicBool::new(false));
+    let bridge_state = Arc::new(Mutex::new(RuntimeUiBridgeState::default()));
+    let notifier_runtime = runtime.clone();
+    runtime.install_ui_notifier(move || {
+        if callback_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending_for_callback = Arc::clone(&callback_pending);
+        let pending_on_error = Arc::clone(&callback_pending);
+        let window = window.clone();
+        let reminder_window = reminder_window.clone();
+        let runtime = notifier_runtime.clone();
+        let data_root = data_root.clone();
+        let available_update = Arc::clone(&available_update);
+        let crash_upload_busy = Arc::clone(&crash_upload_busy);
+        let bridge_state = Arc::clone(&bridge_state);
+        #[cfg(windows)]
+        let tray = Arc::clone(&tray);
+        let queued = slint::invoke_from_event_loop(move || {
+            pending_for_callback.store(false, Ordering::Release);
+            drain_runtime_ui(
+                &window,
+                &reminder_window,
+                &runtime,
+                &data_root,
+                &available_update,
+                &crash_upload_busy,
+                update_configured,
+                crash_upload_configured,
+                skip_auto_start_registration,
+                skip_update_check,
+                skip_crash_upload,
+                &bridge_state,
+                #[cfg(windows)]
+                &tray,
+            );
+        });
+        if queued.is_err() {
+            pending_on_error.store(false, Ordering::Release);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_runtime_ui(
+    window: &slint::Weak<MainWindow>,
+    reminder_window: &slint::Weak<ReminderWindow>,
+    runtime: &RuntimeHandle,
+    data_root: &PathBuf,
+    available_update: &Arc<Mutex<Option<updater::AvailableUpdate>>>,
+    crash_upload_busy: &Arc<AtomicBool>,
+    update_configured: bool,
+    crash_upload_configured: bool,
+    skip_auto_start_registration: bool,
+    skip_update_check: bool,
+    skip_crash_upload: bool,
+    bridge_state: &Arc<Mutex<RuntimeUiBridgeState>>,
+    #[cfg(windows)] tray: &Arc<native_tray::NativeTray>,
+) {
+    let Some(ui) = window.upgrade() else { return };
+    let snapshot = runtime.snapshot();
+    let mut apply_startup = false;
+    let mut refresh = false;
+    if let Ok(mut state) = bridge_state.lock() {
+        if !state.startup_applied && runtime.is_ready() {
+            state.startup_applied = true;
+            apply_startup = true;
+        }
+        if state.last_ui_revision != Some(snapshot.revision) {
+            state.last_ui_revision = Some(snapshot.revision);
+            refresh = true;
+        }
+    }
+
+    if apply_startup {
+        let settings = runtime.settings().unwrap_or_default();
+        if settings.onboarding_completed && !skip_auto_start_registration {
+            match env::current_exe() {
+                Ok(executable) => {
+                    if let Err(error) = windows_integration::set_auto_start(
+                        settings.auto_start_enabled,
+                        &executable,
+                        data_root,
+                    ) {
+                        operations::log("WARN", &format!("校准开机自启动失败：{error:#}"));
+                    }
+                }
+                Err(error) => operations::log(
+                    "WARN",
+                    &format!("读取当前程序路径失败，无法校准开机自启动：{error:#}"),
+                ),
+            }
+        }
+        apply_settings(&ui, &settings);
+        refresh_secondary_notification_ui(&ui, data_root, &settings, runtime);
+        if !settings.onboarding_completed {
+            ui.set_active_page(3);
+        }
+        if settings.automatic_updates_enabled && update_configured && !skip_update_check {
+            let update_window = ui.as_weak();
+            let update_state = Arc::clone(available_update);
+            Timer::single_shot(Duration::from_secs(3), move || {
+                start_update_check(update_window.clone(), Arc::clone(&update_state), true);
+            });
+        }
+        if settings.crash_report_upload_enabled && crash_upload_configured && !skip_crash_upload {
+            let upload_window = ui.as_weak();
+            let upload_root = data_root.clone();
+            let upload_busy = Arc::clone(crash_upload_busy);
+            Timer::single_shot(Duration::from_secs(5), move || {
+                start_crash_upload(
+                    upload_window.clone(),
+                    upload_root.clone(),
+                    Arc::clone(&upload_busy),
+                    true,
+                );
+            });
+        }
+    }
+    if refresh {
+        refresh_ui(&ui, runtime);
+    }
+
+    #[cfg(windows)]
+    {
+        let tray_status = (
+            snapshot.pending_count,
+            snapshot.last_sync_succeeded == Some(false)
+                || snapshot.health_state == HealthState::Failed,
+        );
+        let update_tray = bridge_state.lock().is_ok_and(|mut state| {
+            if state.last_tray_status == Some(tray_status) {
+                false
+            } else {
+                state.last_tray_status = Some(tray_status);
+                true
+            }
+        });
+        if update_tray {
+            tray.set_status(tray_status.0, tray_status.1);
+        }
+    }
+
+    let Some(reminder_window) = reminder_window.upgrade() else {
+        return;
+    };
+    let mut deliveries = Vec::new();
+    let mut health_summary = None;
+    while let Some(event) = runtime.try_event() {
+        match event {
+            UiEvent::Reminder(delivery) => deliveries.push(delivery),
+            UiEvent::Health { state, text } => health_summary = Some((state, text)),
+        }
+    }
+    if !deliveries.is_empty() {
+        let batch = reminder_batch(&deliveries, health_summary.as_ref().map(|value| &value.1));
+        reminder_window.set_reminder_title(batch.title.clone().into());
+        reminder_window.set_reminder_body(batch.body.clone().into());
+        reminder_window.set_reminder_event_id(batch.event_id.clone().into());
+        reminder_window.set_reminder_event_version(batch.event_version);
+        reminder_window.set_batch_count(deliveries.len() as i32);
+        reminder_window.set_can_acknowledge(batch.can_acknowledge);
+        let shown = show_dedicated_reminder(&reminder_window);
+        let settings = runtime.settings().unwrap_or_default();
+        if settings.sound_enabled {
+            windows_integration::play_alert();
+        }
+        if settings.flash_taskbar {
+            windows_integration::flash_window(reminder_window.window());
+        }
+        #[cfg(windows)]
+        if settings.toast_enabled {
+            tray.notify(
+                &batch.title,
+                &batch.body,
+                (!batch.event_id.is_empty()).then_some(batch.event_id.as_str()),
+            );
+        }
+        if shown {
+            let completion_runtime = runtime.clone();
+            let visibility_window = reminder_window.as_weak();
+            Timer::single_shot(Duration::from_millis(150), move || {
+                let visibility = visibility_window
+                    .upgrade()
+                    .context("专用提醒窗口已被销毁")
+                    .and_then(|window| {
+                        windows_integration::confirm_window_visible(window.window())
+                    });
+                match visibility {
+                    Ok(()) => {
+                        for delivery in deliveries {
+                            if let Err(error) = completion_runtime.complete_delivery(&delivery) {
+                                operations::log(
+                                    "ERROR",
+                                    &format!("提醒可见后完成 Outbox 投递状态失败：{error:#}"),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("提醒窗口可见性确认失败：{error:#}");
+                        operations::log("ERROR", &message);
+                        for delivery in deliveries {
+                            if let Err(fail_error) =
+                                completion_runtime.fail_delivery(&delivery, &message)
+                            {
+                                operations::log(
+                                    "ERROR",
+                                    &format!("记录提醒投递失败状态时出错：{fail_error:#}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    } else if let Some((state, text)) = health_summary {
+        reminder_window.set_reminder_title(match state {
+            HealthState::Failed => "每日健康摘要 · 需要处理".into(),
+            HealthState::Warning => "每日健康摘要 · 存在警告".into(),
+            _ => "每日健康摘要".into(),
+        });
+        reminder_window.set_reminder_body(text.clone().into());
+        reminder_window.set_reminder_event_id("".into());
+        reminder_window.set_reminder_event_version(0);
+        reminder_window.set_batch_count(0);
+        reminder_window.set_can_acknowledge(false);
+        let _ = show_dedicated_reminder(&reminder_window);
+        #[cfg(windows)]
+        if runtime.settings().unwrap_or_default().toast_enabled {
+            tray.notify("A 股打新提醒 · 健康摘要", &text, None);
+        }
+    }
 }
 
 fn schedule_reminder_window_smoke(reminder: slint::Weak<ReminderWindow>, report_path: PathBuf) {
@@ -775,15 +857,15 @@ fn wire_callbacks(
             let normal_sync_minutes = parse_sync_interval(
                 ui.get_normal_sync_interval_value().as_str(),
                 ui.get_normal_sync_interval_unit_index(),
-                "普通日期自动同步间隔",
+                "来源异常重试间隔",
             )?;
             let active_day_sync_minutes = parse_sync_interval(
                 ui.get_active_sync_interval_value().as_str(),
                 ui.get_active_sync_interval_unit_index(),
-                "申购日自动同步间隔",
+                "当日未确认任务核验间隔",
             )?;
             if active_day_sync_minutes > normal_sync_minutes {
-                anyhow::bail!("申购日自动同步间隔不能大于普通日期间隔");
+                anyhow::bail!("当日未确认任务核验间隔不能大于来源异常重试间隔");
             }
             settings.normal_sync_minutes = normal_sync_minutes;
             settings.active_day_sync_minutes = active_day_sync_minutes;
@@ -1781,14 +1863,7 @@ fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
             )
             .into(),
         );
-        ui.set_heartbeat_text(
-            format!(
-                "调度心跳 {} · 投递心跳 {}",
-                format_timestamp(health.scheduler_heartbeat),
-                format_timestamp(health.delivery_heartbeat),
-            )
-            .into(),
-        );
+        ui.set_heartbeat_text(snapshot.next_wake_text.clone().into());
         let sources = health
             .sources
             .into_iter()
@@ -2268,6 +2343,7 @@ fn diagnostic_summary(runtime: &RuntimeHandle, data_root: &PathBuf) -> String {
         format!("最近同步：{}", snapshot.last_sync_text),
         format!("同步成功：{:?}", snapshot.last_sync_succeeded),
         format!("系统时间：{}", snapshot.clock_text),
+        snapshot.next_wake_text.clone(),
         toast_status,
         format!(
             "Toast AUMID：{}，进程标识：{}，开始菜单匹配：{}",
@@ -2718,7 +2794,6 @@ mod native_tray {
         Win32::{
             Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
             System::{
-                EventNotificationService::IsNetworkAlive,
                 LibraryLoader::GetModuleHandleW,
                 RemoteDesktop::{
                     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
@@ -2733,14 +2808,14 @@ mod native_tray {
                 },
                 WindowsAndMessaging::{
                     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                    DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MF_SEPARATOR,
-                    MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL,
-                    PBT_APMRESUMESTANDBY, PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage,
-                    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
-                    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
-                    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-                    WM_DESTROY, WM_LBUTTONDBLCLK, WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMECHANGE,
-                    WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WTS_SESSION_UNLOCK,
+                    DispatchMessageW, GetCursorPos, GetMessageW, MF_SEPARATOR, MF_STRING, MSG,
+                    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESTANDBY,
+                    PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, RegisterClassW,
+                    RegisterWindowMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+                    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+                    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
+                    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMECHANGE, WM_WTSSESSION_CHANGE,
+                    WNDCLASSW, WTS_SESSION_UNLOCK,
                 },
             },
         },
@@ -2758,8 +2833,6 @@ mod native_tray {
     const FUTURE_COMMAND: usize = 1006;
     const LOGS_COMMAND: usize = 1007;
     const ICON_ID: u32 = 1;
-    const NETWORK_TIMER_ID: usize = 2001;
-    const NETWORK_POLL_MILLISECONDS: u32 = 10_000;
 
     struct Callbacks {
         show: Box<dyn Fn() + Send + Sync>,
@@ -2777,7 +2850,6 @@ mod native_tray {
     static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
     static LAST_NOTIFICATION_EVENT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     static LAST_RECOVERY: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-    static NETWORK_AVAILABLE: AtomicBool = AtomicBool::new(false);
     static TOAST_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
     static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
     static ACTIVATE_INSTANCE_MESSAGE: AtomicU32 = AtomicU32::new(0);
@@ -2800,7 +2872,7 @@ mod native_tray {
             window: Weak<MainWindow>,
             runtime: RuntimeHandle,
             data_root: std::path::PathBuf,
-            recovery_smoke_mode: bool,
+            _recovery_smoke_mode: bool,
         ) -> Result<Self> {
             let activation_message_name = windows_integration::activation_message_name(&data_root);
             let show_window = window.clone();
@@ -2915,9 +2987,6 @@ mod native_tray {
                 recovery: Box::new(move || {
                     RECOVERY_CALLBACKS.fetch_add(1, Ordering::AcqRel);
                     recovery_runtime.recovery();
-                    if !recovery_smoke_mode {
-                        recovery_runtime.request_sync("系统恢复或时间变化");
-                    }
                 }),
             });
             let hwnd = Arc::new(AtomicIsize::new(0));
@@ -3183,18 +3252,6 @@ mod native_tray {
             hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
             unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }
                 .context("无法注册 Windows 会话恢复通知")?;
-            NETWORK_AVAILABLE.store(network_available(), Ordering::Release);
-            if unsafe {
-                SetTimer(
-                    Some(hwnd),
-                    NETWORK_TIMER_ID,
-                    NETWORK_POLL_MILLISECONDS,
-                    None,
-                )
-            } == 0
-            {
-                bail!("无法创建网络恢复检测计时器");
-            }
             let icon_data = create_icon_data(hwnd)?;
             if !unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data) }.as_bool() {
                 bail!("Shell_NotifyIconW(NIM_ADD) 失败");
@@ -3218,7 +3275,6 @@ mod native_tray {
                 DispatchMessageW(&message);
             }
         }
-        let _ = unsafe { KillTimer(Some(_hwnd), NETWORK_TIMER_ID) };
         let _ = unsafe { WTSUnRegisterSessionNotification(_hwnd) };
         let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &icon_data) };
         hwnd_slot.store(0, Ordering::Release);
@@ -3374,25 +3430,12 @@ mod native_tray {
                 dispatch_recovery();
                 LRESULT(0)
             }
-            WM_TIMER if wparam.0 == NETWORK_TIMER_ID => {
-                let available = network_available();
-                let previous = NETWORK_AVAILABLE.swap(available, Ordering::AcqRel);
-                if available && !previous {
-                    dispatch_recovery();
-                }
-                LRESULT(0)
-            }
             WM_DESTROY => {
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         }
-    }
-
-    fn network_available() -> bool {
-        let mut flags = 0u32;
-        unsafe { IsNetworkAlive(&mut flags) }.is_ok()
     }
 
     fn dispatch_recovery() {

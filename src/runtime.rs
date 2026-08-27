@@ -7,11 +7,11 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 
 use crate::{
     announcement,
@@ -29,14 +29,13 @@ use crate::{
 
 const MINIMUM_SYNC_MINUTES: i32 = 5;
 const MAXIMUM_SYNC_MINUTES: i32 = 7 * 24 * 60;
-const DELIVERY_INTERVAL: Duration = Duration::from_secs(10);
-const LIFECYCLE_INTERVAL: Duration = Duration::from_secs(30);
-const HEALTH_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
-const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SYNC_WINDOW_START_HOUR: u32 = 6;
 const SYNC_WINDOW_END_HOUR: u32 = 22;
+const DAILY_DISCOVERY_HOUR: u32 = 8;
+const DAILY_MAINTENANCE_HOUR: u32 = 5;
+const DAILY_MAINTENANCE_MINUTE: u32 = 30;
+const MANAGED_BACKUP_LIMIT: usize = 7;
+const MANAGED_BACKUP_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct AutomaticSyncSchedule {
@@ -134,6 +133,7 @@ pub struct RuntimeSnapshot {
     pub clock_state: HealthState,
     pub pending_count: i64,
     pub today_count: usize,
+    pub next_wake_text: String,
     pub last_error: Option<String>,
 }
 
@@ -151,6 +151,7 @@ impl Default for RuntimeSnapshot {
             clock_state: HealthState::Unknown,
             pending_count: 0,
             today_count: 0,
+            next_wake_text: "后台调度正在初始化…".into(),
             last_error: None,
         }
     }
@@ -169,12 +170,40 @@ enum RuntimeCommand {
     Stop,
 }
 
+type UiNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct RuntimeUiState {
+    snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    notifier: Arc<Mutex<Option<UiNotifier>>>,
+}
+
+impl RuntimeUiState {
+    fn new() -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(RuntimeSnapshot::default())),
+            notifier: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn notify(&self) {
+        let notifier = self
+            .notifier
+            .lock()
+            .ok()
+            .and_then(|value| value.as_ref().cloned());
+        if let Some(notifier) = notifier {
+            notifier();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeHandle {
     database: Database,
     command_sender: mpsc::Sender<RuntimeCommand>,
     event_receiver: Arc<Mutex<mpsc::Receiver<UiEvent>>>,
-    snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    ui_state: RuntimeUiState,
     ready: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
 }
@@ -199,7 +228,8 @@ impl RuntimeHandle {
         self.ready.load(Ordering::Acquire)
     }
     pub fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshot
+        self.ui_state
+            .snapshot
             .read()
             .map(|value| value.clone())
             .unwrap_or_default()
@@ -207,13 +237,28 @@ impl RuntimeHandle {
     pub fn try_event(&self) -> Option<UiEvent> {
         self.event_receiver.lock().ok()?.try_recv().ok()
     }
+    pub fn install_ui_notifier(&self, notifier: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut target) = self.ui_state.notifier.lock() {
+            *target = Some(Arc::new(notifier));
+        }
+        self.ui_state.notify();
+    }
+    pub fn remove_ui_notifier(&self) {
+        if let Ok(mut target) = self.ui_state.notifier.lock() {
+            *target = None;
+        }
+    }
     pub fn complete_delivery(&self, delivery: &ReminderDelivery) -> Result<()> {
         self.ensure_ready()?;
-        self.database.complete_delivery(delivery, "slint+tray")
+        self.database.complete_delivery(delivery, "slint+tray")?;
+        self.wake();
+        Ok(())
     }
     pub fn fail_delivery(&self, delivery: &ReminderDelivery, error: &str) -> Result<()> {
         self.ensure_ready()?;
-        self.database.fail_delivery(delivery.outbox_id, error)
+        self.database.fail_delivery(delivery.outbox_id, error)?;
+        self.wake();
+        Ok(())
     }
     pub fn settings(&self) -> Result<AppSettings> {
         self.ensure_ready()?;
@@ -223,6 +268,7 @@ impl RuntimeHandle {
         self.ensure_ready()?;
         self.database.save_settings(settings)?;
         self.database.replan_all()?;
+        self.wake();
         Ok(())
     }
     pub fn reserve_secondary_notification_test(
@@ -350,14 +396,14 @@ where
     let database = Database::new(&data_root);
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
-    let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
+    let ui_state = RuntimeUiState::new();
     let ready = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::new(AtomicBool::new(false));
     let handle = RuntimeHandle {
         database: database.clone(),
         command_sender,
         event_receiver: Arc::new(Mutex::new(event_receiver)),
-        snapshot: Arc::clone(&snapshot),
+        ui_state: ui_state.clone(),
         ready: Arc::clone(&ready),
         stop_requested: Arc::clone(&stop_requested),
     };
@@ -366,7 +412,7 @@ where
         .spawn(move || {
             if let Err(error) = initialize(&database, &data_root) {
                 crate::operations::log("ERROR", &format!("本地数据库初始化失败：{error:#}"));
-                update_snapshot(&snapshot, |value| {
+                update_snapshot(&ui_state, |value| {
                     value.is_synchronizing = false;
                     value.status_text = "本地数据库初始化失败，请查看日志".into();
                     value.health_text = "后台提醒服务未启动".into();
@@ -376,7 +422,7 @@ where
                 return;
             }
             ready.store(true, Ordering::Release);
-            update_snapshot(&snapshot, |value| {
+            update_snapshot(&ui_state, |value| {
                 value.is_synchronizing = false;
                 value.status_text = "本地数据已就绪，正在启动后台提醒服务…".into();
             });
@@ -389,10 +435,10 @@ where
                 startup_sync,
                 command_receiver,
                 event_sender,
-                snapshot.clone(),
+                ui_state.clone(),
             ) {
                 crate::operations::log("ERROR", &format!("后台运行时异常：{error:#}"));
-                update_snapshot(&snapshot, |value| {
+                update_snapshot(&ui_state, |value| {
                     value.is_synchronizing = false;
                     value.status_text = "后台运行时异常，继续使用本地数据".into();
                     value.last_error = Some(format!("{error:#}"));
@@ -408,161 +454,253 @@ fn run_loop(
     startup_sync: bool,
     commands: mpsc::Receiver<RuntimeCommand>,
     events: mpsc::Sender<UiEvent>,
-    snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    ui_state: RuntimeUiState,
 ) -> Result<()> {
     let client = network::client()?;
-    let initial_schedule = automatic_sync_schedule(&database, now_china());
-    let mut next_sync = if startup_sync {
-        Instant::now()
-    } else {
-        schedule_instant(&initial_schedule, now_china())
-    };
-    let mut next_sync_reason = initial_schedule.reason;
-    let mut next_delivery = Instant::now();
-    let mut next_lifecycle = Instant::now();
-    let mut next_health_summary = Instant::now();
-    let mut next_heartbeat = Instant::now();
-    let mut next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
-    let mut next_clock = Instant::now();
-    let mut next_maintenance = Instant::now();
-    let mut last_health_date = None;
     let mut requested_reason = startup_sync.then(|| "程序启动".to_owned());
-    refresh_snapshot(&database, &snapshot);
+    let mut forced_sync_retry = None::<ChinaDateTime>;
+    let mut last_health_date = database
+        .health_summary_sent_on(now_china().date_naive())
+        .ok()
+        .filter(|sent| *sent)
+        .map(|_| now_china().date_naive());
+    let mut last_maintenance_date = None::<NaiveDate>;
+    let initial_now = now_china();
+    let initial_schedule = automatic_sync_schedule(&database, initial_now);
+    let mut automatic_sync_not_before = (!startup_sync && initial_schedule.due_at <= initial_now)
+        .then(|| next_workday_at(initial_now.date_naive(), DAILY_DISCOVERY_HOUR));
+    let mut refresh_requested = true;
 
     loop {
-        let now = Instant::now();
-        if now >= next_sync || requested_reason.is_some() {
+        let now = now_china();
+        let lifecycle_due = database.next_lifecycle_transition_at(now)?;
+        if lifecycle_due.is_some_and(|due_at| due_at <= now) {
+            if database.refresh_lifecycle()? {
+                refresh_requested = true;
+            }
+        }
+
+        let local_delivery_due = database.next_local_delivery_at()?;
+        let secondary_delivery_due = database.next_secondary_delivery_at(now)?;
+        if local_delivery_due.is_some_and(|due_at| due_at <= now)
+            || secondary_delivery_due.is_some_and(|due_at| due_at <= now)
+        {
+            if run_delivery_cycle(&database, &events, &ui_state, &data_root)? {
+                refresh_requested = true;
+            }
+        }
+
+        let settings = database.settings().unwrap_or_default();
+        let mut sync_schedule = automatic_sync_schedule(&database, now);
+        apply_sync_not_before(&mut sync_schedule, automatic_sync_not_before);
+        if let Some(retry_at) = forced_sync_retry {
+            sync_schedule = AutomaticSyncSchedule {
+                due_at: retry_at,
+                reason: "上次同步异常后的必要重试".into(),
+            };
+        }
+        if requested_reason.is_some() || sync_schedule.due_at <= now {
             let reason = requested_reason
                 .take()
-                .unwrap_or_else(|| next_sync_reason.clone());
-            if let Err(error) = synchronize(&database, &client, &snapshot, &reason) {
-                let message = format!("{error:#}");
-                operations::log("ERROR", &format!("同步失败（{reason}）：{message}"));
-                update_snapshot(&snapshot, |value| {
-                    value.is_synchronizing = false;
-                    value.status_text = "同步失败，继续使用 SQLite 缓存".into();
-                    value.last_sync_text = now_china().format("%Y-%m-%d %H:%M").to_string();
-                    value.last_sync_succeeded = Some(false);
-                    value.last_error = Some(message.clone());
-                });
+                .unwrap_or_else(|| sync_schedule.reason.clone());
+            match synchronize(&database, &client, &ui_state, &reason) {
+                Ok(()) => forced_sync_retry = None,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    operations::log("ERROR", &format!("同步失败（{reason}）：{message}"));
+                    update_snapshot(&ui_state, |value| {
+                        value.is_synchronizing = false;
+                        value.status_text = "同步失败，继续使用 SQLite 缓存".into();
+                        value.last_sync_text = now_china().format("%Y-%m-%d %H:%M").to_string();
+                        value.last_sync_succeeded = Some(false);
+                        value.last_error = Some(message.clone());
+                    });
+                    let retry_minutes = settings
+                        .normal_sync_minutes
+                        .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES)
+                        as i64;
+                    forced_sync_retry =
+                        Some(now_china() + chrono::Duration::minutes(retry_minutes));
+                }
             }
-            let schedule = automatic_sync_schedule(&database, now_china());
-            next_sync = schedule_instant(&schedule, now_china());
-            next_sync_reason = schedule.reason;
-            refresh_snapshot(&database, &snapshot);
+            automatic_sync_not_before = None;
+            let (clock_state, clock_text) = check_clock(&client, "同步后的时间校验");
+            update_snapshot(&ui_state, |value| {
+                value.clock_state = clock_state;
+                value.clock_text = clock_text;
+            });
+            refresh_snapshot(&database, &ui_state);
             #[cfg(windows)]
             crate::windows_integration::trim_working_set();
         }
-        if Instant::now() >= next_delivery {
-            let _ = run_delivery_cycle(&database, &events, &data_root);
-            next_delivery = Instant::now() + DELIVERY_INTERVAL;
-        }
 
-        if Instant::now() >= next_lifecycle {
-            if database.refresh_lifecycle().unwrap_or(false) {
-                next_snapshot = Instant::now();
-            }
-            next_lifecycle = Instant::now() + LIFECYCLE_INTERVAL;
-        }
-
-        if Instant::now() >= next_health_summary {
-            let china_now = now_china();
-            if last_health_date != Some(china_now.date_naive())
-                && let Ok(settings) = database.settings()
-                && settings.daily_health_summary_enabled
-            {
-                match database.try_mark_health_summary_due(china_now) {
-                    Ok(should_send) => {
-                        if should_send && let Ok((state, text)) = database.health_text() {
-                            let _ = events.send(UiEvent::Health { state, text });
-                        }
-                        if china_now.time() >= crate::model::time(8, 0) {
-                            last_health_date = Some(china_now.date_naive());
-                        }
-                    }
-                    Err(error) => operations::log(
-                        "ERROR",
-                        &format!("每日健康摘要去重状态写入失败：{error:#}"),
-                    ),
+        let summary_now = now_china();
+        let summary_settings = database.settings().unwrap_or_default();
+        let visible_snapshot = ui_state
+            .snapshot
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let health_due = next_health_summary_at(
+            &summary_settings,
+            &visible_snapshot,
+            last_health_date,
+            summary_now,
+        );
+        if health_due.is_some_and(|due_at| due_at <= summary_now) {
+            last_health_date = Some(summary_now.date_naive());
+            if let Ok(details) = database.health_details() {
+                let should_send = details.today_task_count > 0
+                    || matches!(
+                        details.overall_state,
+                        HealthState::Warning | HealthState::Failed
+                    );
+                if should_send
+                    && database
+                        .try_mark_health_summary_sent(summary_now.date_naive(), summary_now)?
+                    && let Ok((state, text)) = database.health_text()
+                {
+                    send_ui_event(&events, &ui_state, UiEvent::Health { state, text })?;
                 }
             }
-            next_health_summary = Instant::now() + HEALTH_SUMMARY_INTERVAL;
         }
 
-        if Instant::now() >= next_heartbeat {
-            let _ = database.touch_runtime_heartbeats(now_china());
-            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        }
-
-        if Instant::now() >= next_snapshot {
-            refresh_snapshot(&database, &snapshot);
-            next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
-        }
-
-        if Instant::now() >= next_maintenance {
+        let maintenance_now = now_china();
+        if next_maintenance_at(maintenance_now, last_maintenance_date) <= maintenance_now {
             run_daily_maintenance(&database, &data_root);
-            next_maintenance = Instant::now() + Duration::from_secs(60 * 60);
+            last_maintenance_date = Some(maintenance_now.date_naive());
         }
 
-        if Instant::now() >= next_clock {
-            let (state, text) = check_clock(&client, "周期或恢复检查");
-            update_snapshot(&snapshot, |value| {
-                value.clock_state = state;
-                value.clock_text = text;
-            });
-            next_clock = Instant::now() + CLOCK_CHECK_INTERVAL;
+        if refresh_requested {
+            refresh_snapshot(&database, &ui_state);
+            refresh_requested = false;
         }
 
-        let wait = next_sync
-            .min(next_delivery)
-            .min(next_lifecycle)
-            .min(next_health_summary)
-            .min(next_heartbeat)
-            .min(next_snapshot)
-            .min(next_clock)
-            .min(next_maintenance)
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(10));
+        let now = now_china();
+        let mut next_sync = automatic_sync_schedule(&database, now);
+        apply_sync_not_before(&mut next_sync, automatic_sync_not_before);
+        if let Some(retry_at) = forced_sync_retry {
+            next_sync = AutomaticSyncSchedule {
+                due_at: retry_at,
+                reason: "上次同步异常后的必要重试".into(),
+            };
+        }
+        let settings = database.settings().unwrap_or_default();
+        let visible_snapshot = ui_state
+            .snapshot
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let mut deadline = WakeDeadline::new(next_sync.due_at, next_sync.reason);
+        deadline.consider(database.next_local_delivery_at()?, "本地提醒到期");
+        deadline.consider(
+            database.next_secondary_delivery_at(now)?,
+            "第二通知通道到期或重试",
+        );
+        deadline.consider(
+            database.next_lifecycle_transition_at(now)?,
+            "任务生命周期切换",
+        );
+        deadline.consider(
+            next_health_summary_at(&settings, &visible_snapshot, last_health_date, now),
+            "每日健康摘要",
+        );
+        deadline.consider(
+            Some(next_maintenance_at(now, last_maintenance_date)),
+            "工作日数据库维护",
+        );
+        update_snapshot(&ui_state, |value| {
+            value.next_wake_text = format!(
+                "后台正常休眠 · 下一次唤醒 {}（{}）",
+                deadline.at.format("%Y-%m-%d %H:%M:%S"),
+                deadline.reason
+            );
+        });
+        let wait = duration_until(deadline.at, now);
         match commands.recv_timeout(wait) {
             Ok(RuntimeCommand::Sync(reason)) => {
                 requested_reason = Some(reason);
                 while let Ok(command) = commands.try_recv() {
                     match command {
                         RuntimeCommand::Sync(reason) => requested_reason = Some(reason),
-                        RuntimeCommand::Wake => {
-                            next_delivery = Instant::now();
-                            next_lifecycle = Instant::now();
-                            next_snapshot = Instant::now();
-                        }
-                        RuntimeCommand::Recovery => {
-                            next_delivery = Instant::now();
-                            next_lifecycle = Instant::now();
-                            next_health_summary = Instant::now();
-                            next_heartbeat = Instant::now();
-                            next_snapshot = Instant::now();
-                            next_clock = Instant::now();
-                        }
+                        RuntimeCommand::Wake | RuntimeCommand::Recovery => refresh_requested = true,
                         RuntimeCommand::Stop => return Ok(()),
                     }
                 }
             }
-            Ok(RuntimeCommand::Wake) => {
-                next_delivery = Instant::now();
-                next_lifecycle = Instant::now();
-                next_snapshot = Instant::now();
-            }
-            Ok(RuntimeCommand::Recovery) => {
-                next_delivery = Instant::now();
-                next_lifecycle = Instant::now();
-                next_health_summary = Instant::now();
-                next_heartbeat = Instant::now();
-                next_snapshot = Instant::now();
-                next_clock = Instant::now();
-            }
+            Ok(RuntimeCommand::Wake) | Ok(RuntimeCommand::Recovery) => refresh_requested = true,
             Ok(RuntimeCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+fn apply_sync_not_before(schedule: &mut AutomaticSyncSchedule, not_before: Option<ChinaDateTime>) {
+    if let Some(not_before) = not_before
+        && schedule.due_at < not_before
+    {
+        schedule.due_at = not_before;
+        schedule.reason = "已跳过本次启动同步，等待下一个工作日核验".into();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WakeDeadline {
+    at: ChinaDateTime,
+    reason: String,
+}
+
+impl WakeDeadline {
+    fn new(at: ChinaDateTime, reason: String) -> Self {
+        Self { at, reason }
+    }
+
+    fn consider(&mut self, candidate: Option<ChinaDateTime>, reason: &str) {
+        if let Some(candidate) = candidate
+            && candidate < self.at
+        {
+            self.at = candidate;
+            self.reason = reason.to_owned();
+        }
+    }
+}
+
+fn duration_until(deadline: ChinaDateTime, now: ChinaDateTime) -> Duration {
+    Duration::from_millis((deadline - now).num_milliseconds().max(0) as u64)
+}
+
+fn send_ui_event(
+    events: &mpsc::Sender<UiEvent>,
+    ui_state: &RuntimeUiState,
+    event: UiEvent,
+) -> std::result::Result<(), mpsc::SendError<UiEvent>> {
+    events.send(event)?;
+    ui_state.notify();
+    Ok(())
+}
+
+fn next_health_summary_at(
+    settings: &AppSettings,
+    snapshot: &RuntimeSnapshot,
+    last_health_date: Option<NaiveDate>,
+    now: ChinaDateTime,
+) -> Option<ChinaDateTime> {
+    if !settings.daily_health_summary_enabled
+        || last_health_date == Some(now.date_naive())
+        || (snapshot.today_count == 0
+            && !matches!(
+                snapshot.health_state,
+                HealthState::Warning | HealthState::Failed
+            ))
+    {
+        return None;
+    }
+    let today = now.date_naive();
+    if !is_workday(today) && snapshot.today_count == 0 {
+        return None;
+    }
+    let anchor = at(today, crate::model::time(8, 0));
+    Some(anchor.max(now))
 }
 
 #[cfg(test)]
@@ -578,24 +716,24 @@ fn automatic_sync_interval_for(settings: &AppSettings, active_day: bool) -> Dura
 
 fn automatic_sync_schedule(database: &Database, now: ChinaDateTime) -> AutomaticSyncSchedule {
     let settings = database.settings().unwrap_or_default();
-    let active_day = has_active_sync_tasks(database, &settings);
+    let active_day = has_active_sync_tasks(database, &settings, now.date_naive());
     let has_tomorrow_event = has_sync_relevant_events_on(
         database,
         &settings,
         now.date_naive() + chrono::Duration::days(1),
     );
-    let last_sync = database
-        .latest_sync_conclusion()
-        .ok()
-        .flatten()
-        .map(|conclusion| conclusion.finished_at);
+    let needs_follow_up_discovery = has_unknown_follow_up_events(database, &settings, now);
+    let last_sync = database.latest_sync_conclusion().ok().flatten();
+    let next_source_retry = database.next_source_retry_at().ok().flatten();
     let identity = database.path().to_string_lossy();
     automatic_sync_schedule_for(
         &settings,
         now,
         active_day,
         has_tomorrow_event,
-        last_sync,
+        needs_follow_up_discovery,
+        last_sync.as_ref(),
+        next_source_retry,
         &identity,
     )
 }
@@ -605,38 +743,68 @@ fn automatic_sync_schedule_for(
     now: ChinaDateTime,
     active_day: bool,
     has_tomorrow_event: bool,
-    last_sync: Option<ChinaDateTime>,
+    needs_follow_up_discovery: bool,
+    last_sync: Option<&SyncConclusion>,
+    next_source_retry: Option<ChinaDateTime>,
     jitter_identity: &str,
 ) -> AutomaticSyncSchedule {
-    let minutes = if active_day {
-        settings.active_day_sync_minutes
+    let last_finished = last_sync.map(|value| value.finished_at);
+    let last_is_healthy = last_sync.is_some_and(|value| value.kind.is_healthy());
+    let mut schedule = if active_day {
+        let minutes = settings
+            .active_day_sync_minutes
+            .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES);
+        let jitter_seconds = sync_jitter_seconds(jitter_identity, now, true);
+        let base = last_finished
+            .filter(|last| *last <= now)
+            .unwrap_or(now - chrono::Duration::minutes(minutes as i64));
+        let due_at = normalize_sync_window(
+            (base
+                + chrono::Duration::minutes(minutes as i64)
+                + chrono::Duration::seconds(jitter_seconds))
+            .max(now),
+            true,
+        );
+        AutomaticSyncSchedule {
+            due_at,
+            reason: format!("申购日必要同步（{minutes} 分钟间隔）"),
+        }
+    } else if last_sync.is_some() && !last_is_healthy {
+        let minutes = settings
+            .normal_sync_minutes
+            .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES);
+        let jitter_seconds = sync_jitter_seconds(jitter_identity, now, false);
+        let interval_due = last_finished.filter(|last| *last <= now).unwrap_or(now)
+            + chrono::Duration::minutes(minutes as i64)
+            + chrono::Duration::seconds(jitter_seconds);
+        let retry_due = next_source_retry
+            .map(|value| value.min(interval_due))
+            .unwrap_or(interval_due)
+            .max(now);
+        AutomaticSyncSchedule {
+            due_at: normalize_sync_window(retry_due, has_tomorrow_event),
+            reason: "来源覆盖未恢复，按退避执行必要重试".into(),
+        }
     } else {
-        settings.normal_sync_minutes
-    }
-    .clamp(MINIMUM_SYNC_MINUTES, MAXIMUM_SYNC_MINUTES);
-    let interval_text = if minutes % 60 == 0 {
-        format!("每 {} 小时", minutes / 60)
-    } else {
-        format!("每 {minutes} 分钟")
-    };
-    let jitter_seconds = sync_jitter_seconds(jitter_identity, now, active_day);
-    let interval_due = normalize_sync_window(
-        now + chrono::Duration::minutes(minutes as i64) + chrono::Duration::seconds(jitter_seconds),
-    );
-    let mut schedule = AutomaticSyncSchedule {
-        due_at: interval_due,
-        reason: if active_day {
-            format!("申购日自动同步（{interval_text}，抖动 {jitter_seconds} 秒）")
-        } else {
-            format!("常规自动同步（{interval_text}，抖动 {jitter_seconds} 秒）")
-        },
+        let due_at = next_discovery_sync_at(now, last_finished);
+        AutomaticSyncSchedule {
+            due_at,
+            reason: if needs_follow_up_discovery {
+                "工作日发现同步（补齐中签、缴款或上市日期）".into()
+            } else if last_sync.is_some_and(|value| value.kind == SyncConclusionKind::HealthyEmpty)
+            {
+                "健康空结果后的下一个工作日核验".into()
+            } else {
+                "工作日一次发现同步".into()
+            },
+        }
     };
 
     if active_day {
         consider_fixed_sync(
             &mut schedule,
             now,
-            last_sync,
+            last_finished,
             at(now.date_naive(), crate::model::time(8, 0)),
             "申购日 08:00 定点跨源核验",
         );
@@ -645,7 +813,7 @@ fn automatic_sync_schedule_for(
         consider_fixed_sync(
             &mut schedule,
             now,
-            last_sync,
+            last_finished,
             at(now.date_naive(), crate::model::time(20, 0)),
             "申购日前一日 20:00 定点跨源核验",
         );
@@ -674,8 +842,8 @@ fn consider_fixed_sync(
     }
 }
 
-fn normalize_sync_window(value: ChinaDateTime) -> ChinaDateTime {
-    if value.hour() < SYNC_WINDOW_START_HOUR {
+fn normalize_sync_window(value: ChinaDateTime, allow_weekend: bool) -> ChinaDateTime {
+    let mut normalized = if value.hour() < SYNC_WINDOW_START_HOUR {
         at(
             value.date_naive(),
             crate::model::time(SYNC_WINDOW_START_HOUR, 0),
@@ -687,7 +855,11 @@ fn normalize_sync_window(value: ChinaDateTime) -> ChinaDateTime {
         )
     } else {
         value
+    };
+    if !allow_weekend && !is_workday(normalized.date_naive()) {
+        normalized = next_workday_at(normalized.date_naive(), SYNC_WINDOW_START_HOUR);
     }
+    normalized
 }
 
 fn sync_jitter_seconds(identity: &str, now: ChinaDateTime, active_day: bool) -> i64 {
@@ -702,13 +874,45 @@ fn sync_jitter_seconds(identity: &str, now: ChinaDateTime, active_day: bool) -> 
     (value % (maximum + 1)) as i64
 }
 
-fn schedule_instant(schedule: &AutomaticSyncSchedule, now: ChinaDateTime) -> Instant {
-    let milliseconds = (schedule.due_at - now).num_milliseconds().max(0) as u64;
-    Instant::now() + Duration::from_millis(milliseconds)
+fn next_discovery_sync_at(now: ChinaDateTime, last_sync: Option<ChinaDateTime>) -> ChinaDateTime {
+    let today = now.date_naive();
+    let today_anchor = at(today, crate::model::time(DAILY_DISCOVERY_HOUR, 0));
+    if is_workday(today) && last_sync.is_none_or(|last| last.date_naive() < today) {
+        return today_anchor.max(now);
+    }
+    next_workday_at(today, DAILY_DISCOVERY_HOUR)
 }
 
-fn has_active_sync_tasks(database: &Database, settings: &AppSettings) -> bool {
-    has_sync_relevant_events_on(database, settings, now_china().date_naive())
+fn next_workday_at(date: NaiveDate, hour: u32) -> ChinaDateTime {
+    next_workday_at_time(date, crate::model::time(hour, 0))
+}
+
+fn next_workday_at_time(date: NaiveDate, time: chrono::NaiveTime) -> ChinaDateTime {
+    let mut candidate = date + chrono::Duration::days(1);
+    while !is_workday(candidate) {
+        candidate += chrono::Duration::days(1);
+    }
+    at(candidate, time)
+}
+
+fn is_workday(date: NaiveDate) -> bool {
+    !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+}
+
+fn next_maintenance_at(
+    now: ChinaDateTime,
+    last_maintenance_date: Option<NaiveDate>,
+) -> ChinaDateTime {
+    let today = now.date_naive();
+    let time = crate::model::time(DAILY_MAINTENANCE_HOUR, DAILY_MAINTENANCE_MINUTE);
+    if is_workday(today) && last_maintenance_date != Some(today) {
+        return at(today, time).max(now);
+    }
+    next_workday_at_time(today, time)
+}
+
+fn has_active_sync_tasks(database: &Database, settings: &AppSettings, date: NaiveDate) -> bool {
+    has_sync_relevant_events_on(database, settings, date)
 }
 
 fn has_sync_relevant_events_on(
@@ -724,20 +928,49 @@ fn has_sync_relevant_events_on(
                     LifecycleStatus::Discovered
                         | LifecycleStatus::Scheduled
                         | LifecycleStatus::ActiveUnconfirmed
-                        | LifecycleStatus::Acknowledged
                         | LifecycleStatus::AcknowledgedNeedsReview
                 )
         })
     })
 }
 
+fn has_unknown_follow_up_events(
+    database: &Database,
+    settings: &AppSettings,
+    now: ChinaDateTime,
+) -> bool {
+    database
+        .events(
+            now.date_naive() - chrono::Duration::days(90),
+            now.date_naive(),
+        )
+        .is_ok_and(|events| {
+            events.into_iter().any(|event| {
+                if !settings.exchange_enabled(event.exchange)
+                    || event.lifecycle_status != LifecycleStatus::Acknowledged
+                {
+                    return false;
+                }
+                let Some(apply_date) = event.apply_date else {
+                    return false;
+                };
+                let post_apply_missing = settings.post_apply_reminders_enabled
+                    && apply_date >= now.date_naive() - chrono::Duration::days(30)
+                    && (event.ballot_date.is_none() || event.payment_date.is_none());
+                let listing_missing =
+                    settings.listing_reminders_enabled && event.listing_date.is_none();
+                post_apply_missing || listing_missing
+            })
+        })
+}
+
 fn synchronize(
     database: &Database,
     client: &reqwest::blocking::Client,
-    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
+    ui_state: &RuntimeUiState,
     reason: &str,
 ) -> Result<()> {
-    update_snapshot(snapshot, |value| {
+    update_snapshot(ui_state, |value| {
         value.is_synchronizing = true;
         value.status_text = format!("正在同步：{reason}");
         value.last_error = None;
@@ -842,7 +1075,7 @@ fn synchronize(
             &missing_sources,
         );
         let message = format!("{reason_text}；{}", conclusion.summary);
-        update_snapshot(snapshot, |value| {
+        update_snapshot(ui_state, |value| {
             value.is_synchronizing = false;
             value.status_text = format!("{message}，继续使用 SQLite 缓存");
             value.last_sync_text = now_china().format("%Y-%m-%d %H:%M").to_string();
@@ -1021,7 +1254,7 @@ fn synchronize(
         &missing_sources,
     );
     database.save_sync_conclusion(&conclusion)?;
-    update_snapshot(snapshot, |value| {
+    update_snapshot(ui_state, |value| {
         value.is_synchronizing = false;
         value.status_text = conclusion.summary.clone();
         value.last_sync_text = now_china().format("%Y-%m-%d %H:%M").to_string();
@@ -1180,15 +1413,19 @@ fn should_check_announcements(event: &IpoEvent) -> bool {
 fn run_delivery_cycle(
     database: &Database,
     events: &mpsc::Sender<UiEvent>,
+    ui_state: &RuntimeUiState,
     data_root: &Path,
-) -> Result<()> {
-    for delivery in database.claim_due(20)? {
-        if let Err(error) = events.send(UiEvent::Reminder(delivery.clone())) {
+) -> Result<bool> {
+    let local = database.claim_due(20)?;
+    let mut did_work = !local.is_empty();
+    for delivery in local {
+        if let Err(error) = send_ui_event(events, ui_state, UiEvent::Reminder(delivery.clone())) {
             database.fail_delivery(delivery.outbox_id, &error.to_string())?;
         }
     }
     let secondary = database.claim_secondary_due(20)?;
     if !secondary.is_empty() {
+        did_work = true;
         match secondary_notification::send_batch(data_root, &secondary) {
             Ok(receipt) => {
                 database.complete_secondary_deliveries(
@@ -1204,40 +1441,74 @@ fn run_delivery_cycle(
             }
         }
     }
-    Ok(())
+    Ok(did_work)
 }
 
 fn run_daily_maintenance(database: &Database, data_root: &Path) {
     let backup_directory = data_root.join("backups");
     let today = now_china().date_naive();
-    if fs_needs_daily_backup(&backup_directory, today) {
-        match database.backup(&backup_directory) {
-            Ok(path) => {
-                retain_latest_backups(&backup_directory, 7, Some(&path));
-                if let Err(error) =
-                    database.save_operation_health("database-backup", HealthState::Healthy, None)
-                {
-                    operations::log("ERROR", &format!("SQLite 备份健康状态写入失败：{error:#}"));
-                }
-                operations::log("INFO", &format!("每日 SQLite 备份完成：{}", path.display()));
-            }
-            Err(error) => {
-                let message = format!("{error:#}");
-                let _ = database.save_operation_health(
-                    "database-backup",
-                    HealthState::Failed,
-                    Some(&message),
-                );
-                operations::log("ERROR", &format!("每日 SQLite 备份失败：{message}"));
+    let fingerprint = database.business_state_fingerprint();
+    match fingerprint {
+        Ok(Some(fingerprint)) if fs_needs_daily_backup(&backup_directory, today) => {
+            match latest_managed_backup_fingerprint(&backup_directory) {
+                Ok(Some(previous)) if previous == fingerprint => {}
+                Ok(_) => match database.backup(&backup_directory) {
+                    Ok(path) => {
+                        if let Err(error) = write_backup_fingerprint(&path, &fingerprint) {
+                            operations::log("WARN", &format!("SQLite 备份指纹写入失败：{error:#}"));
+                        }
+                        retain_latest_backups(
+                            &backup_directory,
+                            MANAGED_BACKUP_LIMIT,
+                            MANAGED_BACKUP_MAX_BYTES,
+                            Some(&path),
+                        );
+                        if let Err(error) = database.save_operation_health(
+                            "database-backup",
+                            HealthState::Healthy,
+                            None,
+                        ) {
+                            operations::log(
+                                "ERROR",
+                                &format!("SQLite 备份健康状态写入失败：{error:#}"),
+                            );
+                        }
+                        operations::log(
+                            "INFO",
+                            &format!("业务数据变化后的 SQLite 备份完成：{}", path.display()),
+                        );
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let _ = database.save_operation_health(
+                            "database-backup",
+                            HealthState::Failed,
+                            Some(&message),
+                        );
+                        operations::log("ERROR", &format!("SQLite 备份失败：{message}"));
+                    }
+                },
+                Err(error) => operations::log(
+                    "WARN",
+                    &format!("读取 SQLite 备份指纹失败，将跳过自动备份：{error:#}"),
+                ),
             }
         }
+        Ok(_) => {}
+        Err(error) => operations::log(
+            "WARN",
+            &format!("计算 SQLite 业务数据指纹失败，将跳过自动备份：{error:#}"),
+        ),
     }
     match database.maintenance(data_root) {
-        Ok(()) => {
+        Ok(changed) => {
             if let Err(error) =
                 database.save_operation_health("database-maintenance", HealthState::Healthy, None)
             {
                 operations::log("ERROR", &format!("数据库维护健康状态写入失败：{error:#}"));
+            }
+            if changed {
+                operations::log("INFO", "本地数据库与临时文件保留策略已完成清理");
             }
         }
         Err(error) => {
@@ -1375,13 +1646,13 @@ fn add_windows_time_status(
     }
 }
 
-fn refresh_snapshot(database: &Database, snapshot: &Arc<RwLock<RuntimeSnapshot>>) {
+fn refresh_snapshot(database: &Database, ui_state: &RuntimeUiState) {
     let events = database.today_events().unwrap_or_default();
     let pending = database.pending_count().unwrap_or_default();
     let health = database
         .health_text()
         .unwrap_or_else(|error| (HealthState::Failed, format!("健康状态读取失败：{error}")));
-    update_snapshot(snapshot, |value| {
+    update_snapshot(ui_state, |value| {
         value.today_count = events.len();
         value.pending_count = pending;
         value.health_state = health.0;
@@ -1392,18 +1663,20 @@ fn refresh_snapshot(database: &Database, snapshot: &Arc<RwLock<RuntimeSnapshot>>
     });
 }
 
-fn update_snapshot(
-    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
-    update: impl FnOnce(&mut RuntimeSnapshot),
-) {
-    if let Ok(mut value) = snapshot.write() {
+fn update_snapshot(ui_state: &RuntimeUiState, update: impl FnOnce(&mut RuntimeSnapshot)) {
+    let mut changed = false;
+    if let Ok(mut value) = ui_state.snapshot.write() {
         let previous = value.clone();
         let revision = value.revision;
         update(&mut value);
         value.revision = revision;
         if *value != previous {
             value.revision = revision.wrapping_add(1);
+            changed = true;
         }
+    }
+    if changed {
+        ui_state.notify();
     }
 }
 
@@ -1417,22 +1690,88 @@ fn fs_needs_daily_backup(directory: &Path, date: chrono::NaiveDate) -> bool {
         .all(|entry| !entry.file_name().to_string_lossy().starts_with(&prefix))
 }
 
-fn retain_latest_backups(directory: &Path, count: usize, preserve: Option<&Path>) {
+fn retain_latest_backups(
+    directory: &Path,
+    count: usize,
+    maximum_bytes: u64,
+    preserve: Option<&Path>,
+) {
     let mut paths: Vec<_> = std::fs::read_dir(directory)
         .ok()
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|value| value == "db"))
+        .filter(|path| is_managed_daily_backup(path))
         .collect();
     paths.sort();
-    let remove_count = paths.len().saturating_sub(count);
-    for path in paths.into_iter().take(remove_count) {
-        if preserve != Some(path.as_path()) {
-            let _ = std::fs::remove_file(path);
+    let mut total_bytes = paths
+        .iter()
+        .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+        .sum::<u64>();
+    while paths.len() > count || total_bytes > maximum_bytes {
+        let Some(index) = paths
+            .iter()
+            .position(|path| preserve != Some(path.as_path()))
+        else {
+            break;
+        };
+        let path = paths.remove(index);
+        let length = path
+            .metadata()
+            .ok()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(length);
+            let _ = std::fs::remove_file(backup_fingerprint_path(&path));
         }
     }
+}
+
+fn is_managed_daily_backup(path: &Path) -> bool {
+    path.extension().is_some_and(|value| value == "db")
+        && path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                value
+                    .strip_prefix("stock-ipo-reminder-")
+                    .is_some_and(|suffix| suffix.len() == 19 && suffix.as_bytes()[8] == b'-')
+            })
+        && backup_fingerprint_path(path).is_file()
+}
+
+fn backup_fingerprint_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.fingerprint", path.display()))
+}
+
+fn write_backup_fingerprint(path: &Path, fingerprint: &str) -> Result<()> {
+    let target = backup_fingerprint_path(path);
+    let temporary = PathBuf::from(format!("{}.tmp", target.display()));
+    std::fs::write(&temporary, fingerprint.as_bytes())?;
+    operations::atomic_replace_file(&temporary, &target)
+}
+
+fn latest_managed_backup_fingerprint(directory: &Path) -> Result<Option<String>> {
+    let latest = std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_managed_daily_backup(path))
+        .max();
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let fingerprint_path = backup_fingerprint_path(&latest);
+    if !fingerprint_path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(
+        std::fs::read_to_string(fingerprint_path)?.trim().to_owned(),
+    ))
 }
 
 #[cfg(test)]
@@ -1441,7 +1780,53 @@ mod tests {
     use crate::model::{
         AnnouncementRef, Board, DataQualityStatus, Exchange, IssueStatus, LifecycleStatus,
     };
+    use std::time::Instant;
     use uuid::Uuid;
+
+    fn sync_at(kind: SyncConclusionKind, finished_at: ChinaDateTime) -> SyncConclusion {
+        SyncConclusion {
+            kind,
+            started_at: finished_at - chrono::Duration::seconds(1),
+            finished_at,
+            today_count: usize::from(kind == SyncConclusionKind::HealthyNonempty),
+            event_count: 0,
+            announcement_count: 0,
+            successful_sources: Vec::new(),
+            missing_sources: Vec::new(),
+            summary: "fixture".into(),
+        }
+    }
+
+    fn event_at(now: ChinaDateTime, lifecycle_status: LifecycleStatus) -> IpoEvent {
+        IpoEvent {
+            id: "shanghai:601001".into(),
+            exchange: Exchange::Shanghai,
+            board: Board::Main,
+            security_code: "601001".into(),
+            apply_code: Some("780001".into()),
+            legacy_code: None,
+            name: "测试股份".into(),
+            apply_date: Some(now.date_naive()),
+            issue_price: Some(10.0),
+            lot_size: Some(500),
+            max_apply_quantity: Some(10_000),
+            required_market_value: None,
+            required_cash: None,
+            ballot_date: None,
+            payment_date: None,
+            listing_date: None,
+            status: IssueStatus::Active,
+            lifecycle_status,
+            event_version: 1,
+            announcement_url: None,
+            data_quality_status: DataQualityStatus::MultiSourceVerified,
+            data_conflict: false,
+            manual_override_fields: Vec::new(),
+            sessions: Vec::new(),
+            first_seen_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn automatic_sync_uses_the_configured_interval() {
@@ -1473,43 +1858,23 @@ mod tests {
     }
 
     #[test]
-    fn automatic_sync_respects_window_fixed_checks_and_jitter_bounds() {
+    fn automatic_sync_uses_exact_fixed_checks_and_stops_periodic_idle_sync() {
         let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
         let settings = AppSettings::default();
 
-        let before_window = crate::core::at(date, crate::model::time(5, 0));
-        let schedule = automatic_sync_schedule_for(
-            &settings,
-            before_window,
-            false,
-            false,
-            Some(before_window),
-            "fixture-a",
-        );
-        assert_eq!(schedule.due_at.date_naive(), date);
-        assert_eq!(schedule.due_at.hour(), 6);
-
-        let after_window = crate::core::at(date, crate::model::time(22, 5));
-        let schedule = automatic_sync_schedule_for(
-            &settings,
-            after_window,
-            false,
-            false,
-            Some(after_window),
-            "fixture-a",
-        );
-        assert_eq!(
-            schedule.due_at,
-            crate::core::at(date + chrono::Duration::days(1), crate::model::time(6, 0))
-        );
-
         let before_morning_check = crate::core::at(date, crate::model::time(7, 55));
+        let last_sync = sync_at(
+            SyncConclusionKind::HealthyNonempty,
+            crate::core::at(date, crate::model::time(7, 50)),
+        );
         let schedule = automatic_sync_schedule_for(
             &settings,
             before_morning_check,
             true,
             false,
-            Some(crate::core::at(date, crate::model::time(7, 0))),
+            false,
+            Some(&last_sync),
+            None,
             "fixture-a",
         );
         assert_eq!(
@@ -1519,24 +1884,35 @@ mod tests {
         assert!(schedule.reason.contains("08:00"));
 
         let after_missed_check = crate::core::at(date, crate::model::time(8, 5));
+        let old_sync = sync_at(
+            SyncConclusionKind::HealthyNonempty,
+            crate::core::at(date, crate::model::time(7, 0)),
+        );
         let schedule = automatic_sync_schedule_for(
             &settings,
             after_missed_check,
             true,
             false,
-            Some(crate::core::at(date, crate::model::time(7, 0))),
+            false,
+            Some(&old_sync),
+            None,
             "fixture-a",
         );
         assert_eq!(schedule.due_at, after_missed_check);
-        assert!(schedule.reason.starts_with("补做"));
 
         let before_evening_check = crate::core::at(date, crate::model::time(19, 55));
+        let evening_sync = sync_at(
+            SyncConclusionKind::HealthyEmpty,
+            crate::core::at(date, crate::model::time(19, 0)),
+        );
         let schedule = automatic_sync_schedule_for(
             &settings,
             before_evening_check,
             false,
             true,
-            Some(crate::core::at(date, crate::model::time(19, 0))),
+            false,
+            Some(&evening_sync),
+            None,
             "fixture-a",
         );
         assert_eq!(
@@ -1552,6 +1928,159 @@ mod tests {
         assert_eq!(
             normal_jitter,
             sync_jitter_seconds("fixture-a", before_evening_check, false)
+        );
+    }
+
+    #[test]
+    fn healthy_idle_sync_skips_the_rest_of_the_day_and_the_weekend() {
+        let settings = AppSettings::default();
+        let thursday = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let thursday_now = crate::core::at(thursday, crate::model::time(10, 0));
+        let thursday_sync = sync_at(SyncConclusionKind::HealthyEmpty, thursday_now);
+        let schedule = automatic_sync_schedule_for(
+            &settings,
+            thursday_now,
+            false,
+            false,
+            false,
+            Some(&thursday_sync),
+            None,
+            "idle-thursday",
+        );
+        assert_eq!(
+            schedule.due_at,
+            crate::core::at(
+                NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+                crate::model::time(8, 0),
+            )
+        );
+
+        let friday = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let friday_now = crate::core::at(friday, crate::model::time(10, 0));
+        let friday_sync = sync_at(SyncConclusionKind::HealthyEmpty, friday_now);
+        let schedule = automatic_sync_schedule_for(
+            &settings,
+            friday_now,
+            false,
+            false,
+            false,
+            Some(&friday_sync),
+            None,
+            "idle-friday",
+        );
+        assert_eq!(
+            schedule.due_at,
+            crate::core::at(
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+                crate::model::time(8, 0),
+            )
+        );
+    }
+
+    #[test]
+    fn degraded_sync_keeps_a_bounded_retry_deadline() {
+        let settings = AppSettings {
+            normal_sync_minutes: 30,
+            ..AppSettings::default()
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let now = crate::core::at(date, crate::model::time(10, 0));
+        let last = sync_at(
+            SyncConclusionKind::Unknown,
+            crate::core::at(date, crate::model::time(9, 55)),
+        );
+        let retry = crate::core::at(date, crate::model::time(10, 7));
+        let schedule = automatic_sync_schedule_for(
+            &settings,
+            now,
+            false,
+            false,
+            false,
+            Some(&last),
+            Some(retry),
+            "degraded",
+        );
+        assert_eq!(schedule.due_at, retry);
+        assert!(schedule.reason.contains("退避"));
+    }
+
+    #[test]
+    fn skipped_startup_sync_remains_suppressed_after_deadline_recalculation() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let now = crate::core::at(date, crate::model::time(11, 0));
+        let not_before = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+            crate::model::time(8, 0),
+        );
+        let mut first = AutomaticSyncSchedule {
+            due_at: now,
+            reason: "工作日一次发现同步".into(),
+        };
+        apply_sync_not_before(&mut first, Some(not_before));
+        assert_eq!(first.due_at, not_before);
+
+        let mut recalculated = AutomaticSyncSchedule {
+            due_at: now,
+            reason: "工作日一次发现同步".into(),
+        };
+        apply_sync_not_before(&mut recalculated, Some(not_before));
+        assert_eq!(recalculated.due_at, not_before);
+        assert!(recalculated.reason.contains("跳过"));
+    }
+
+    #[test]
+    fn acknowledged_tasks_stop_active_sync_but_unknown_follow_up_dates_are_discovered() {
+        let root = std::env::temp_dir().join(format!(
+            "stock-ipo-sync-state-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = Database::new(&root);
+        database.initialize().unwrap();
+        let settings = AppSettings::default();
+        database.save_settings(&settings).unwrap();
+        let now = now_china();
+        database
+            .upsert_event(event_at(now, LifecycleStatus::Acknowledged))
+            .unwrap();
+
+        assert!(!has_sync_relevant_events_on(
+            &database,
+            &settings,
+            now.date_naive()
+        ));
+        assert!(has_unknown_follow_up_events(&database, &settings, now));
+
+        let mut complete = database.event("shanghai:601001").unwrap().unwrap();
+        complete.ballot_date = Some(now.date_naive() + chrono::Duration::days(1));
+        complete.payment_date = Some(now.date_naive() + chrono::Duration::days(2));
+        complete.listing_date = Some(now.date_naive() + chrono::Duration::days(7));
+        complete.updated_at = now + chrono::Duration::seconds(1);
+        database.upsert_event(complete).unwrap();
+        assert!(!has_unknown_follow_up_events(&database, &settings, now));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deadline_scheduler_prioritizes_real_weekend_reminders_and_overdue_recovery() {
+        let friday = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+            crate::model::time(10, 0),
+        );
+        let monday = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            crate::model::time(8, 0),
+        );
+        let sunday_reminder = crate::core::at(
+            NaiveDate::from_ymd_opt(2026, 8, 30).unwrap(),
+            crate::model::time(20, 0),
+        );
+        let mut deadline = WakeDeadline::new(monday, "工作日发现同步".into());
+        deadline.consider(Some(sunday_reminder), "本地提醒到期");
+        assert_eq!(deadline.at, sunday_reminder);
+        assert_eq!(deadline.reason, "本地提醒到期");
+        assert_eq!(
+            duration_until(friday - chrono::Duration::seconds(1), friday),
+            Duration::ZERO
         );
     }
 
@@ -1646,12 +2175,15 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
         let settings = AppSettings::default();
         let at_window_end = crate::core::at(date, crate::model::time(22, 0));
+        let failed = sync_at(SyncConclusionKind::Unknown, at_window_end);
         let schedule = automatic_sync_schedule_for(
             &settings,
             at_window_end,
             false,
             false,
-            Some(at_window_end),
+            false,
+            Some(&failed),
+            None,
             "cross-day",
         );
         assert_eq!(
@@ -1661,12 +2193,15 @@ mod tests {
 
         let after_rollback = crate::core::at(date, crate::model::time(7, 30));
         let future_last_sync = crate::core::at(date, crate::model::time(9, 0));
+        let future = sync_at(SyncConclusionKind::HealthyNonempty, future_last_sync);
         let schedule = automatic_sync_schedule_for(
             &settings,
             after_rollback,
             true,
             false,
-            Some(future_last_sync),
+            false,
+            Some(&future),
+            None,
             "clock-rollback",
         );
         assert!(schedule.due_at > after_rollback);
@@ -1703,34 +2238,7 @@ mod tests {
         let database = Database::new(&root);
         database.initialize().unwrap();
         let now = now_china();
-        let event = IpoEvent {
-            id: "shanghai:601001".into(),
-            exchange: Exchange::Shanghai,
-            board: Board::Main,
-            security_code: "601001".into(),
-            apply_code: Some("780001".into()),
-            legacy_code: None,
-            name: "测试股份".into(),
-            apply_date: Some(now.date_naive()),
-            issue_price: Some(10.0),
-            lot_size: Some(500),
-            max_apply_quantity: Some(10_000),
-            required_market_value: None,
-            required_cash: None,
-            ballot_date: None,
-            payment_date: None,
-            listing_date: None,
-            status: IssueStatus::Active,
-            lifecycle_status: LifecycleStatus::ActiveUnconfirmed,
-            event_version: 1,
-            announcement_url: None,
-            data_quality_status: DataQualityStatus::MultiSourceVerified,
-            data_conflict: false,
-            manual_override_fields: Vec::new(),
-            sessions: Vec::new(),
-            first_seen_at: now,
-            updated_at: now,
-        };
+        let event = event_at(now, LifecycleStatus::ActiveUnconfirmed);
         let document = announcement::metadata_document(
             &event,
             AnnouncementRef {
@@ -1776,39 +2284,44 @@ mod tests {
 
     #[test]
     fn snapshot_revision_only_changes_when_visible_state_changes() {
-        let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
+        let ui_state = RuntimeUiState::new();
 
-        update_snapshot(&snapshot, |_| {});
-        assert_eq!(snapshot.read().unwrap().revision, 0);
+        update_snapshot(&ui_state, |_| {});
+        assert_eq!(ui_state.snapshot.read().unwrap().revision, 0);
 
-        update_snapshot(&snapshot, |value| {
+        update_snapshot(&ui_state, |value| {
             value.status_text = "后台提醒服务已就绪".into();
         });
-        assert_eq!(snapshot.read().unwrap().revision, 1);
+        assert_eq!(ui_state.snapshot.read().unwrap().revision, 1);
 
-        update_snapshot(&snapshot, |value| {
+        update_snapshot(&ui_state, |value| {
             value.status_text = "后台提醒服务已就绪".into();
         });
-        assert_eq!(snapshot.read().unwrap().revision, 1);
+        assert_eq!(ui_state.snapshot.read().unwrap().revision, 1);
     }
 
     #[test]
-    fn daily_maintenance_creates_one_backup_without_a_successful_sync() {
+    fn daily_maintenance_skips_repeated_backup_without_business_changes() {
         let root = std::env::temp_dir().join(format!(
             "stock-ipo-rust-maintenance-test-{}",
             Uuid::new_v4().simple()
         ));
         let database = Database::new(&root);
         database.initialize().unwrap();
+        database.save_settings(&AppSettings::default()).unwrap();
 
         run_daily_maintenance(&database, &root);
         let backup_directory = root.join("backups");
-        let first_count = std::fs::read_dir(&backup_directory)
+        let first = std::fs::read_dir(&backup_directory)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|value| value == "db"))
-            .count();
-        assert_eq!(first_count, 1);
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|value| value == "db"))
+            .unwrap();
+        let old = backup_directory.join("stock-ipo-reminder-20000101-000000-000.db");
+        let old_fingerprint = backup_fingerprint_path(&old);
+        std::fs::rename(&first, &old).unwrap();
+        std::fs::rename(backup_fingerprint_path(&first), old_fingerprint).unwrap();
 
         run_daily_maintenance(&database, &root);
         let second_count = std::fs::read_dir(&backup_directory)
@@ -1817,6 +2330,45 @@ mod tests {
             .filter(|entry| entry.path().extension().is_some_and(|value| value == "db"))
             .count();
         assert_eq!(second_count, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daily_maintenance_creates_a_new_backup_after_business_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "stock-ipo-rust-maintenance-change-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let database = Database::new(&root);
+        database.initialize().unwrap();
+        database.save_settings(&AppSettings::default()).unwrap();
+        run_daily_maintenance(&database, &root);
+        let backup_directory = root.join("backups");
+        let first = std::fs::read_dir(&backup_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|value| value == "db"))
+            .unwrap();
+        let old = backup_directory.join("stock-ipo-reminder-20000101-000000-000.db");
+        std::fs::rename(&first, &old).unwrap();
+        std::fs::rename(
+            backup_fingerprint_path(&first),
+            backup_fingerprint_path(&old),
+        )
+        .unwrap();
+
+        let mut settings = database.settings().unwrap();
+        settings.sound_enabled = !settings.sound_enabled;
+        database.save_settings(&settings).unwrap();
+        run_daily_maintenance(&database, &root);
+
+        let count = std::fs::read_dir(&backup_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|value| value == "db"))
+            .count();
+        assert_eq!(count, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 }

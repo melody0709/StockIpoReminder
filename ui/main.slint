@@ -876,11 +876,11 @@ export component MainWindow inherits Window {
                         VerticalBox {
                             padding: 12px;
                             spacing: 7px;
-                            Text { text: "同步频率"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                            Text { text: "节能同步"; color: #f8fafc; font-size: 18px; font-weight: 600; }
                             HorizontalBox {
                                 height: 34px;
                                 spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "普通日期"; color: #cbd5e1; vertical-alignment: center; }
+                                Text { width: root.compact-width ? 150px : 190px; text: "来源异常重试"; color: #cbd5e1; vertical-alignment: center; }
                                 LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
                                 ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
                                 Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
@@ -888,12 +888,12 @@ export component MainWindow inherits Window {
                             HorizontalBox {
                                 height: 34px;
                                 spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "当日有未确认任务"; color: #cbd5e1; vertical-alignment: center; }
+                                Text { width: root.compact-width ? 150px : 190px; text: "当日未确认任务核验"; color: #cbd5e1; vertical-alignment: center; }
                                 LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "10"; }
                                 ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
                                 Text { text: "默认 10 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
                             }
-                            Text { text: "程序启动时同步一次；普通日期和申购日分别按上述间隔自动同步，均可设置为 5 分钟至 7 天，也可以随时手动同步。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "健康同步确认无任务或任务已确认后，当天停止周期同步；周末无真实提醒时直接睡到下个工作日。上方间隔只用于来源异常重试和当日未确认任务核验；已知提醒、用户操作与系统恢复会按需唤醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                         }
                     }
                     Rectangle {
