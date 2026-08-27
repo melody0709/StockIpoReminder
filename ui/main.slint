@@ -177,8 +177,8 @@ export component MainWindow inherits Window {
     title: "A 股新股申购提醒";
     preferred-width: 1180px;
     preferred-height: 780px;
-    min-width: 760px;
-    min-height: 460px;
+    min-width: 800px;
+    min-height: 500px;
     // Toggling repaint-token marks the complete window background dirty. This
     // is used when a tray-resident software-rendered window becomes visible
     // again, because a plain request-redraw may otherwise repaint only the
@@ -194,7 +194,6 @@ export component MainWindow inherits Window {
     in-out property <int> runtime-level: 0;
     in-out property <bool> compact-width: false;
     in-out property <bool> compact-height: false;
-    property <bool> compact-layout: root.compact-width || root.compact-height;
     changed width => { root.compact-width = root.width < 1000px; }
     changed height => { root.compact-height = root.height < 650px; }
     in property <string> app-version: "";
@@ -349,21 +348,24 @@ export component MainWindow inherits Window {
     callback exit-app();
 
     VerticalBox {
-        padding: root.compact-layout ? 12px : 20px;
-        spacing: root.compact-layout ? 8px : 12px;
+        padding-left: root.compact-width ? 12px : 20px;
+        padding-right: root.compact-width ? 12px : 20px;
+        padding-top: root.compact-height ? 14px : 20px;
+        padding-bottom: root.compact-height ? 14px : 20px;
+        spacing: root.compact-height ? 8px : 12px;
 
         VerticalBox {
-            min-height: root.compact-layout ? 72px : 86px;
-            max-height: root.compact-layout ? 72px : 86px;
-            spacing: root.compact-layout ? 4px : 8px;
+            min-height: root.compact-height ? 80px : 86px;
+            max-height: root.compact-height ? 80px : 86px;
+            spacing: root.compact-height ? 6px : 8px;
             HorizontalBox {
-                min-height: root.compact-layout ? 40px : 46px;
-                max-height: root.compact-layout ? 40px : 46px;
+                min-height: root.compact-height ? 40px : 46px;
+                max-height: root.compact-height ? 40px : 46px;
                 spacing: root.compact-width ? 8px : 12px;
                 Text {
                     text: "A 股新股申购提醒";
-                    min-height: root.compact-layout ? 40px : 46px;
-                    max-height: root.compact-layout ? 40px : 46px;
+                    min-height: root.compact-height ? 40px : 46px;
+                    max-height: root.compact-height ? 40px : 46px;
                     font-size: root.compact-width ? 23px : 27px;
                     font-weight: 700;
                     color: #f8fafc;
@@ -392,26 +394,28 @@ export component MainWindow inherits Window {
                 ActionButton { label: "隐藏到托盘"; compact: root.compact-width; clicked => { root.hide-to-tray(); } }
             }
             Rectangle {
-                min-height: root.compact-layout ? 24px : 32px;
-                max-height: root.compact-layout ? 24px : 32px;
+                min-height: root.compact-height ? 30px : 32px;
+                max-height: root.compact-height ? 30px : 32px;
                 background: transparent;
                 HorizontalBox {
-                    spacing: root.compact-layout ? 6px : 8px;
-                    Rectangle { min-width: root.compact-layout ? 8px : 10px; max-width: root.compact-layout ? 8px : 10px; min-height: root.compact-layout ? 8px : 10px; max-height: root.compact-layout ? 8px : 10px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
+                    spacing: root.compact-width ? 6px : 8px;
+                    Rectangle { min-width: root.compact-height ? 8px : 10px; max-width: root.compact-height ? 8px : 10px; min-height: root.compact-height ? 8px : 10px; max-height: root.compact-height ? 8px : 10px; border-radius: 5px; background: root.is-synchronizing ? #f59e0b : root.runtime-level == 2 ? #ef4444 : root.runtime-level == 1 ? #22c55e : #f59e0b; }
                     Text {
                         text: root.status-text + " · " + root.sync-text;
                         color: #a8b5ca;
-                        font-size: root.compact-layout ? 12px : 13px;
+                        font-size: 13px;
                         vertical-alignment: center;
+                        vertical-stretch: 1;
                         horizontal-stretch: 1;
+                        overflow: elide;
                     }
                 }
             }
         }
 
         HorizontalBox {
-            min-height: root.compact-layout ? 38px : 42px;
-            max-height: root.compact-layout ? 38px : 42px;
+            min-height: root.compact-height ? 38px : 42px;
+            max-height: root.compact-height ? 38px : 42px;
             spacing: 6px;
             NavButton { label: "今日任务"; compact: root.compact-width; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
             NavButton { label: "未来 60 天"; compact: root.compact-width; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
@@ -466,13 +470,13 @@ export component MainWindow inherits Window {
         }
 
         if root.active-page == 0 : VerticalBox {
-            spacing: root.compact-layout ? 8px : 12px;
+            spacing: root.compact-height ? 8px : 12px;
             HorizontalBox {
                 spacing: root.compact-width ? 6px : 10px;
-                StatCard { label: "今日任务"; compact: root.compact-layout; value: "" + root.today-count; horizontal-stretch: 1; }
-                StatCard { label: "待确认"; compact: root.compact-layout; value: "" + root.pending-count; value-color: #fca5a5; horizontal-stretch: 1; }
-                StatCard { label: "已确认"; compact: root.compact-layout; value: "" + root.acknowledged-count; value-color: #86efac; horizontal-stretch: 1; }
-                StatCard { label: "异常数据"; compact: root.compact-layout; value: "" + root.issue-count; value-color: #fcd34d; horizontal-stretch: 1; }
+                StatCard { label: "今日任务"; compact: root.compact-height; value: "" + root.today-count; horizontal-stretch: 1; }
+                StatCard { label: "待确认"; compact: root.compact-height; value: "" + root.pending-count; value-color: #fca5a5; horizontal-stretch: 1; }
+                StatCard { label: "已确认"; compact: root.compact-height; value: "" + root.acknowledged-count; value-color: #86efac; horizontal-stretch: 1; }
+                StatCard { label: "异常数据"; compact: root.compact-height; value: "" + root.issue-count; value-color: #fcd34d; horizontal-stretch: 1; }
             }
             Rectangle {
                 vertical-stretch: 1;
@@ -649,7 +653,7 @@ export component MainWindow inherits Window {
         }
 
         if root.active-page == 2 : VerticalBox {
-            spacing: root.compact-layout ? 8px : 12px;
+            spacing: root.compact-height ? 8px : 12px;
             Rectangle {
                 height: root.compact-height ? 110px : 124px;
                 border-radius: 10px;
@@ -657,7 +661,10 @@ export component MainWindow inherits Window {
                 border-color: #26334a;
                 background: #111b2e;
                 HorizontalBox {
-                    padding: root.compact-layout ? 10px : 14px;
+                    padding-left: root.compact-width ? 10px : 14px;
+                    padding-right: root.compact-width ? 10px : 14px;
+                    padding-top: root.compact-height ? 10px : 14px;
+                    padding-bottom: root.compact-height ? 10px : 14px;
                     spacing: root.compact-width ? 8px : 12px;
                     VerticalBox {
                         spacing: 6px;
@@ -710,8 +717,11 @@ export component MainWindow inherits Window {
                 border-color: #26334a;
                 background: #111b2e;
                 VerticalBox {
-                    padding: root.compact-layout ? 10px : 12px;
-                    spacing: root.compact-layout ? 5px : 7px;
+                    padding-left: root.compact-width ? 10px : 12px;
+                    padding-right: root.compact-width ? 10px : 12px;
+                    padding-top: root.compact-height ? 10px : 12px;
+                    padding-bottom: root.compact-height ? 10px : 12px;
+                    spacing: root.compact-height ? 5px : 7px;
                     Text { text: "本地诊断"; color: #f8fafc; font-size: 17px; font-weight: 600; }
                     Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
                     HorizontalBox {
@@ -733,8 +743,11 @@ export component MainWindow inherits Window {
             background: #111b2e;
             ScrollView {
                 VerticalBox {
-                    padding: root.compact-layout ? 10px : 14px;
-                    spacing: root.compact-layout ? 10px : 12px;
+                    padding-left: root.compact-width ? 10px : 14px;
+                    padding-right: root.compact-width ? 10px : 14px;
+                    padding-top: root.compact-height ? 10px : 14px;
+                    padding-bottom: root.compact-height ? 10px : 14px;
+                    spacing: root.compact-height ? 10px : 12px;
                     if !root.onboarding-completed : Rectangle {
                         min-height: 62px;
                         max-height: 62px;
@@ -1149,8 +1162,11 @@ export component MainWindow inherits Window {
             border-color: #3b82f6;
             background: #111b2e;
             VerticalBox {
-                padding: root.compact-layout ? 12px : 18px;
-                spacing: root.compact-layout ? 8px : 10px;
+                padding-left: root.compact-width ? 12px : 18px;
+                padding-right: root.compact-width ? 12px : 18px;
+                padding-top: root.compact-height ? 12px : 18px;
+                padding-bottom: root.compact-height ? 12px : 18px;
+                spacing: root.compact-height ? 8px : 10px;
                 HorizontalBox {
                     VerticalBox {
                         horizontal-stretch: 1;
@@ -1256,8 +1272,11 @@ export component MainWindow inherits Window {
                     background: #0f172a;
                     ScrollView {
                         VerticalBox {
-                            padding: root.compact-layout ? 9px : 12px;
-                            spacing: root.compact-layout ? 8px : 9px;
+                            padding-left: root.compact-width ? 9px : 12px;
+                            padding-right: root.compact-width ? 9px : 12px;
+                            padding-top: root.compact-height ? 9px : 12px;
+                            padding-bottom: root.compact-height ? 9px : 12px;
+                            spacing: root.compact-height ? 8px : 9px;
                             Rectangle {
                                 height: root.compact-width ? 76px : 60px;
                                 border-radius: 8px;

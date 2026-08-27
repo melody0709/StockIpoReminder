@@ -652,8 +652,8 @@ pub fn fit_window_to_work_area(window: &slint::Window) -> Result<()> {
         let available_height = (work_height - frame_height - margin * 2).max(1) as u32;
         let current_size = window.size();
         let scale_factor = window.scale_factor();
-        let minimum_width = (760.0 * scale_factor).round().max(1.0) as u32;
-        let minimum_height = (460.0 * scale_factor).round().max(1.0) as u32;
+        let minimum_width = (800.0 * scale_factor).round().max(1.0) as u32;
+        let minimum_height = (500.0 * scale_factor).round().max(1.0) as u32;
         let target_width =
             clamp_window_dimension(current_size.width, minimum_width, available_width);
         let target_height =
