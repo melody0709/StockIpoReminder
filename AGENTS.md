@@ -8,12 +8,7 @@
 - Preserve user changes already present in the worktree and avoid unrelated edits.
 - Treat `Cargo.toml` as the source of truth for the application version.
 
-## Command execution
 
-- Follow the RTK instructions referenced above and prefix shell commands with `rtk`.
-- On Windows, invoke the repository batch entry point with `rtk cmd /c build.bat ...`.
-- For PowerShell commands, use `rtk pwsh ...`, not `rtk powershell ...`. `pwsh` is the Microsoft Store-installed PowerShell 7; `powershell.exe` is legacy Windows PowerShell 5.1 and must not be used unless explicitly requested.
-- Use `rg` or `rg --files` for source and file searches.
 
 ## Source changes
 
