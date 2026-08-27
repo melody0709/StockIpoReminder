@@ -12,6 +12,7 @@
 
 - Follow the RTK instructions referenced above and prefix shell commands with `rtk`.
 - On Windows, invoke the repository batch entry point with `rtk cmd /c build.bat ...`.
+- For PowerShell commands, use `rtk pwsh ...`, not `rtk powershell ...`. `pwsh` is the Microsoft Store-installed PowerShell 7; `powershell.exe` is legacy Windows PowerShell 5.1 and must not be used unless explicitly requested.
 - Use `rg` or `rg --files` for source and file searches.
 
 ## Source changes
@@ -44,7 +45,7 @@ build\packages\<version>\SHA256SUMS.txt
 Run the layout validation after packaging:
 
 ```text
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.ps1
 ```
 
 ## Completion report
