@@ -196,7 +196,7 @@ pub fn collect_eastmoney(client: &Client, cancelled: &dyn Fn() -> bool) -> Resul
     while page <= total_pages && page <= MAX_BOUNDED_PAGES {
         ensure_not_cancelled(cancelled)?;
         let url = eastmoney_url(started.date_naive(), page)?;
-        let raw = get_text(client, &url, None)?;
+        let raw = get_text(client, &url, None, cancelled)?;
         ensure_not_cancelled(cancelled)?;
         let (page_declared, page_details, pages) = eastmoney_page_counts(&raw)?;
         declared_count = declared_count.or(page_declared);
@@ -226,7 +226,12 @@ pub fn collect_sse(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<Coll
     while page <= total_pages && page <= MAX_BOUNDED_PAGES {
         ensure_not_cancelled(cancelled)?;
         let url = sse_url(page)?;
-        let raw = get_text(client, &url, Some("https://www.sse.com.cn/ipo/listing/"))?;
+        let raw = get_text(
+            client,
+            &url,
+            Some("https://www.sse.com.cn/ipo/listing/"),
+            cancelled,
+        )?;
         ensure_not_cancelled(cancelled)?;
         let (page_declared, page_details, pages) = sse_page_counts(&raw)?;
         declared_count = declared_count.or(page_declared);
@@ -249,7 +254,12 @@ pub fn collect_cninfo(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<C
     let started = now_china();
     let url = "https://www.cninfo.com.cn/neweipo/index/ipoListQuery";
     ensure_not_cancelled(cancelled)?;
-    let raw = get_text(client, url, Some("https://www.cninfo.com.cn/new/index"))?;
+    let raw = get_text(
+        client,
+        url,
+        Some("https://www.cninfo.com.cn/new/index"),
+        cancelled,
+    )?;
     ensure_not_cancelled(cancelled)?;
     let candidates = parse_cninfo(&raw, started)?;
     Ok(output("cninfo", started, raw, candidates))
@@ -264,6 +274,7 @@ pub fn collect_bse(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<Coll
         client,
         "https://www.bseinfo.net/newshare/listofissues.html",
         None,
+        cancelled,
     )?;
     ensure_not_cancelled(cancelled)?;
     let mut page = 0;
@@ -293,7 +304,7 @@ pub fn collect_bse(client: &Client, cancelled: &dyn Fn() -> bool) -> Result<Coll
             ])
             .send()?;
         ensure_not_cancelled(cancelled)?;
-        let raw = response_text(response, false)?;
+        let raw = response_text(response, false, cancelled)?;
         let parsed = parse_bse_page_with_meta(&raw, started)?;
         detail_count += parsed.detail_count;
         declared_count = parsed.declared_count.or(declared_count);
@@ -698,13 +709,18 @@ fn parse_bse_page_with_meta(raw: &str, fetched: ChinaDateTime) -> Result<BsePage
     })
 }
 
-pub fn get_text(client: &Client, url: &str, referer: Option<&str>) -> Result<String> {
+pub fn get_text(
+    client: &Client,
+    url: &str,
+    referer: Option<&str>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
     ensure_allowed(url, false)?;
     let mut request = client.get(url);
     if let Some(referer) = referer {
         request = request.header("Referer", referer);
     }
-    response_text(request.send()?, false)
+    response_text(request.send()?, false, cancelled)
 }
 
 pub fn checked_response(response: Response, announcement: bool) -> Result<Response> {
@@ -733,7 +749,11 @@ pub fn retry_after_from_error(error: &anyhow::Error) -> Option<ChinaDateTime> {
         .and_then(|failure| failure.retry_after)
 }
 
-pub(crate) fn response_text(response: Response, announcement: bool) -> Result<String> {
+pub(crate) fn response_text(
+    response: Response,
+    announcement: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
     let mut response = checked_response(response, announcement)?;
     let limit = if announcement {
         MAX_ANNOUNCEMENT_RESPONSE_BYTES
@@ -746,18 +766,90 @@ pub(crate) fn response_text(response: Response, announcement: bool) -> Result<St
     {
         bail!("远端响应超过 {} MiB 大小上限", limit / 1024 / 1024);
     }
-    let bytes = read_limited(&mut response, limit)?;
-    String::from_utf8(bytes).context("远端响应不是有效 UTF-8")
+    let charset = declared_charset(response.headers());
+    let bytes = read_limited(&mut response, limit, Some(cancelled))?;
+    decode_response_bytes(&bytes, charset)
 }
 
-fn read_limited(reader: &mut impl Read, limit: u64) -> Result<Vec<u8>> {
+/// 从 Content-Type 提取 charset 参数（小写化，去掉引号）。
+fn declared_charset(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|content_type| {
+            content_type.split(';').skip(1).find_map(|parameter| {
+                let parameter = parameter.trim();
+                let (name, value) = parameter.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("charset")
+                    .then(|| value.trim().trim_matches('"').to_ascii_lowercase())
+            })
+        })
+}
+
+/// 按声明字符集解码响应体。仅接受 UTF-8 与显式声明的 GBK/GB2312/GB18030；
+/// 对无声明的非法 UTF-8 不做猜测式兜底，只报错并附有限长度 hex 诊断。
+fn decode_response_bytes(bytes: &[u8], charset: Option<String>) -> Result<String> {
+    const HEX_PREVIEW_BYTES: usize = 48;
+    let hex_preview = |data: &[u8]| -> String {
+        data.iter()
+            .take(HEX_PREVIEW_BYTES)
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let declared = charset.as_deref().unwrap_or_default();
+    if matches!(declared, "gbk" | "gb2312" | "gb18030") {
+        // GB18030 是 GBK/GB2312 的官方超集，统一按 GB18030 解码。
+        let (decoded, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+        if had_errors {
+            bail!(
+                "远端响应按 GB18030 解码存在无法映射的字节，前 {HEX_PREVIEW_BYTES} 字节 hex：{}",
+                hex_preview(bytes)
+            );
+        }
+        Ok(decoded.into_owned())
+    } else {
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => Ok(text),
+            Err(error) => {
+                let bytes = error.into_bytes();
+                bail!(
+                    "远端响应不是有效 UTF-8（charset 声明：{}），前 {HEX_PREVIEW_BYTES} 字节 hex：{}",
+                    if declared.is_empty() {
+                        "未声明"
+                    } else {
+                        declared
+                    },
+                    hex_preview(&bytes)
+                );
+            }
+        }
+    }
+}
+
+/// 分块读取响应体：每次成功 read 后检查取消标志，退出请求不再需要等待
+/// 整段响应读完。逐次 read 的 stall 超时与体积上限保持不变。
+fn read_limited(
+    reader: &mut impl Read,
+    limit: u64,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<u8>> {
+    const CHUNK_SIZE: usize = 64 * 1024;
     let mut bytes = Vec::new();
-    reader
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .context("无法读取远端响应")?;
-    if bytes.len() as u64 > limit {
-        bail!("远端响应超过 {} MiB 大小上限", limit / 1024 / 1024);
+    let mut chunk = vec![0u8; CHUNK_SIZE];
+    loop {
+        if cancelled.is_some_and(|check| check()) {
+            bail!("同步已取消：读取响应体时检测到退出请求");
+        }
+        let read = reader.read(&mut chunk).context("无法读取远端响应")?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() as u64 > limit {
+            bail!("远端响应超过 {} MiB 大小上限", limit / 1024 / 1024);
+        }
     }
     Ok(bytes)
 }
@@ -934,6 +1026,40 @@ mod tests {
     use super::*;
     use std::{fs, path::Path};
 
+    #[test]
+    fn declared_charset_parses_content_type_parameters() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json; Charset=\"GBK\""),
+        );
+        assert_eq!(declared_charset(&headers).as_deref(), Some("gbk"));
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(declared_charset(&headers), None);
+    }
+
+    #[test]
+    fn decode_response_bytes_only_honors_declared_gb_charsets() {
+        assert_eq!(decode_response_bytes(b"plain", None).unwrap(), "plain");
+        let gb_bytes = vec![0xD6, 0xD0]; // “中”的 GBK 编码
+        assert_eq!(
+            decode_response_bytes(&gb_bytes, Some("gb2312".into())).unwrap(),
+            "中"
+        );
+        // 无声明的非法 UTF-8：不猜测，报错并带 hex 诊断
+        let error = decode_response_bytes(&gb_bytes, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("D6"), "unexpected error: {error}");
+        assert!(error.contains("未声明"));
+        // 未知 charset 同样不兜底
+        assert!(decode_response_bytes(&gb_bytes, Some("big5".into())).is_err());
+    }
+
     fn fixture(path: &str) -> String {
         fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1100,10 +1226,43 @@ mod tests {
         assert!(unwrap_jsonp(")(").is_err());
         assert!(unwrap_jsonp("foo)bar(baz").is_err());
 
+        let not_cancelled = || false;
         let mut exact = std::io::Cursor::new(b"1234".to_vec());
-        assert_eq!(read_limited(&mut exact, 4).unwrap(), b"1234");
+        assert_eq!(
+            read_limited(&mut exact, 4, Some(&not_cancelled)).unwrap(),
+            b"1234"
+        );
         let mut oversized = std::io::Cursor::new(b"12345".to_vec());
-        assert!(read_limited(&mut oversized, 4).is_err());
+        assert!(read_limited(&mut oversized, 4, Some(&not_cancelled)).is_err());
+    }
+
+    #[test]
+    fn read_limited_stops_promptly_when_cancelled() {
+        struct InfiniteOnes;
+        impl Read for InfiniteOnes {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                for byte in buf.iter_mut() {
+                    *byte = 1;
+                }
+                Ok(buf.len())
+            }
+        }
+
+        // 前 3 次 read 检查放行，第 4 次取消：读取循环必须立即停止并返回
+        // 可识别的取消错误，而不是一直读到体积上限。
+        let cancel_after = std::cell::Cell::new(3usize);
+        let cancelled = || {
+            if cancel_after.get() > 0 {
+                cancel_after.set(cancel_after.get() - 1);
+                false
+            } else {
+                true
+            }
+        };
+        let mut reader = InfiniteOnes;
+        let error = read_limited(&mut reader, u64::MAX, Some(&cancelled)).unwrap_err();
+        assert!(error.to_string().contains("同步已取消"));
+        assert_eq!(cancel_after.get(), 0);
     }
 
     #[test]

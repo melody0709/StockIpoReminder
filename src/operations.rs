@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result};
@@ -198,7 +198,11 @@ pub fn log(level: &str, message: &str) {
     let Some(directory) = LOG_DIRECTORY.get() else {
         return;
     };
-    let Ok(_guard) = LOG_GATE.lock() else { return };
+    // 锁中毒只代表某条日志写入时 panic；恢复串行化比静默丢弃后续日志更安全。
+    let _log_guard = match LOG_GATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let now = now_china();
     if let Ok(mut last_cleanup) = LAST_LOG_CLEANUP_DATE.lock()
         && *last_cleanup != Some(now.date_naive())
@@ -278,17 +282,21 @@ fn log_date_from_name(name: &str) -> Option<NaiveDate> {
 }
 
 pub fn redact(value: &str) -> String {
-    let authorization =
-        Regex::new(r"(?i)(authorization|cookie|set-cookie)\s*[:=]\s*[^\s,;]+(?:[;,][^\s]+)*")
-            .unwrap();
-    let query = Regex::new(r"(https://[^\s?]+)\?[^\s]+").unwrap();
-    let data_root =
-        Regex::new(r#"(?i)(--data-root(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s]+)"#).unwrap();
-    let unc_path = Regex::new(
-        r#"(?i)(?:\\\\\?\\UNC\\|\\\\)[^\\/\s"'<>|]+[\\/][^\\/\s"'<>|]+(?:[\\/][^\s"'<>|]+)*"#,
-    )
-    .unwrap();
-    let windows_path = Regex::new(r#"(?i)\b[A-Z]:[\\/](?:[^\s"'<>|]+[\\/]?)*"#).unwrap();
+    // 每条日志都会调用本函数；正则只编译一次（LazyLock 缓存）。
+    static PATTERNS: LazyLock<(Regex, Regex, Regex, Regex, Regex)> = LazyLock::new(|| {
+        (
+            Regex::new(r"(?i)(authorization|cookie|set-cookie)\s*[:=]\s*[^\s,;]+(?:[;,][^\s]+)*")
+                .unwrap(),
+            Regex::new(r"(https://[^\s?]+)\?[^\s]+").unwrap(),
+            Regex::new(r#"(?i)(--data-root(?:\s*=\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s]+)"#).unwrap(),
+            Regex::new(
+                r#"(?i)(?:\\\\\?\\UNC\\|\\\\)[^\\/\s"'<>|]+[\\/][^\\/\s"'<>|]+(?:[\\/][^\s"'<>|]+)*"#,
+            )
+            .unwrap(),
+            Regex::new(r#"(?i)\b[A-Z]:[\\/](?:[^\s"'<>|]+[\\/]?)*"#).unwrap(),
+        )
+    });
+    let (authorization, query, data_root, unc_path, windows_path) = &*PATTERNS;
     let value = authorization.replace_all(value, "$1:<redacted>");
     let value = query.replace_all(&value, "$1?<redacted>");
     let value = data_root.replace_all(&value, "$1<local-path>");

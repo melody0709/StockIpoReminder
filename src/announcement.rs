@@ -40,6 +40,39 @@ impl ReferenceSearch {
     }
 }
 
+/// 单页解析结果：保留完整性信息，供分页循环判定是否继续探测。
+#[derive(Debug)]
+struct ReferencePage {
+    references: Vec<AnnouncementRef>,
+    /// 原始响应数组行数（过滤前）；total 缺失时以满页探测判断是否还有下一页。
+    raw_count: usize,
+    /// 来源声明的匹配总数；`None` 表示响应未提供 total，不得回退为行数。
+    total: Option<usize>,
+}
+
+fn pagination_has_next(page: usize, raw_count: usize, total: Option<usize>) -> Result<bool> {
+    if page == 0 {
+        bail!("公告分页页码必须从 1 开始");
+    }
+    match total {
+        Some(total) => {
+            let consumed_before = (page - 1)
+                .checked_mul(ANNOUNCEMENT_PAGE_SIZE)
+                .context("公告分页偏移量溢出")?;
+            let expected = total
+                .saturating_sub(consumed_before)
+                .min(ANNOUNCEMENT_PAGE_SIZE);
+            if raw_count != expected {
+                bail!(
+                    "公告分页 total={total} 与第 {page} 页原始行数不一致：实际 {raw_count}，预期 {expected}"
+                );
+            }
+            Ok(consumed_before + raw_count < total)
+        }
+        None => Ok(raw_count >= ANNOUNCEMENT_PAGE_SIZE),
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchOutput {
     pub references: Vec<AnnouncementRef>,
@@ -122,7 +155,14 @@ fn search_sse(
         }
         (Ok(official), Err(error)) => Ok(SearchOutput {
             references: official.references,
-            warning: Some(format!("巨潮沪市公告镜像不可用：{error:#}")),
+            warning: Some(if official.truncated {
+                format!(
+                    "上交所公告结果超过 {} 页安全上限，本轮结果已明确标记为不完整；巨潮沪市公告镜像不可用：{error:#}",
+                    MAX_ANNOUNCEMENT_PAGES
+                )
+            } else {
+                format!("巨潮沪市公告镜像不可用：{error:#}")
+            }),
             used_mirror: false,
         }),
         (Err(error), Ok(mirror)) => Ok(SearchOutput {
@@ -152,8 +192,7 @@ fn search_sse_official(
 ) -> Result<ReferenceSearch> {
     let mut references = Vec::new();
     let mut page = 1usize;
-    let mut total_pages = 1usize;
-    while page <= total_pages && page <= MAX_ANNOUNCEMENT_PAGES {
+    let truncated = loop {
         ensure_not_cancelled(cancelled)?;
         let values = HashMap::from([
             ("isPagination", "true".to_owned()),
@@ -186,24 +225,29 @@ fn search_sse_official(
             true,
         )?;
         ensure_not_cancelled(cancelled)?;
-        let raw = response_text(response, true)?;
-        let (rows, total) = parse_sse_reference_page(&raw)?;
-        references.extend(rows);
-        total_pages = total.div_ceil(ANNOUNCEMENT_PAGE_SIZE).max(1);
+        let raw = response_text(response, true, cancelled)?;
+        let page_result = parse_sse_reference_page(&raw)?;
+        references.extend(page_result.references);
+        let has_next = pagination_has_next(page, page_result.raw_count, page_result.total)?;
+        if !has_next || page >= MAX_ANNOUNCEMENT_PAGES {
+            break has_next;
+        }
         page += 1;
-    }
+    };
     Ok(ReferenceSearch {
         references: deduplicate(references)?,
-        truncated: total_pages > MAX_ANNOUNCEMENT_PAGES,
+        truncated,
     })
 }
 
 #[cfg(test)]
 pub fn parse_sse_references(raw: &str) -> Result<Vec<AnnouncementRef>> {
-    parse_sse_reference_page(raw).map(|value| value.0)
+    parse_sse_reference_page(raw)
+        .map(|value| value.references)
+        .and_then(deduplicate)
 }
 
-fn parse_sse_reference_page(raw: &str) -> Result<(Vec<AnnouncementRef>, usize)> {
+fn parse_sse_reference_page(raw: &str) -> Result<ReferencePage> {
     let root: Value = serde_json::from_str(raw)?;
     let rows = root
         .pointer("/pageHelp/data")
@@ -249,16 +293,26 @@ fn parse_sse_reference_page(raw: &str) -> Result<(Vec<AnnouncementRef>, usize)> 
             announcement_type: Some(announcement_type(&title)),
         });
     }
-    let total = root
-        .pointer("/pageHelp/total")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            root.pointer("/pageHelp/total")
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse().ok())
-        })
-        .unwrap_or(rows.len() as u64) as usize;
-    Ok((deduplicate(result)?, total))
+    let total = match root.pointer("/pageHelp/total") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let parsed = value
+                .as_u64()
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|raw| raw.trim().parse::<u64>().ok())
+                })
+                .with_context(|| format!("上交所公告响应 pageHelp.total 格式非法：{value}"))?;
+            Some(usize::try_from(parsed).context("上交所公告响应 pageHelp.total 超出范围")?)
+        }
+    };
+    // 去重统一在外层合并时执行（L12），页解析只解析和校验。
+    Ok(ReferencePage {
+        references: result,
+        raw_count: rows.len(),
+        total,
+    })
 }
 
 fn search_cninfo_market(
@@ -282,8 +336,7 @@ fn search_cninfo_market(
     let date_range = format!("{}~{}", from.format("%Y-%m-%d"), to.format("%Y-%m-%d"));
     let mut references = Vec::new();
     let mut page = 1usize;
-    let mut total_pages = 1usize;
-    while page <= total_pages && page <= MAX_ANNOUNCEMENT_PAGES {
+    let truncated = loop {
         ensure_not_cancelled(cancelled)?;
         let form = HashMap::from([
             ("pageNum", page.to_string()),
@@ -308,16 +361,19 @@ fn search_cninfo_market(
             true,
         )?;
         ensure_not_cancelled(cancelled)?;
-        let raw = response_text(response, true)?;
-        let (rows, total) =
+        let raw = response_text(response, true, cancelled)?;
+        let page_result =
             parse_cninfo_reference_page_for_event(&raw, Some(&event.security_code), provider)?;
-        references.extend(rows);
-        total_pages = total.div_ceil(ANNOUNCEMENT_PAGE_SIZE).max(1);
+        references.extend(page_result.references);
+        let has_next = pagination_has_next(page, page_result.raw_count, page_result.total)?;
+        if !has_next || page >= MAX_ANNOUNCEMENT_PAGES {
+            break has_next;
+        }
         page += 1;
-    }
+    };
     Ok(ReferenceSearch {
         references: deduplicate(references)?,
-        truncated: total_pages > MAX_ANNOUNCEMENT_PAGES,
+        truncated,
     })
 }
 
@@ -332,14 +388,16 @@ fn parse_cninfo_references_for_event(
     expected_code: Option<&str>,
     provider: &str,
 ) -> Result<Vec<AnnouncementRef>> {
-    parse_cninfo_reference_page_for_event(raw, expected_code, provider).map(|value| value.0)
+    parse_cninfo_reference_page_for_event(raw, expected_code, provider)
+        .map(|value| value.references)
+        .and_then(deduplicate)
 }
 
 fn parse_cninfo_reference_page_for_event(
     raw: &str,
     expected_code: Option<&str>,
     provider: &str,
-) -> Result<(Vec<AnnouncementRef>, usize)> {
+) -> Result<ReferencePage> {
     let root: Value = serde_json::from_str(raw).context("巨潮公告响应不是有效 JSON")?;
     let total_announcements = cninfo_count(&root, "totalAnnouncement")?;
     let total_records = cninfo_count(&root, "totalRecordNum")?;
@@ -348,7 +406,11 @@ fn parse_cninfo_reference_page_for_event(
     };
     if value.is_null() {
         if total_announcements == Some(0) && total_records == Some(0) {
-            return Ok((Vec::new(), 0));
+            return Ok(ReferencePage {
+                references: Vec::new(),
+                raw_count: 0,
+                total: Some(0),
+            });
         }
         bail!(
             "巨潮公告响应 announcements=null，但健康空结果计数缺失或非零：totalAnnouncement={total_announcements:?}, totalRecordNum={total_records:?}"
@@ -406,8 +468,14 @@ fn parse_cninfo_reference_page_for_event(
         .into_iter()
         .chain(total_records)
         .max()
-        .unwrap_or(rows.len() as u64) as usize;
-    Ok((deduplicate(result)?, total.max(rows.len())))
+        .map(|value| usize::try_from(value).context("巨潮公告 total 超出范围"))
+        .transpose()?;
+    // 去重统一在外层合并时执行（L12），页解析只解析和校验。
+    Ok(ReferencePage {
+        references: result,
+        raw_count: rows.len(),
+        total,
+    })
 }
 
 fn cninfo_count(root: &Value, key: &str) -> Result<Option<u64>> {
@@ -516,7 +584,7 @@ fn search_bse_pages(
             true,
         )?;
         ensure_not_cancelled(cancelled)?;
-        let raw = response_text(response, true)?;
+        let raw = response_text(response, true, cancelled)?;
         let (rows, pages) = parse_bse_references(&raw, event, from, to)?;
         result.extend(rows);
         total_pages = pages;
@@ -868,6 +936,52 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(rows[0].announcement_id, "issue");
+    }
+
+    #[test]
+    fn pagination_probe_decision_table() {
+        // total 缺失：满页继续探测，短页/空页结束。
+        assert!(pagination_has_next(1, 100, None).unwrap());
+        assert!(!pagination_has_next(1, 99, None).unwrap());
+        assert!(!pagination_has_next(1, 0, None).unwrap());
+        // total 已知：按声明页数判定。
+        assert!(pagination_has_next(1, 100, Some(250)).unwrap());
+        assert!(!pagination_has_next(3, 50, Some(250)).unwrap());
+        assert!(!pagination_has_next(1, 0, Some(0)).unwrap());
+        assert!(pagination_has_next(1, 100, Some(1)).is_err());
+        assert!(pagination_has_next(2, 100, Some(150)).is_err());
+        assert!(pagination_has_next(1, 0, Some(250)).is_err());
+    }
+
+    #[test]
+    fn sse_page_preserves_missing_total_and_rejects_invalid_total() {
+        let missing = r#"{"pageHelp":{"data":[{"TITLE":"首次公开发行股票网上发行公告","URL":"https://www.sse.com.cn/a/b/1234/","SSEDATE":"2026-08-24"}]}}"#;
+        let page = parse_sse_reference_page(missing).unwrap();
+        assert_eq!(page.total, None, "total 缺失不得回退为行数");
+        assert_eq!(page.raw_count, 1);
+        assert_eq!(page.references.len(), 1);
+
+        let string_total = r#"{"pageHelp":{"total":"250","data":[]}}"#;
+        assert_eq!(
+            parse_sse_reference_page(string_total).unwrap().total,
+            Some(250),
+            "total 为数字字符串时应可解析"
+        );
+
+        let invalid = r#"{"pageHelp":{"total":"abc","data":[]}}"#;
+        let error = parse_sse_reference_page(invalid).unwrap_err().to_string();
+        assert!(error.contains("格式非法"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn cninfo_page_preserves_missing_total() {
+        let raw = r#"{"announcements":[{"announcementTitle":"首次公开发行股票网上发行公告","adjunctUrl":"a/b/1234.pdf","announcementId":"1234","secCode":"301688"}]}"#;
+        let page =
+            parse_cninfo_reference_page_for_event(raw, Some("301688"), "cninfo-announcement")
+                .unwrap();
+        assert_eq!(page.total, None, "total 缺失不得回退为行数");
+        assert_eq!(page.raw_count, 1);
+        assert_eq!(page.references.len(), 1);
     }
 
     #[test]

@@ -221,8 +221,44 @@ fn send_message(secret: &SecretMaterial, title: &str, body: &str) -> Result<()> 
     validate_provider_response(secret.provider, &value)
 }
 
+// 各服务商对 text 消息 content 的 UTF-8 字节上限（省略号计入上限）：
+// 企业微信群机器人 text content 上限 2048 字节；钉钉自定义机器人 text
+// content 上限 5000 字节；飞书自定义机器人与 PushPlus 未公布明确的
+// 小字节上限，取 15000 字节保守值。
+const WECOM_MESSAGE_BYTES: usize = 2048;
+const DINGTALK_MESSAGE_BYTES: usize = 5000;
+const FEISHU_MESSAGE_BYTES: usize = 15000;
+const PUSHPLUS_MESSAGE_BYTES: usize = 15000;
+
+fn provider_message_limit(provider: SecondaryNotificationProvider) -> usize {
+    match provider {
+        SecondaryNotificationProvider::WeCom => WECOM_MESSAGE_BYTES,
+        SecondaryNotificationProvider::DingTalk => DINGTALK_MESSAGE_BYTES,
+        SecondaryNotificationProvider::Feishu => FEISHU_MESSAGE_BYTES,
+        SecondaryNotificationProvider::PushPlus => PUSHPLUS_MESSAGE_BYTES,
+        _ => WECOM_MESSAGE_BYTES,
+    }
+}
+
+/// 按 UTF-8 字节数截断，只能在字符边界结束；省略号的字节数计入上限。
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    const ELLIPSIS: &str = "…";
+    if max_bytes < ELLIPSIS.len() {
+        return String::new();
+    }
+    let mut end = max_bytes - ELLIPSIS.len();
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &value[..end])
+}
+
 fn provider_request(secret: &SecretMaterial, title: &str, body: &str) -> Result<(Url, Value)> {
-    let content = truncate_text(&format!("{title}\n\n{body}"), MAX_MESSAGE_CHARS);
+    let limit = provider_message_limit(secret.provider);
+    let content = truncate_utf8_bytes(&format!("{title}\n\n{body}"), limit);
     match secret.provider {
         SecondaryNotificationProvider::WeCom => Ok((
             validate_webhook_url(secret.provider, &secret.value)?,
@@ -241,7 +277,7 @@ fn provider_request(secret: &SecretMaterial, title: &str, body: &str) -> Result<
             json!({
                 "token": secret.value,
                 "title": truncate_text(title, 128),
-                "content": truncate_text(body, MAX_MESSAGE_CHARS),
+                "content": truncate_utf8_bytes(body, limit),
                 "template": "txt"
             }),
         )),
@@ -531,6 +567,47 @@ fn unprotect_current_user(_value: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::model::SecondaryNotificationProvider;
+
+    #[test]
+    fn provider_message_limits_follow_provider_contract() {
+        assert_eq!(
+            provider_message_limit(SecondaryNotificationProvider::WeCom),
+            2048
+        );
+        assert_eq!(
+            provider_message_limit(SecondaryNotificationProvider::DingTalk),
+            5000
+        );
+        assert_eq!(
+            provider_message_limit(SecondaryNotificationProvider::Feishu),
+            15000
+        );
+        assert_eq!(
+            provider_message_limit(SecondaryNotificationProvider::PushPlus),
+            15000
+        );
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_respects_boundaries_and_counts_ellipsis() {
+        // 未超限：原样返回
+        assert_eq!(truncate_utf8_bytes("abc", 10), "abc");
+        // 中文按 UTF-8 每字 3 字节计
+        let text = "一".repeat(10);
+        assert_eq!(truncate_utf8_bytes(&text, 30), text);
+        // 超限：截断到字符边界，省略号占 3 字节
+        let truncated = truncate_utf8_bytes(&text, 10);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() <= 10);
+        assert_eq!(truncated.chars().count(), 3, "6 字节正文 + 3 字节省略号");
+        // 不能把多字节字符切一半
+        let mixed = "a中b";
+        let result = truncate_utf8_bytes(mixed, 4);
+        assert!(result.chars().all(|c| c != '\u{FFFD}'));
+        // 极小限制
+        assert_eq!(truncate_utf8_bytes("abc", 2), "");
+        assert_eq!(truncate_utf8_bytes("abcd", 3), "…");
+    }
 
     #[test]
     fn webhook_validation_accepts_only_official_credential_free_https_urls() {

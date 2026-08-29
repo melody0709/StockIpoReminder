@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -35,15 +36,102 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const PROCESS_SYNCHRONIZE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
 
-pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
-    let executable = env::current_exe()?;
-    let stem = executable
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let implicit_install = arguments.is_empty() && stem.contains("setup");
-    let implicit_uninstall = arguments.is_empty() && stem.contains("uninstaller");
+/// 部署模式：互斥，一次只允许一种操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeploymentMode {
+    Install,
+    Uninstall,
+    LegacyUninstallHelper,
+    MsiUninstallHelper,
+}
+
+impl DeploymentMode {
+    fn label(self) -> &'static str {
+        match self {
+            DeploymentMode::Install => "install",
+            DeploymentMode::Uninstall => "uninstall",
+            DeploymentMode::LegacyUninstallHelper => "uninstall-helper",
+            DeploymentMode::MsiUninstallHelper => "msi-uninstall-helper",
+        }
+    }
+}
+
+fn allowed_mode_arguments(
+    mode: DeploymentMode,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match mode {
+        DeploymentMode::Install => (
+            &["--install", "--no-launch"],
+            &["--data-root", "--install-root", "--report"],
+        ),
+        DeploymentMode::Uninstall => (
+            &["--uninstall", "--purge-data"],
+            &[
+                "--data-root",
+                "--install-root",
+                "--report",
+                "--purge-confirmation",
+            ],
+        ),
+        DeploymentMode::LegacyUninstallHelper => (
+            &["--uninstall-helper", "--purge-data"],
+            &[
+                "--data-root",
+                "--install-root",
+                "--report",
+                "--purge-confirmation",
+            ],
+        ),
+        DeploymentMode::MsiUninstallHelper => (
+            &["--msi-uninstall-helper", "--purge-data"],
+            &[
+                "--data-root",
+                "--report",
+                "--purge-confirmation",
+                "--product-code",
+                "--parent-pid",
+            ],
+        ),
+    }
+}
+
+fn validate_mode_arguments(arguments: &[String], mode: DeploymentMode) -> Result<()> {
+    let (flags, value_arguments) = allowed_mode_arguments(mode);
+    let mut seen = HashSet::new();
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if flags.contains(&argument) {
+            if !seen.insert(argument) {
+                bail!("部署参数重复：{argument}");
+            }
+            index += 1;
+            continue;
+        }
+        if value_arguments.contains(&argument) {
+            if !seen.insert(argument) {
+                bail!("部署参数重复：{argument}");
+            }
+            let value = arguments
+                .get(index + 1)
+                .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                .with_context(|| format!("部署参数缺少值：{argument}"))?;
+            let _ = value;
+            index += 2;
+            continue;
+        }
+        bail!("部署参数不适用于当前模式（{}）：{argument}", mode.label());
+    }
+    if seen.contains("--purge-confirmation") && !seen.contains("--purge-data") {
+        bail!("--purge-confirmation 只能与 --purge-data 同时使用");
+    }
+    Ok(())
+}
+
+fn deployment_mode(arguments: &[String], stem: &str) -> Result<Option<DeploymentMode>> {
+    let stem = stem.to_ascii_lowercase();
+    let implicit_install = stem.contains("setup");
+    let implicit_uninstall = stem.contains("uninstaller");
     let install = implicit_install || arguments.iter().any(|value| value == "--install");
     let uninstall = implicit_uninstall || arguments.iter().any(|value| value == "--uninstall");
     let legacy_helper = arguments.iter().any(|value| value == "--uninstall-helper");
@@ -53,6 +141,41 @@ pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
     if !install && !uninstall && !legacy_helper && !msi_helper {
         return Ok(None);
     }
+    let mut modes = Vec::new();
+    if install {
+        modes.push(DeploymentMode::Install);
+    }
+    if uninstall {
+        modes.push(DeploymentMode::Uninstall);
+    }
+    if legacy_helper {
+        modes.push(DeploymentMode::LegacyUninstallHelper);
+    }
+    if msi_helper {
+        modes.push(DeploymentMode::MsiUninstallHelper);
+    }
+    if modes.len() > 1 {
+        let labels = modes
+            .iter()
+            .map(|mode| mode.label())
+            .collect::<Vec<_>>()
+            .join("、");
+        bail!("部署模式互斥，检测到多个模式同时请求：{labels}");
+    }
+    Ok(modes.into_iter().next())
+}
+
+pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
+    let executable = env::current_exe()?;
+    let stem = executable
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let Some(mode) = deployment_mode(arguments, &stem)? else {
+        return Ok(None);
+    };
+    validate_mode_arguments(arguments, mode)?;
 
     let data_root = argument_path(arguments, "--data-root").unwrap_or_else(default_data_root);
     let install_root =
@@ -61,40 +184,48 @@ pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
     let purge_data = arguments.iter().any(|value| value == "--purge-data");
     let purge_confirmation = argument_value(arguments, "--purge-confirmation").unwrap_or_default();
     let no_launch = arguments.iter().any(|value| value == "--no-launch");
-    let result = if install {
-        install_application(&executable, &install_root, &data_root, no_launch)
-    } else if msi_helper {
-        let product_code =
-            argument_value(arguments, "--product-code").context("卸载助手缺少 MSI ProductCode")?;
-        let parent_pid = argument_value(arguments, "--parent-pid")
-            .context("卸载助手缺少父进程编号")?
-            .parse::<u32>()
-            .context("卸载助手父进程编号无效")?;
-        run_msi_uninstall_helper(
-            &product_code,
-            parent_pid,
-            &data_root,
-            purge_data,
-            &purge_confirmation,
-        )
-    } else if legacy_helper {
-        thread::sleep(Duration::from_millis(1200));
-        uninstall_application(&install_root, &data_root, purge_data, &purge_confirmation)
-    } else {
-        dispatch_uninstall_helper(
+    let result = match mode {
+        DeploymentMode::Install => {
+            install_application(&executable, &install_root, &data_root, no_launch)
+        }
+        DeploymentMode::MsiUninstallHelper => {
+            let product_code = argument_value(arguments, "--product-code")
+                .context("卸载助手缺少 MSI ProductCode")?;
+            let parent_pid = argument_value(arguments, "--parent-pid")
+                .context("卸载助手缺少父进程编号")?
+                .parse::<u32>()
+                .context("卸载助手父进程编号无效")?;
+            run_msi_uninstall_helper(
+                &product_code,
+                parent_pid,
+                &data_root,
+                purge_data,
+                &purge_confirmation,
+            )
+        }
+        DeploymentMode::LegacyUninstallHelper => {
+            thread::sleep(Duration::from_millis(1200));
+            uninstall_application(&install_root, &data_root, purge_data, &purge_confirmation)
+        }
+        DeploymentMode::Uninstall => dispatch_uninstall_helper(
             &executable,
             &install_root,
             &data_root,
             purge_data,
             &purge_confirmation,
-        )
+        ),
+    };
+    let action = if mode == DeploymentMode::Install {
+        "install"
+    } else {
+        "uninstall"
     };
     let report = match &result {
         Ok(detail) => {
-            json!({"success": true, "action": if install {"install"} else {"uninstall"}, "detail": detail})
+            json!({"success": true, "action": action, "detail": detail})
         }
         Err(error) => {
-            json!({"success": false, "action": if install {"install"} else {"uninstall"}, "error": format!("{error:#}")})
+            json!({"success": false, "action": action, "error": format!("{error:#}")})
         }
     };
     if let Some(path) = report_path {
@@ -535,6 +666,132 @@ fn default_install_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_modes_are_mutually_exclusive() {
+        assert_eq!(
+            deployment_mode(&[], "StockIpoReminder-Setup").unwrap(),
+            Some(DeploymentMode::Install)
+        );
+        assert_eq!(
+            deployment_mode(&[], "StockIpoReminder-Uninstaller").unwrap(),
+            Some(DeploymentMode::Uninstall)
+        );
+        assert_eq!(
+            deployment_mode(&["--install".to_owned()], "StockIpoReminder").unwrap(),
+            Some(DeploymentMode::Install)
+        );
+        assert_eq!(
+            deployment_mode(&["--msi-uninstall-helper".to_owned()], "x").unwrap(),
+            Some(DeploymentMode::MsiUninstallHelper)
+        );
+        assert_eq!(
+            deployment_mode(&["--unrelated".to_owned()], "StockIpoReminder").unwrap(),
+            None
+        );
+        let mode_flags = [
+            "--install",
+            "--uninstall",
+            "--uninstall-helper",
+            "--msi-uninstall-helper",
+        ];
+        for first in 0..mode_flags.len() {
+            for second in (first + 1)..mode_flags.len() {
+                assert!(
+                    deployment_mode(
+                        &[mode_flags[first].to_owned(), mode_flags[second].to_owned(),],
+                        "StockIpoReminder"
+                    )
+                    .is_err(),
+                    "{} 与 {} 应互斥",
+                    mode_flags[first],
+                    mode_flags[second]
+                );
+            }
+        }
+        assert!(deployment_mode(&["--uninstall".to_owned()], "StockIpoReminder-Setup").is_err());
+        assert!(
+            deployment_mode(&["--install".to_owned()], "StockIpoReminder-Uninstaller").is_err()
+        );
+    }
+
+    #[test]
+    fn deployment_accepts_only_well_formed_arguments_for_the_selected_mode() {
+        assert!(
+            validate_mode_arguments(
+                &["--install".to_owned(), "--no-launch".to_owned()],
+                DeploymentMode::Install
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode_arguments(
+                &[
+                    "--uninstall".to_owned(),
+                    "--data-root".to_owned(),
+                    "C:\\d".to_owned(),
+                    "--purge-data".to_owned(),
+                    "--purge-confirmation".to_owned(),
+                    DATA_PURGE_CONFIRMATION.to_owned(),
+                ],
+                DeploymentMode::Uninstall
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode_arguments(
+                &[
+                    "--msi-uninstall-helper".to_owned(),
+                    "--product-code".to_owned(),
+                    "{PRODUCT-CODE}".to_owned(),
+                    "--parent-pid".to_owned(),
+                    "123".to_owned(),
+                ],
+                DeploymentMode::MsiUninstallHelper
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode_arguments(&["--product-code".to_owned()], DeploymentMode::Install)
+                .is_err()
+        );
+        assert!(
+            validate_mode_arguments(&["--no-launch".to_owned()], DeploymentMode::Uninstall)
+                .is_err()
+        );
+        assert!(
+            validate_mode_arguments(
+                &["--install".to_owned(), "--unknown".to_owned()],
+                DeploymentMode::Install
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mode_arguments(
+                &["--install".to_owned(), "--data-root".to_owned()],
+                DeploymentMode::Install
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mode_arguments(
+                &["--install".to_owned(), "--install".to_owned()],
+                DeploymentMode::Install
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mode_arguments(
+                &[
+                    "--uninstall".to_owned(),
+                    "--purge-confirmation".to_owned(),
+                    DATA_PURGE_CONFIRMATION.to_owned(),
+                ],
+                DeploymentMode::Uninstall
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn purge_requires_exact_confirmation_phrase() {

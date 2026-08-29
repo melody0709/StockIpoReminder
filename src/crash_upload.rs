@@ -203,8 +203,9 @@ fn validated_https_url(value: &str, label: &str) -> Result<Url> {
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.fragment().is_some()
     {
-        bail!("{label}必须使用不含凭据的 HTTPS URL");
+        bail!("{label}必须使用不含凭据和片段的 HTTPS URL");
     }
     Ok(url)
 }
@@ -253,10 +254,17 @@ fn write_last_result(data_root: &Path, result: &Result<UploadOutcome>) -> Result
             "error": operations::redact(&format!("{error:#}"))
         }),
     };
-    fs::write(
-        directory.join("crash-upload-last-result.json"),
-        serde_json::to_vec_pretty(&value)?,
-    )?;
+    let path = directory.join("crash-upload-last-result.json");
+    // 与 save_state 一致：临时文件 + 原子替换，避免进程中断留下半写 JSON。
+    let temporary = directory.join(format!(
+        "crash-upload-last-result-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
+    if let Err(error) = operations::atomic_replace_file(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("无法提交崩溃报告上传结果");
+    }
     Ok(())
 }
 
@@ -402,6 +410,31 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_https_url_rejects_password_only_and_fragment() {
+        assert!(
+            validated_https_url(
+                "https://:secret@reports.example.invalid/v1/crashes",
+                "崩溃报告接收地址"
+            )
+            .is_err()
+        );
+        assert!(
+            validated_https_url(
+                "https://reports.example.invalid/v1/crashes#frag",
+                "崩溃报告接收地址"
+            )
+            .is_err()
+        );
+        assert!(
+            validated_https_url(
+                "https://reports.example.invalid/v1/crashes",
+                "崩溃报告接收地址"
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn configuration_requires_two_credential_free_https_urls() {

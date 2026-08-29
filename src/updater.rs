@@ -14,7 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::windows_integration;
+use crate::{operations, windows_integration};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -132,6 +132,45 @@ pub fn check_for_update() -> Result<UpdateCheck> {
     }))
 }
 
+/// 下载/验签过程的清理守卫：helper 成功启动前任何失败都尽力删除已生成的
+/// 更新文件（.part 与改名后的 .msi），避免失败残留长期占用磁盘。
+struct PendingUpdateFile {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl PendingUpdateFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            paths: vec![path],
+            armed: true,
+        }
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingUpdateFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for path in &self.paths {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                operations::log("WARN", &format!("清理未完成的更新文件失败：{error}"));
+            }
+        }
+    }
+}
+
 pub fn download_and_request_install(data_root: &Path, update: &AvailableUpdate) -> Result<String> {
     if crate::deployment::installed_msi_product_code()?.is_none() {
         bail!("自动更新只支持由 Windows Installer 管理的安装版");
@@ -141,14 +180,25 @@ pub fn download_and_request_install(data_root: &Path, update: &AvailableUpdate) 
     fs::create_dir_all(&directory).context("无法创建更新下载目录")?;
     let (partial, installer) =
         update_download_paths(&directory, &update.manifest.version, Uuid::new_v4());
-    download_installer(&client, update, &partial)?;
-    fs::rename(&partial, &installer).context("无法提交已验证的更新安装包")?;
-    verify_authenticode(&installer, TRUSTED_UPDATE_SIGNER_SHA256)?;
-    dispatch_install_helper(data_root, &installer, &update.manifest.installer.sha256)?;
-    Ok(format!(
-        "{} 已下载并通过签名校验；程序退出后将启动 Windows Installer",
-        update.manifest.version
-    ))
+    let mut guard = PendingUpdateFile::new(partial.clone());
+    let result = (|| -> Result<()> {
+        download_installer(&client, update, &partial)?;
+        fs::rename(&partial, &installer).context("无法提交已验证的更新安装包")?;
+        guard.track(installer.clone());
+        verify_authenticode(&installer, TRUSTED_UPDATE_SIGNER_SHA256)?;
+        dispatch_install_helper(data_root, &installer, &update.manifest.installer.sha256)?;
+        Ok(())
+    })();
+    if result.is_ok() {
+        // helper 成功启动后由安装流程接管安装包；失败路径由守卫清理。
+        guard.disarm();
+    }
+    result.map(|()| {
+        format!(
+            "{} 已下载并通过签名校验；程序退出后将启动 Windows Installer",
+            update.manifest.version
+        )
+    })
 }
 
 fn update_download_paths(
@@ -223,8 +273,13 @@ fn update_client() -> Result<Client> {
 
 fn validated_https_url(value: &str, label: &str) -> Result<Url> {
     let url = Url::parse(value).with_context(|| format!("{label} URL 无效"))?;
-    if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty() {
-        bail!("{label}必须使用不含凭据的 HTTPS URL");
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("{label}必须使用不含凭据和片段的 HTTPS URL");
     }
     Ok(url)
 }
@@ -746,6 +801,28 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_https_url_rejects_password_only_and_fragment() {
+        assert!(
+            validated_https_url(
+                "https://:secret@updates.example.invalid/manifest.json",
+                "更新清单"
+            )
+            .is_err()
+        );
+        assert!(
+            validated_https_url(
+                "https://updates.example.invalid/manifest.json#frag",
+                "更新清单"
+            )
+            .is_err()
+        );
+        assert!(
+            validated_https_url("https://updates.example.invalid/manifest.json", "更新清单")
+                .is_ok()
+        );
+    }
 
     fn manifest() -> UpdateManifest {
         UpdateManifest {

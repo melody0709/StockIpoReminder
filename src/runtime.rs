@@ -543,7 +543,8 @@ fn run_loop(
         .map(|_| now_china().date_naive());
     let mut last_maintenance_date = None::<NaiveDate>;
     let initial_now = now_china();
-    let initial_schedule = automatic_sync_schedule(&database, initial_now);
+    let initial_settings = database.settings()?;
+    let initial_schedule = automatic_sync_schedule(database, &initial_settings, initial_now);
     let mut automatic_sync_not_before = (suppress_overdue_initial_sync
         && initial_schedule.due_at <= initial_now)
         .then(|| next_workday_at(initial_now.date_naive(), DAILY_DISCOVERY_HOUR));
@@ -554,13 +555,16 @@ fn run_loop(
             return Ok(());
         }
         let now = now_china();
-        database.touch_heartbeat("scheduler", now)?;
-        database.touch_heartbeat("delivery", now)?;
+        database.touch_runtime_heartbeats(now)?;
+        // 本轮是否发生过会改变 deadline 基础数据的写入；未写入时
+        // deadline 计算直接复用本轮开头读取的结果，避免重复查询。
+        let mut did_writes = false;
         let lifecycle_due = database.next_lifecycle_transition_at(now)?;
         if lifecycle_due.is_some_and(|due_at| due_at <= now) {
             if database.refresh_lifecycle()? {
                 refresh_requested = true;
             }
+            did_writes = true;
         }
 
         let local_delivery_due = database.next_local_delivery_at()?;
@@ -571,10 +575,11 @@ fn run_loop(
             if run_delivery_cycle(database, events, ui_state, data_root)? {
                 refresh_requested = true;
             }
+            did_writes = true;
         }
 
         let settings = database.settings()?;
-        let mut sync_schedule = automatic_sync_schedule(&database, now);
+        let mut sync_schedule = automatic_sync_schedule(database, &settings, now);
         apply_sync_not_before(&mut sync_schedule, automatic_sync_not_before);
         if let Some(retry_at) = forced_sync_retry {
             sync_schedule = AutomaticSyncSchedule {
@@ -591,6 +596,7 @@ fn run_loop(
             } else {
                 sync_schedule.reason.clone()
             };
+            did_writes = true;
             match synchronize(database, &client, ui_state, &reason, stop_requested) {
                 Ok(()) => forced_sync_retry = None,
                 Err(_) if stop_requested.load(Ordering::Acquire) => return Ok(()),
@@ -630,18 +636,13 @@ fn run_loop(
         }
 
         let summary_now = now_china();
-        let summary_settings = database.settings()?;
         let visible_snapshot = ui_state
             .snapshot
             .read()
             .map(|value| value.clone())
             .unwrap_or_default();
-        let health_due = next_health_summary_at(
-            &summary_settings,
-            &visible_snapshot,
-            last_health_date,
-            summary_now,
-        );
+        let health_due =
+            next_health_summary_at(&settings, &visible_snapshot, last_health_date, summary_now);
         if health_due.is_some_and(|due_at| due_at <= summary_now) {
             let details = database.health_details()?;
             let should_send = details.today_task_count > 0
@@ -670,15 +671,30 @@ fn run_loop(
         }
 
         let now = now_china();
-        let mut next_sync = automatic_sync_schedule(&database, now);
-        apply_sync_not_before(&mut next_sync, automatic_sync_not_before);
+        // deadline 计算：本轮发生过写入时基础数据已过期，必须重算；
+        // 否则复用本轮开头读取的三个 next_* 结果与同步计划。
+        let (deadline_local, deadline_secondary, deadline_lifecycle) = if did_writes {
+            (
+                database.next_local_delivery_at()?,
+                database.next_secondary_delivery_at(now)?,
+                database.next_lifecycle_transition_at(now)?,
+            )
+        } else {
+            (local_delivery_due, secondary_delivery_due, lifecycle_due)
+        };
+        let mut next_sync = if did_writes {
+            let mut schedule = automatic_sync_schedule(database, &settings, now);
+            apply_sync_not_before(&mut schedule, automatic_sync_not_before);
+            schedule
+        } else {
+            sync_schedule
+        };
         if let Some(retry_at) = forced_sync_retry {
             next_sync = AutomaticSyncSchedule {
                 due_at: retry_at,
                 reason: "上次同步异常后的必要重试".into(),
             };
         }
-        let settings = database.settings()?;
         let visible_snapshot = ui_state
             .snapshot
             .read()
@@ -691,15 +707,9 @@ fn run_loop(
         {
             deadline.consider(Some(next_sync_window_start(now)), "等待自动同步窗口");
         }
-        deadline.consider(database.next_local_delivery_at()?, "本地提醒到期");
-        deadline.consider(
-            database.next_secondary_delivery_at(now)?,
-            "第二通知通道到期或重试",
-        );
-        deadline.consider(
-            database.next_lifecycle_transition_at(now)?,
-            "任务生命周期切换",
-        );
+        deadline.consider(deadline_local, "本地提醒到期");
+        deadline.consider(deadline_secondary, "第二通知通道到期或重试");
+        deadline.consider(deadline_lifecycle, "任务生命周期切换");
         deadline.consider(
             next_health_summary_at(&settings, &visible_snapshot, last_health_date, now),
             "每日健康摘要",
@@ -813,20 +823,23 @@ fn automatic_sync_interval_for(settings: &AppSettings, active_day: bool) -> Dura
     Duration::from_secs(minutes * 60)
 }
 
-fn automatic_sync_schedule(database: &Database, now: ChinaDateTime) -> AutomaticSyncSchedule {
-    let settings = database.settings().unwrap_or_default();
-    let active_day = has_active_sync_tasks(database, &settings, now.date_naive());
+fn automatic_sync_schedule(
+    database: &Database,
+    settings: &AppSettings,
+    now: ChinaDateTime,
+) -> AutomaticSyncSchedule {
+    let active_day = has_active_sync_tasks(database, settings, now.date_naive());
     let has_tomorrow_event = has_sync_relevant_events_on(
         database,
-        &settings,
+        settings,
         now.date_naive() + chrono::Duration::days(1),
     );
-    let needs_follow_up_discovery = has_unknown_follow_up_events(database, &settings, now);
+    let needs_follow_up_discovery = has_unknown_follow_up_events(database, settings, now);
     let last_sync = database.latest_sync_conclusion().ok().flatten();
     let next_source_retry = database.next_source_retry_at().ok().flatten();
     let identity = database.path().to_string_lossy();
     automatic_sync_schedule_for(
-        &settings,
+        settings,
         now,
         active_day,
         has_tomorrow_event,

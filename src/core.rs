@@ -144,10 +144,13 @@ pub fn effective_cutoff(event: &IpoEvent, settings: &AppSettings) -> NaiveTime {
     } else {
         event.sessions.clone()
     };
+    // 语义是「最后结束的时段」：取最大的 official_end，
+    // 不依赖 Vec 存储顺序或场次号，对乱序数据稳健。
     settings.safety_cutoff.min(
         sessions
-            .last()
-            .map(|s| s.official_end)
+            .iter()
+            .map(|session| session.official_end)
+            .max()
             .unwrap_or(time(15, 0)),
     )
 }
@@ -160,7 +163,12 @@ pub fn plan_reminders(
     let Some(date) = event.apply_date else {
         return vec![];
     };
-    if event.is_terminal() || !settings.exchange_enabled(event.exchange) {
+    // Postponed 在业务上可恢复（新申购日公布后重新规划），因此不并入
+    // is_terminal()；但在恢复前必须停止全部申购提醒。
+    if event.is_terminal()
+        || event.status == IssueStatus::Postponed
+        || !settings.exchange_enabled(event.exchange)
+    {
         return vec![];
     }
     let mut sessions = if event.sessions.is_empty() {
@@ -329,17 +337,29 @@ pub fn reconcile_candidates(
         .unwrap_or_else(|| security_code.clone());
     let apply_code = pick_text(&usable, |c| c.apply_code.as_ref())
         .or_else(|| existing.and_then(|e| e.apply_code.clone()));
-    let apply_date =
+    let selected_apply_date =
         pick(&usable, |c| c.apply_date).or_else(|| existing.and_then(|e| e.apply_date));
     let issue_price =
         pick(&usable, |c| c.issue_price).or_else(|| existing.and_then(|e| e.issue_price));
-    let status = usable
+    let selected_status = usable
         .iter()
         .find_map(|c| (c.status != IssueStatus::Unknown).then_some(c.status))
         .or_else(|| existing.map(|e| e.status))
         .unwrap_or(IssueStatus::Unknown);
+    let apply_date_conflict = conflicts(&usable, |c| c.apply_date.map(|d| d.to_string()));
+    let status_conflict = conflicts(&usable, |c| {
+        (c.status != IssueStatus::Unknown).then(|| format!("{:?}", c.status))
+    });
+    let (apply_date, status) = resolve_postponed_transition(
+        &usable,
+        existing,
+        selected_apply_date,
+        selected_status,
+        apply_date_conflict,
+        status_conflict,
+    );
     let conflict = conflicts(&usable, |c| c.apply_code.clone())
-        || conflicts(&usable, |c| c.apply_date.map(|d| d.to_string()))
+        || apply_date_conflict
         || conflicts(&usable, |c| c.issue_price.map(|v| v.to_string()))
         || conflicts(&usable, |c| c.lot_size.map(|v| v.to_string()))
         || conflicts(&usable, |c| c.max_apply_quantity.map(|v| v.to_string()))
@@ -349,9 +369,7 @@ pub fn reconcile_candidates(
         || conflicts(&usable, |c| c.payment_date.map(|v| v.to_string()))
         || conflicts(&usable, |c| c.listing_date.map(|v| v.to_string()))
         || conflicts(&usable, candidate_session_signature)
-        || conflicts(&usable, |c| {
-            (c.status != IssueStatus::Unknown).then(|| format!("{:?}", c.status))
-        });
+        || status_conflict;
     let distinct_sources = usable
         .iter()
         .map(|candidate| candidate.source.as_str())
@@ -429,6 +447,58 @@ pub fn reconcile_candidates(
         first_seen_at: existing.map(|e| e.first_seen_at).unwrap_or(now),
         updated_at: now,
     })
+}
+
+/// 官方交易所/巨潮/北交所候选使用 200；聚合源使用 100。非人工
+/// Postponed 只能由同一条高可信候选携带“正常状态 + 不同新日期”恢复。
+const TRUSTED_CANDIDATE_PRIORITY: i32 = 200;
+
+fn resolve_postponed_transition(
+    candidates: &[&Candidate],
+    existing: Option<&IpoEvent>,
+    selected_apply_date: Option<NaiveDate>,
+    selected_status: IssueStatus,
+    apply_date_conflict: bool,
+    status_conflict: bool,
+) -> (Option<NaiveDate>, IssueStatus) {
+    let Some(previous) = existing.filter(|event| {
+        event.status == IssueStatus::Postponed
+            && !event
+                .manual_override_fields
+                .iter()
+                .any(|field| field == "IssueStatus")
+    }) else {
+        return (selected_apply_date, selected_status);
+    };
+
+    // 更严重或明确的非正常状态仍可更新；这里只阻止由日期派生出的
+    // Upcoming/Active 在缺少可信新日期时把 Postponed 静默解封。
+    if matches!(
+        selected_status,
+        IssueStatus::Suspended | IssueStatus::Terminated | IssueStatus::Completed
+    ) {
+        return (selected_apply_date, selected_status);
+    }
+
+    if !apply_date_conflict
+        && !status_conflict
+        && let Some(candidate) = candidates.iter().copied().find(|candidate| {
+            candidate.priority >= TRUSTED_CANDIDATE_PRIORITY
+                && matches!(
+                    candidate.status,
+                    IssueStatus::Upcoming | IssueStatus::Active
+                )
+                && candidate
+                    .apply_date
+                    .is_some_and(|date| Some(date) != previous.apply_date)
+        })
+    {
+        return (candidate.apply_date, candidate.status);
+    }
+
+    // 冲突期间保留遗留日期；否则把某个冲突值写入后，会导致冲突消失时
+    // “新日期”与已保存值相同，从而永远无法恢复。
+    (previous.apply_date, IssueStatus::Postponed)
 }
 
 fn pick<T: Copy>(items: &[&Candidate], selector: impl Fn(&Candidate) -> Option<T>) -> Option<T> {
@@ -650,6 +720,20 @@ mod tests {
     }
 
     #[test]
+    fn postponed_event_has_no_reminders() {
+        let mut value = event(NaiveDate::from_ymd_opt(2026, 8, 25).unwrap());
+        value.status = IssueStatus::Postponed;
+        assert!(
+            plan_reminders(
+                &value,
+                &AppSettings::default(),
+                at(value.apply_date.unwrap(), time(10, 0))
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn acknowledged_event_plans_only_known_post_apply_prompts() {
         let apply_date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
         let mut value = event(apply_date);
@@ -746,6 +830,44 @@ mod tests {
         );
         assert_eq!(reminders.len(), 1);
         assert_eq!(reminders[0].level, ReminderLevel::ListingMorning);
+    }
+
+    #[test]
+    fn effective_cutoff_uses_latest_official_end_regardless_of_order() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        let mut value = event(date);
+        let settings = AppSettings::default();
+        // 乱序存储：先下午场（结束 15:00），再上午场（结束 11:30）。
+        // 语义是「最后结束的时段」→ max(official_end)=15:00，再与
+        // 默认安全截止 14:55 取小；若错误地取 .last() 会得到 11:30。
+        value.sessions = vec![
+            SubscriptionSession {
+                session_number: 1,
+                official_start: time(13, 0),
+                official_end: time(15, 0),
+                broker_accept_start: Some(time(9, 15)),
+                safety_cutoff: None,
+                funding_mode: FundingMode::MarketValue,
+                allocation_time_sensitive: false,
+                source: "fixture-a".into(),
+                source_published_at: None,
+            },
+            SubscriptionSession {
+                session_number: 2,
+                official_start: time(9, 30),
+                official_end: time(11, 30),
+                broker_accept_start: None,
+                safety_cutoff: None,
+                funding_mode: FundingMode::MarketValue,
+                allocation_time_sensitive: false,
+                source: "fixture-a".into(),
+                source_published_at: None,
+            },
+        ];
+        assert_eq!(effective_cutoff(&value, &settings), time(14, 55));
+        // 空时段回退默认截止。
+        value.sessions = vec![];
+        assert_eq!(effective_cutoff(&value, &settings), time(14, 55));
     }
 
     #[test]
@@ -931,6 +1053,79 @@ mod tests {
             announcement_url: None,
             sessions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn non_manual_postponed_requires_a_trusted_consistent_new_date_to_resume() {
+        let old_date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let new_date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let now = at(old_date - Duration::days(1), time(8, 0));
+        let mut existing = event(old_date);
+        existing.status = IssueStatus::Postponed;
+
+        let mut same_date = resolved_candidate_fixture(old_date, now);
+        same_date.priority = TRUSTED_CANDIDATE_PRIORITY;
+        same_date.status = IssueStatus::Upcoming;
+        let unchanged =
+            reconcile_candidates(&[same_date], Some(&existing), &AppSettings::default(), now)
+                .unwrap();
+        assert_eq!(unchanged.status, IssueStatus::Postponed);
+        assert_eq!(unchanged.apply_date, Some(old_date));
+
+        let mut untrusted = resolved_candidate_fixture(new_date, now);
+        untrusted.priority = TRUSTED_CANDIDATE_PRIORITY - 1;
+        untrusted.status = IssueStatus::Upcoming;
+        let unchanged =
+            reconcile_candidates(&[untrusted], Some(&existing), &AppSettings::default(), now)
+                .unwrap();
+        assert_eq!(unchanged.status, IssueStatus::Postponed);
+        assert_eq!(unchanged.apply_date, Some(old_date));
+
+        let mut trusted = resolved_candidate_fixture(new_date, now);
+        trusted.priority = TRUSTED_CANDIDATE_PRIORITY;
+        trusted.status = IssueStatus::Upcoming;
+        let resumed =
+            reconcile_candidates(&[trusted], Some(&existing), &AppSettings::default(), now)
+                .unwrap();
+        assert_eq!(resumed.status, IssueStatus::Upcoming);
+        assert_eq!(resumed.apply_date, Some(new_date));
+        assert!(!plan_reminders(&resumed, &AppSettings::default(), now).is_empty());
+    }
+
+    #[test]
+    fn postponed_keeps_the_legacy_date_until_new_date_conflicts_clear() {
+        let old_date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let first_new_date = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let second_new_date = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        let now = at(old_date - Duration::days(1), time(8, 0));
+        let mut existing = event(old_date);
+        existing.status = IssueStatus::Postponed;
+
+        let mut first = resolved_candidate_fixture(first_new_date, now);
+        first.priority = TRUSTED_CANDIDATE_PRIORITY;
+        first.source = "official".into();
+        first.status = IssueStatus::Upcoming;
+        let mut second = resolved_candidate_fixture(second_new_date, now);
+        second.source = "mirror".into();
+        second.status = IssueStatus::Upcoming;
+
+        let conflicted = reconcile_candidates(
+            &[first.clone(), second],
+            Some(&existing),
+            &AppSettings::default(),
+            now,
+        )
+        .unwrap();
+        assert!(conflicted.data_conflict);
+        assert_eq!(conflicted.status, IssueStatus::Postponed);
+        assert_eq!(conflicted.apply_date, Some(old_date));
+        assert!(plan_reminders(&conflicted, &AppSettings::default(), now).is_empty());
+
+        let resumed =
+            reconcile_candidates(&[first], Some(&conflicted), &AppSettings::default(), now)
+                .unwrap();
+        assert_eq!(resumed.status, IssueStatus::Upcoming);
+        assert_eq!(resumed.apply_date, Some(first_new_date));
     }
 
     #[test]

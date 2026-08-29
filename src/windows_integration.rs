@@ -405,6 +405,16 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 fn xml_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
+        // XML 1.0 Char 合法范围：#x9 | #xA | #xD | [#x20-#xD7FF] |
+        // [#xE000-#xFFFD] | [#x10000-#x10FFFF]。TAB/LF/CR 合法必须保留，
+        // 其余 C0 控制字符会导致 XmlDocument::LoadXml 失败。
+        let is_legal = matches!(character, '\t' | '\n' | '\r')
+            || ('\u{20}'..='\u{D7FF}').contains(&character)
+            || ('\u{E000}'..='\u{FFFD}').contains(&character)
+            || ('\u{10000}'..='\u{10FFFF}').contains(&character);
+        if !is_legal {
+            continue;
+        }
         match character {
             '&' => escaped.push_str("&amp;"),
             '<' => escaped.push_str("&lt;"),
@@ -1107,11 +1117,22 @@ pub fn delete_after_reboot(path: &Path) {
         use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
-            let _ = MoveFileExW(
+            let result = MoveFileExW(
                 PCWSTR(wide.as_ptr()),
                 PCWSTR::null(),
                 MOVEFILE_DELAY_UNTIL_REBOOT,
             );
+            if result.is_err() {
+                // 调度删除失败不能静默：残留文件依赖维护清理兜底。
+                crate::operations::log(
+                    "WARN",
+                    &format!(
+                        "注册重启后删除失败：{}（Windows 错误码 {}）",
+                        crate::operations::redact(&path.display().to_string()),
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    ),
+                );
+            }
         }
     }
     #[cfg(not(windows))]
@@ -1123,6 +1144,18 @@ pub fn delete_after_reboot(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_escape_keeps_xml_10_chars_and_filters_illegal_control_bytes() {
+        assert_eq!(xml_escape("a\tb\nc\rd"), "a\tb\nc\rd");
+        assert_eq!(
+            xml_escape("<a>&\"'</a>"),
+            "&lt;a&gt;&amp;&quot;&apos;&lt;/a&gt;"
+        );
+        assert_eq!(xml_escape("中\u{0}文\u{8}"), "中文");
+        assert_eq!(xml_escape("emoji \u{1F600}"), "emoji \u{1F600}");
+        assert_eq!(xml_escape(""), "");
+    }
 
     #[test]
     fn activation_message_is_stable_and_scoped_to_the_data_root() {

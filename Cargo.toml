@@ -24,6 +24,7 @@ slint = { version = "1.17.1", default-features = false, features = ["std", "back
 url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8.35"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

@@ -14,8 +14,37 @@ macro_rules! numeric_enum {
             pub fn from_i32(value: i32) -> Self {
                 match value { $($value => Self::$variant,)+ _ => Self::Unknown }
             }
+            /// 与 `from_i32` 相同的可恢复映射（未知值 → Unknown），
+            /// 但会记录一次带去重的诊断日志，便于发现新旧版本枚举不一致。
+            #[allow(dead_code)]
+            pub fn from_i32_tracked(field: &'static str, value: i32) -> Self {
+                match value { $($value => Self::$variant,)+ other => {
+                    log_unknown_enum_value(stringify!($name), field, other);
+                    Self::Unknown
+                }}
+            }
         }
     };
+}
+
+/// 同一 (enum, 字段, 原始值) 组合在进程内只记录一次，避免 UI 高频读取刷屏。
+fn log_unknown_enum_value(enum_name: &'static str, field: &'static str, raw: i32) {
+    use std::{
+        collections::HashSet,
+        sync::{LazyLock, Mutex},
+    };
+    type ReportedKey = (&'static str, &'static str, i32);
+    static REPORTED: LazyLock<Mutex<HashSet<ReportedKey>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let mut reported = REPORTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reported.insert((enum_name, field, raw)) {
+        crate::operations::log(
+            "WARN",
+            &format!("数据库读到未知枚举值：{enum_name}.{field}={raw}，已按 Unknown 处理"),
+        );
+    }
 }
 
 numeric_enum!(Exchange { Unknown = 0, Shanghai = 1, Shenzhen = 2, Beijing = 3 });

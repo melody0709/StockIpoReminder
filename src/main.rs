@@ -21,7 +21,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -29,11 +29,12 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::NaiveTime;
 use model::{
-    AppSettings, Board, DataQualityStatus, Exchange, HealthState, IpoEvent, LifecycleStatus,
-    ReminderDelivery, ReminderLevel, SecondaryNotificationProvider,
+    AnnouncementDocument, AppSettings, Board, DataQualityStatus, Exchange, FieldSourceEntry,
+    HealthState, IpoEvent, LifecycleStatus, ManualOverrideEntry, ReminderDelivery, ReminderLevel,
+    SecondaryNotificationProvider,
 };
 use runtime::{RuntimeHandle, UiEvent};
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, Timer, VecModel};
+use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, VecModel};
 
 slint::include_modules!();
 
@@ -256,6 +257,8 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     let run_result = slint::run_event_loop_until_quit().context("Slint 事件循环异常");
     let _ = ui.hide();
     let _ = reminder_window.hide();
+    // 等 UI 发起的后台数据库/文件操作全部安全收尾，避免进程退出时硬中断事务。
+    wait_for_ui_workers();
     runtime.remove_ui_notifier();
     runtime.stop();
     let _ = runtime_thread.join();
@@ -331,6 +334,30 @@ fn install_runtime_ui_bridge(
     });
 }
 
+/// 提醒呈现时的副作用开关。独立成结构以便对「设置读取结果 → 副作用」
+/// 的决策做单元测试（成功、全部关闭、读取失败 fail-closed）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReminderAlerts {
+    sound: bool,
+    flash: bool,
+    toast: bool,
+}
+
+impl ReminderAlerts {
+    fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            sound: settings.sound_enabled,
+            flash: settings.flash_taskbar,
+            toast: cfg!(windows) && settings.toast_enabled,
+        }
+    }
+
+    /// 设置读取失败时默认关闭全部副作用。
+    fn fail_closed() -> Self {
+        Self::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_runtime_ui(
     window: &slint::Weak<MainWindow>,
@@ -352,12 +379,15 @@ fn drain_runtime_ui(
     let snapshot = runtime.snapshot();
     let mut apply_startup = false;
     let mut refresh = false;
-    if let Ok(mut state) = bridge_state.lock() {
+    // revision 只有在刷新真正完成后才提交；提前提交会让失败后的同一 revision
+    // 不再触发刷新，任务列表可能长期为空。
+    let mut pending_revision = None::<u64>;
+    if let Ok(state) = bridge_state.lock() {
         if !state.startup_applied && runtime.is_ready() {
             apply_startup = true;
         }
         if state.last_ui_revision != Some(snapshot.revision) {
-            state.last_ui_revision = Some(snapshot.revision);
+            pending_revision = Some(snapshot.revision);
             refresh = true;
         }
     }
@@ -424,8 +454,12 @@ fn drain_runtime_ui(
             });
         }
     }
-    if refresh {
-        refresh_ui(&ui, runtime);
+    if refresh
+        && refresh_ui(&ui, runtime)
+        && let Some(revision) = pending_revision
+        && let Ok(mut state) = bridge_state.lock()
+    {
+        state.last_ui_revision = Some(revision);
     }
 
     #[cfg(windows)]
@@ -468,21 +502,26 @@ fn drain_runtime_ui(
         reminder_window.set_batch_count(deliveries.len() as i32);
         reminder_window.set_can_acknowledge(batch.can_acknowledge);
         let shown = show_dedicated_reminder(&reminder_window);
-        let settings = runtime.settings().unwrap_or_else(|error| {
-            operations::log(
-                "ERROR",
-                &format!("提醒呈现时读取设置失败，使用安全通知默认值：{error:#}"),
-            );
-            AppSettings::default()
-        });
-        if settings.sound_enabled {
+        // 设置读取失败时 fail-closed：不回退默认值，避免在用户明确关闭
+        // 声音/闪烁/Toast 的情况下误触发提醒副作用。
+        let alerts = match runtime.settings() {
+            Ok(settings) => ReminderAlerts::from_settings(&settings),
+            Err(error) => {
+                operations::log(
+                    "ERROR",
+                    &format!("提醒呈现时读取设置失败，跳过声音/闪烁/Toast 副作用：{error:#}"),
+                );
+                ReminderAlerts::fail_closed()
+            }
+        };
+        if alerts.sound {
             windows_integration::play_alert();
         }
-        if settings.flash_taskbar {
+        if alerts.flash {
             windows_integration::flash_window(reminder_window.window());
         }
         #[cfg(windows)]
-        if settings.toast_enabled {
+        if alerts.toast {
             tray.notify(
                 &batch.title,
                 &batch.body,
@@ -526,6 +565,16 @@ fn drain_runtime_ui(
                     }
                 }
             });
+        } else {
+            // 窗口完全无法显示：既不能完成也不能保持租约，走既有 fail_delivery
+            // 退避与 last_error 记录，避免 2 分钟租约到期后无退避地无限重试。
+            for delivery in &deliveries {
+                if let Err(error) =
+                    runtime.fail_delivery(delivery, "专用提醒窗口显示失败，已记录并按既有退避重试")
+                {
+                    operations::log("ERROR", &format!("记录提醒投递失败状态时出错：{error:#}"));
+                }
+            }
         }
     } else if let Some((state, text)) = health_summary {
         reminder_window.set_reminder_title(match state {
@@ -786,6 +835,38 @@ fn force_reminder_repaint(window: &ReminderWindow) {
     window.window().request_redraw();
 }
 
+/// UI 发起的后台工作线程数量；退出时等待其收尾，避免数据库写入被硬中断。
+static UI_WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Drop 时机覆盖正常结束与 panic 展开，保证计数在两条路径下都会归还。
+struct UiWorkerGuard;
+
+impl Drop for UiWorkerGuard {
+    fn drop(&mut self) {
+        UI_WORKER_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn spawn_ui_worker(name: &str, body: impl FnOnce() + Send + 'static) -> Result<(), std::io::Error> {
+    UI_WORKER_COUNT.fetch_add(1, Ordering::AcqRel);
+    let spawned = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _worker_guard = UiWorkerGuard;
+            body();
+        });
+    if spawned.is_err() {
+        UI_WORKER_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
+    spawned.map(|_| ())
+}
+
+fn wait_for_ui_workers() {
+    while UI_WORKER_COUNT.load(Ordering::Acquire) > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wire_reminder_callbacks(
     reminder: &ReminderWindow,
     main_window: &MainWindow,
@@ -846,12 +927,18 @@ fn wire_callbacks(
     secondary_notification_busy: Arc<AtomicBool>,
     #[cfg(windows)] tray: Arc<native_tray::NativeTray>,
 ) {
+    // UI 发起的数据库写入统一串行化：同一时刻只允许一个写操作在后台执行，
+    // 防止重复提交；诊断包生成独立门闩。
+    let ui_write_busy = Arc::new(AtomicBool::new(false));
+    let diagnostics_busy = Arc::new(AtomicBool::new(false));
     let weak = ui.as_weak();
     let settings_runtime = runtime.clone();
     let settings_data_root = data_root.clone();
+    let settings_save_busy = Arc::clone(&ui_write_busy);
     ui.on_save_settings(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let result = (|| -> Result<()> {
+        // 输入收集与校验留在 UI 线程；数据库写入与重规划移到工作线程。
+        let collected = (|| -> Result<(AppSettings, String)> {
             if !ui.get_shanghai_enabled() && !ui.get_shenzhen_enabled() && !ui.get_beijing_enabled()
             {
                 anyhow::bail!("至少需要启用一个市场");
@@ -910,33 +997,65 @@ fn wire_callbacks(
             }
             settings.normal_sync_minutes = normal_sync_minutes;
             settings.active_day_sync_minutes = active_day_sync_minutes;
-            save_settings_with_rollback(
-                &settings_runtime,
-                &settings_data_root,
+            Ok((settings, secondary_secret))
+        })();
+        let (settings, secondary_secret) = match collected {
+            Ok(collected) => collected,
+            Err(error) => {
+                ui.set_status_text(format!("保存设置失败：{error:#}").into());
+                return;
+            }
+        };
+        if settings_save_busy.swap(true, Ordering::AcqRel) {
+            ui.set_status_text("上一次设置保存仍在处理，请稍候再试".into());
+            return;
+        }
+        ui.set_status_text("正在保存设置并重算提醒计划…".into());
+        let save_runtime = settings_runtime.clone();
+        let save_data_root = settings_data_root.clone();
+        let save_window = ui.as_weak();
+        let settings_save_busy_worker = Arc::clone(&settings_save_busy);
+        let spawned = spawn_ui_worker("settings-save", move || {
+            let save_error = save_settings_with_rollback(
+                &save_runtime,
+                &save_data_root,
                 &settings,
                 (!secondary_secret.is_empty()).then_some(secondary_secret.as_str()),
-            )?;
-            settings_runtime.request_sync("设置变更");
-            Ok(())
-        })();
-        let saved = result.is_ok();
-        ui.set_status_text(match result {
-            Ok(()) => "设置已保存，提醒计划已重算".into(),
-            Err(error) => format!("保存设置失败：{error:#}").into(),
-        });
-        if let Ok(saved_settings) = settings_runtime.settings() {
-            apply_settings(&ui, &saved_settings);
-            if saved {
-                ui.set_secondary_notification_secret_entry("".into());
+            )
+            .err();
+            if save_error.is_none() {
+                save_runtime.request_sync("设置变更");
             }
-            refresh_secondary_notification_ui(
-                &ui,
-                &settings_data_root,
-                &saved_settings,
-                &settings_runtime,
-            );
+            let saved_settings = save_runtime.settings();
+            let callback_runtime = save_runtime.clone();
+            let callback_data_root = save_data_root.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                settings_save_busy_worker.store(false, Ordering::Release);
+                let Some(ui) = save_window.upgrade() else {
+                    return;
+                };
+                if let Some(error) = save_error {
+                    ui.set_status_text(format!("保存设置失败：{error:#}").into());
+                } else {
+                    ui.set_status_text("设置已保存，提醒计划已重算".into());
+                    ui.set_secondary_notification_secret_entry("".into());
+                }
+                if let Ok(saved_settings) = &saved_settings {
+                    apply_settings(&ui, saved_settings);
+                    refresh_secondary_notification_ui(
+                        &ui,
+                        &callback_data_root,
+                        saved_settings,
+                        &callback_runtime,
+                    );
+                }
+                refresh_ui(&ui, &save_runtime);
+            });
+        });
+        if let Err(error) = spawned {
+            settings_save_busy.store(false, Ordering::Release);
+            ui.set_status_text(format!("无法启动保存线程：{error}").into());
         }
-        refresh_ui(&ui, &settings_runtime);
     });
 
     let sync_runtime = runtime.clone();
@@ -965,92 +1084,192 @@ fn wire_callbacks(
 
     let acknowledge_runtime = runtime.clone();
     let weak = ui.as_weak();
+    let acknowledge_busy = Arc::clone(&ui_write_busy);
     ui.on_acknowledge(move |event_id, version| {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_status_text(
-            match acknowledge_runtime.acknowledge(event_id.as_str(), version) {
-                Ok(()) => "已记录确认，当前版本后续提醒已取消".into(),
-                Err(error) => format!("确认失败：{error:#}").into(),
-            },
-        );
-        refresh_ui(&ui, &acknowledge_runtime);
+        if acknowledge_busy.swap(true, Ordering::AcqRel) {
+            ui.set_status_text("上一次操作仍在处理，请稍候再试".into());
+            return;
+        }
+        ui.set_status_text("正在记录确认…".into());
+        let ack_runtime = acknowledge_runtime.clone();
+        let ack_event_id = event_id.to_string();
+        let ack_window = ui.as_weak();
+        let acknowledge_busy_worker = Arc::clone(&acknowledge_busy);
+        let spawned = spawn_ui_worker("acknowledge", move || {
+            let result = ack_runtime.acknowledge(&ack_event_id, version);
+            let _ = slint::invoke_from_event_loop(move || {
+                acknowledge_busy_worker.store(false, Ordering::Release);
+                let Some(ui) = ack_window.upgrade() else {
+                    return;
+                };
+                ui.set_status_text(match result {
+                    Ok(()) => "已记录确认，当前版本后续提醒已取消".into(),
+                    Err(error) => format!("确认失败：{error:#}").into(),
+                });
+                refresh_ui(&ui, &ack_runtime);
+            });
+        });
+        if let Err(error) = spawned {
+            acknowledge_busy.store(false, Ordering::Release);
+            ui.set_status_text(format!("无法启动后台线程：{error}").into());
+        }
     });
 
     let revoke_runtime = runtime.clone();
     let weak = ui.as_weak();
+    let revoke_busy = Arc::clone(&ui_write_busy);
     ui.on_revoke_acknowledgement(move |event_id, version| {
         let Some(ui) = weak.upgrade() else { return };
-        ui.set_status_text(
-            match revoke_runtime.revoke_acknowledgement(event_id.as_str(), version) {
-                Ok(()) => "已撤销确认，截止时间前的提醒已重新规划".into(),
-                Err(error) => format!("撤销失败：{error:#}").into(),
-            },
-        );
-        refresh_ui(&ui, &revoke_runtime);
+        if revoke_busy.swap(true, Ordering::AcqRel) {
+            ui.set_status_text("上一次操作仍在处理，请稍候再试".into());
+            return;
+        }
+        ui.set_status_text("正在撤销确认…".into());
+        let revoke_ack_runtime = revoke_runtime.clone();
+        let revoke_event_id = event_id.to_string();
+        let revoke_window = ui.as_weak();
+        let revoke_busy_worker = Arc::clone(&revoke_busy);
+        let spawned = spawn_ui_worker("revoke-acknowledgement", move || {
+            let result = revoke_ack_runtime.revoke_acknowledgement(&revoke_event_id, version);
+            let _ = slint::invoke_from_event_loop(move || {
+                revoke_busy_worker.store(false, Ordering::Release);
+                let Some(ui) = revoke_window.upgrade() else {
+                    return;
+                };
+                ui.set_status_text(match result {
+                    Ok(()) => "已撤销确认，截止时间前的提醒已重新规划".into(),
+                    Err(error) => format!("撤销失败：{error:#}").into(),
+                });
+                refresh_ui(&ui, &revoke_ack_runtime);
+            });
+        });
+        if let Err(error) = spawned {
+            revoke_busy.store(false, Ordering::Release);
+            ui.set_status_text(format!("无法启动后台线程：{error}").into());
+        }
     });
 
     let override_runtime = runtime.clone();
     let weak = ui.as_weak();
+    let apply_override_busy = Arc::clone(&ui_write_busy);
     ui.on_apply_override(
         move |event_id, version, field_index, value, reason, announcement_index| {
             let Some(ui) = weak.upgrade() else { return };
             let field = override_field_name(field_index);
-            let announcements = override_runtime
-                .announcements(event_id.as_str())
-                .unwrap_or_default();
-            let announcement_id = (announcement_index > 0)
-                .then(|| announcements.get((announcement_index - 1) as usize))
-                .flatten()
-                .map(|document| document.id.as_str());
-            match override_runtime.apply_override(
-                event_id.as_str(),
-                version,
-                field,
-                value.as_str(),
-                reason.as_str(),
-                announcement_id,
-            ) {
-                Ok(()) => {
-                    ui.set_status_text("人工覆盖已保存，并已重新规划提醒".into());
-                    ui.set_override_status("人工覆盖已保存，提醒计划已重算".into());
-                    ui.set_override_value("".into());
-                    ui.set_override_reason("".into());
-                }
-                Err(error) => {
-                    ui.set_status_text(format!("保存人工覆盖失败：{error:#}").into());
-                    ui.set_override_status(format!("保存失败：{error:#}").into());
-                }
+            let announcement_id = if announcement_index > 0 {
+                let selected = ui
+                    .get_announcement_rows()
+                    .row_data((announcement_index - 1) as usize);
+                let Some(selected) = selected else {
+                    ui.set_status_text("所选依据公告已变化，请刷新详情后重试".into());
+                    ui.set_override_status("所选依据公告已变化，请刷新详情后重试".into());
+                    return;
+                };
+                Some(selected.id.to_string())
+            } else {
+                None
+            };
+            if apply_override_busy.swap(true, Ordering::AcqRel) {
+                ui.set_status_text("上一次操作仍在处理，请稍候再试".into());
+                return;
             }
-            refresh_ui(&ui, &override_runtime);
-            show_event_details(&ui, &override_runtime, event_id.as_str());
-            ui.set_details_active_tab(3);
+            ui.set_status_text("正在保存人工覆盖…".into());
+            ui.set_override_status("正在保存人工覆盖…".into());
+            let save_override_runtime = override_runtime.clone();
+            let save_event_id = event_id.to_string();
+            let save_value = value.to_string();
+            let save_reason = reason.to_string();
+            let override_window = ui.as_weak();
+            let apply_override_busy_worker = Arc::clone(&apply_override_busy);
+            let spawned = spawn_ui_worker("apply-override", move || {
+                let result = save_override_runtime.apply_override(
+                    &save_event_id,
+                    version,
+                    field,
+                    &save_value,
+                    &save_reason,
+                    announcement_id.as_deref(),
+                );
+                let override_event_id = save_event_id.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    apply_override_busy_worker.store(false, Ordering::Release);
+                    let Some(ui) = override_window.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => {
+                            ui.set_status_text("人工覆盖已保存，并已重新规划提醒".into());
+                            ui.set_override_status("人工覆盖已保存，提醒计划已重算".into());
+                            ui.set_override_value("".into());
+                            ui.set_override_reason("".into());
+                        }
+                        Err(error) => {
+                            ui.set_status_text(format!("保存人工覆盖失败：{error:#}").into());
+                            ui.set_override_status(format!("保存失败：{error:#}").into());
+                        }
+                    }
+                    refresh_ui(&ui, &save_override_runtime);
+                    show_event_details(&ui, &save_override_runtime, override_event_id.as_str());
+                    ui.set_details_active_tab(3);
+                });
+            });
+            if let Err(error) = spawned {
+                apply_override_busy.store(false, Ordering::Release);
+                ui.set_status_text(format!("无法启动后台线程：{error}").into());
+            }
         },
     );
 
     let revoke_override_runtime = runtime.clone();
     let weak = ui.as_weak();
+    let revoke_override_busy = Arc::clone(&ui_write_busy);
     ui.on_revoke_override(move |event_id, version, override_id| {
         let Some(ui) = weak.upgrade() else { return };
-        let result = override_id
-            .as_str()
-            .parse::<i64>()
-            .context("人工覆盖记录编号无效")
-            .and_then(|override_id| {
-                revoke_override_runtime.revoke_override(event_id.as_str(), version, override_id)
-            });
-        match result {
-            Ok(()) => {
-                ui.set_status_text("人工覆盖已撤销，并已重新规划提醒".into());
-                ui.set_override_status("人工覆盖已撤销，提醒计划已重算".into());
-            }
-            Err(error) => {
-                ui.set_status_text(format!("撤销人工覆盖失败：{error:#}").into());
-                ui.set_override_status(format!("撤销失败：{error:#}").into());
-            }
+        let Ok(override_record_id) = override_id.as_str().parse::<i64>() else {
+            let error = anyhow::anyhow!("人工覆盖记录编号无效：{}", override_id.as_str());
+            ui.set_status_text(format!("撤销人工覆盖失败：{error:#}").into());
+            ui.set_override_status(format!("撤销失败：{error:#}").into());
+            return;
+        };
+        if revoke_override_busy.swap(true, Ordering::AcqRel) {
+            ui.set_status_text("上一次操作仍在处理，请稍候再试".into());
+            return;
         }
-        refresh_ui(&ui, &revoke_override_runtime);
-        show_event_details(&ui, &revoke_override_runtime, event_id.as_str());
-        ui.set_details_active_tab(3);
+        ui.set_status_text("正在撤销人工覆盖…".into());
+        ui.set_override_status("正在撤销人工覆盖…".into());
+        let revoke_runtime2 = revoke_override_runtime.clone();
+        let revoke_event_id = event_id.to_string();
+        let override_window = ui.as_weak();
+        let revoke_override_busy_worker = Arc::clone(&revoke_override_busy);
+        let spawned = spawn_ui_worker("revoke-override", move || {
+            let result =
+                revoke_runtime2.revoke_override(&revoke_event_id, version, override_record_id);
+            let override_event_id = revoke_event_id.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                revoke_override_busy_worker.store(false, Ordering::Release);
+                let Some(ui) = override_window.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        ui.set_status_text("人工覆盖已撤销，并已重新规划提醒".into());
+                        ui.set_override_status("人工覆盖已撤销，提醒计划已重算".into());
+                    }
+                    Err(error) => {
+                        ui.set_status_text(format!("撤销人工覆盖失败：{error:#}").into());
+                        ui.set_override_status(format!("撤销失败：{error:#}").into());
+                    }
+                }
+                refresh_ui(&ui, &revoke_runtime2);
+                show_event_details(&ui, &revoke_runtime2, override_event_id.as_str());
+                ui.set_details_active_tab(3);
+            });
+        });
+        if let Err(error) = spawned {
+            revoke_override_busy.store(false, Ordering::Release);
+            ui.set_status_text(format!("无法启动后台线程：{error}").into());
+        }
     });
 
     let weak = ui.as_weak();
@@ -1078,20 +1297,42 @@ fn wire_callbacks(
     let diagnostic_runtime = runtime.clone();
     let diagnostic_root = data_root.clone();
     let weak = ui.as_weak();
+    let diagnostics_swap_busy = Arc::clone(&diagnostics_busy);
     ui.on_create_diagnostics(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let result = diagnostic_runtime
-            .database()
-            .and_then(|database| operations::create_diagnostic_bundle(&diagnostic_root, database));
-        ui.set_status_text(match result {
-            Ok(path) => {
-                if let Some(directory) = path.parent() {
-                    let _ = windows_integration::open_folder(directory);
-                }
-                format!("诊断包已生成：{}", path.display()).into()
-            }
-            Err(error) => format!("诊断包生成失败：{error:#}").into(),
+        if diagnostics_swap_busy.swap(true, Ordering::AcqRel) {
+            ui.set_status_text("诊断包正在生成中，请稍候…".into());
+            return;
+        }
+        ui.set_status_text("正在生成诊断包（完整性检查与打包在后台进行）…".into());
+        let diagnostics_window = ui.as_weak();
+        let diagnostics_store_busy = Arc::clone(&diagnostics_swap_busy);
+        let worker_runtime = diagnostic_runtime.clone();
+        let worker_root = diagnostic_root.clone();
+        let spawned = spawn_ui_worker("diagnostics", move || {
+            let result = worker_runtime
+                .database()
+                .and_then(|database| operations::create_diagnostic_bundle(&worker_root, database));
+            let _ = slint::invoke_from_event_loop(move || {
+                diagnostics_store_busy.store(false, Ordering::Release);
+                let Some(ui) = diagnostics_window.upgrade() else {
+                    return;
+                };
+                ui.set_status_text(match result {
+                    Ok(path) => {
+                        if let Some(directory) = path.parent() {
+                            let _ = windows_integration::open_folder(directory);
+                        }
+                        format!("诊断包已生成：{}", path.display()).into()
+                    }
+                    Err(error) => format!("诊断包生成失败：{error:#}").into(),
+                });
+            });
         });
+        if let Err(error) = spawned {
+            diagnostics_swap_busy.store(false, Ordering::Release);
+            ui.set_status_text(format!("无法启动诊断线程：{error}").into());
+        }
     });
 
     let open_root = data_root.clone();
@@ -1956,7 +2197,9 @@ fn notification_test_display(value: Option<bool>, label: &str) -> (String, i32) 
     }
 }
 
-fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
+/// 刷新主窗口运行时状态与任务列表。返回 `false` 表示数据库读取失败、
+/// 刷新未完成；调用方不得据此推进已消费的 UI revision。
+fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bool {
     let snapshot = runtime.snapshot();
     ui.set_is_synchronizing(snapshot.is_synchronizing);
     ui.set_status_text(snapshot.status_text.clone().into());
@@ -1983,18 +2226,37 @@ fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
     ui.set_runtime_level(level);
 
     if !runtime.is_ready() {
-        return;
+        return false;
     }
 
     let settings = match runtime.settings() {
         Ok(settings) => settings,
         Err(error) => {
             ui.set_status_text(format!("读取应用设置失败：{error:#}").into());
-            return;
+            return false;
         }
     };
-    let today = runtime.today_events().unwrap_or_default();
-    let future = runtime.future_events().unwrap_or_default();
+    let today = match runtime.today_events() {
+        Ok(events) => events,
+        Err(error) => {
+            ui.set_status_text(format!("读取今日任务失败：{error:#}").into());
+            return false;
+        }
+    };
+    let future = match runtime.future_events() {
+        Ok(events) => events,
+        Err(error) => {
+            ui.set_status_text(format!("读取未来任务失败：{error:#}").into());
+            return false;
+        }
+    };
+    let health = match runtime.health_details() {
+        Ok(health) => health,
+        Err(error) => {
+            ui.set_status_text(format!("读取健康详情失败：{error:#}").into());
+            return false;
+        }
+    };
     let filter_text = ui.get_task_filter_text().to_string();
     let market_filter = ui.get_task_market_filter_index();
     let status_filter = ui.get_task_status_filter_index();
@@ -2036,49 +2298,48 @@ fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) {
             .collect::<Vec<_>>(),
     ))));
 
-    if let Ok(health) = runtime.health_details() {
-        ui.set_health_title(match health.overall_state {
-            HealthState::Healthy => "程序与数据源运行正常".into(),
-            HealthState::Warning => "存在待核验任务或异常数据源".into(),
-            HealthState::Failed => "提醒系统需要立即检查".into(),
-            _ => "健康状态尚未建立".into(),
-        });
-        ui.set_health_summary(
-            format!(
-                "今日任务 {} 只，待确认 {} 只，来源冲突 {} 只，待人工核验 {} 只，本地投递重试 {} 条。{}",
-                health.today_task_count,
-                health.pending_confirmation_count,
-                health.conflict_count,
-                health.manual_review_count,
-                health.delivery_retry_count,
-                health
-                    .latest_delivery_error
-                    .as_deref()
-                    .map(|error| format!(" 最近错误：{}", operations::redact(error)))
-                    .unwrap_or_default(),
+    ui.set_health_title(match health.overall_state {
+        HealthState::Healthy => "程序与数据源运行正常".into(),
+        HealthState::Warning => "存在待核验任务或异常数据源".into(),
+        HealthState::Failed => "提醒系统需要立即检查".into(),
+        _ => "健康状态尚未建立".into(),
+    });
+    ui.set_health_summary(
+        format!(
+            "今日任务 {} 只，待确认 {} 只，来源冲突 {} 只，待人工核验 {} 只，本地投递重试 {} 条。{}",
+            health.today_task_count,
+            health.pending_confirmation_count,
+            health.conflict_count,
+            health.manual_review_count,
+            health.delivery_retry_count,
+            health
+                .latest_delivery_error
+                .as_deref()
+                .map(|error| format!(" 最近错误：{}", operations::redact(error)))
+                .unwrap_or_default(),
+        )
+        .into(),
+    );
+    ui.set_heartbeat_text(snapshot.next_wake_text.clone().into());
+    let sources = health
+        .sources
+        .into_iter()
+        .map(|source| SourceHealthRow {
+            source: source.source.into(),
+            state: health_state_text(source.state).into(),
+            record_text: format!("记录 {}", source.last_record_count).into(),
+            last_success_text: format!(
+                "最近成功 {} · 连续失败 {}",
+                format_timestamp(source.last_success_at),
+                source.consecutive_failures
             )
             .into(),
-        );
-        ui.set_heartbeat_text(snapshot.next_wake_text.clone().into());
-        let sources = health
-            .sources
-            .into_iter()
-            .map(|source| SourceHealthRow {
-                source: source.source.into(),
-                state: health_state_text(source.state).into(),
-                record_text: format!("记录 {}", source.last_record_count).into(),
-                last_success_text: format!(
-                    "最近成功 {} · 连续失败 {}",
-                    format_timestamp(source.last_success_at),
-                    source.consecutive_failures
-                )
-                .into(),
-                error_text: source.last_error.unwrap_or_default().into(),
-                state_level: health_state_level(source.state),
-            })
-            .collect::<Vec<_>>();
-        ui.set_source_health(ModelRc::from(Rc::new(VecModel::from(sources))));
-    }
+            error_text: source.last_error.unwrap_or_default().into(),
+            state_level: health_state_level(source.state),
+        })
+        .collect::<Vec<_>>();
+    ui.set_source_health(ModelRc::from(Rc::new(VecModel::from(sources))));
+    true
 }
 
 fn task_matches_filter(
@@ -2206,203 +2467,240 @@ fn task_row(event: &IpoEvent, settings: &AppSettings) -> TaskRow {
     }
 }
 
+struct EventDetailsData {
+    event: IpoEvent,
+    field_sources: Vec<FieldSourceEntry>,
+    announcements: Vec<AnnouncementDocument>,
+    overrides: Vec<ManualOverrideEntry>,
+    settings: AppSettings,
+}
+
+fn load_event_details(runtime: &RuntimeHandle, event_id: &str) -> Result<Option<EventDetailsData>> {
+    let Some(event) = runtime.event(event_id)? else {
+        return Ok(None);
+    };
+    let field_sources = runtime.field_sources(event_id)?;
+    let announcements = runtime.announcements(event_id)?;
+    let overrides = runtime.manual_overrides(event_id, event.event_version)?;
+    let settings = runtime.settings()?;
+    Ok(Some(EventDetailsData {
+        event,
+        field_sources,
+        announcements,
+        overrides,
+        settings,
+    }))
+}
+
+/// 任务详情加载移到后台线程：数据库读取不再阻塞事件循环。
+/// 生成号保证旧请求的结果不会覆盖用户后来选择的任务。
 fn show_event_details(ui: &MainWindow, runtime: &RuntimeHandle, event_id: &str) {
-    match runtime.event(event_id) {
-        Ok(Some(event)) => {
-            let field_sources = runtime.field_sources(event_id).unwrap_or_default();
-            let announcements = runtime.announcements(event_id).unwrap_or_default();
-            let overrides = runtime
-                .manual_overrides(event_id, event.event_version)
-                .unwrap_or_default();
-            let settings = match runtime.settings() {
-                Ok(settings) => settings,
-                Err(error) => {
-                    ui.set_status_text(format!("读取应用设置失败：{error:#}").into());
+    static DETAILS_GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = DETAILS_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let details_runtime = runtime.clone();
+    let details_id = event_id.to_owned();
+    let details_window = ui.as_weak();
+    let spawned = std::thread::Builder::new()
+        .name("event-details".into())
+        .spawn(move || {
+            let data = load_event_details(&details_runtime, &details_id);
+            let _ = slint::invoke_from_event_loop(move || {
+                if DETAILS_GENERATION.load(Ordering::Acquire) != generation {
                     return;
                 }
-            };
-            ui.set_selected_event_id(event.id.clone().into());
-            ui.set_selected_event_version(event.event_version);
-            ui.set_selected_title(format!("{} · {}", event.name, event.display_code()).into());
-            ui.set_selected_summary(
-                format!(
-                    "{} · 股票代码 {} · 申购日 {} · 数据版本 {}",
-                    market_name(event.exchange, event.board),
-                    event.security_code,
-                    event
-                        .apply_date
-                        .map(|date| date.to_string())
-                        .unwrap_or_else(|| "待核验".into()),
-                    event.event_version,
-                )
-                .into(),
-            );
-            ui.set_selected_quality(quality_text(event.data_quality_status).into());
-            ui.set_selected_quality_alert(matches!(
-                event.data_quality_status,
-                DataQualityStatus::DataConflict
-                    | DataQualityStatus::ManualReviewRequired
-                    | DataQualityStatus::Stale
-            ));
-            ui.set_selected_warning(if !event.manual_override_fields.is_empty() {
-                format!(
-                    "当前有效人工覆盖：{}。所有原始来源仍保留在“字段来源”中。",
-                    event
-                        .manual_override_fields
-                        .iter()
-                        .map(|field| field_display_name(field))
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                )
-                .into()
-            } else if event.data_conflict {
-                "关键字段存在来源冲突，请以最新正式发行公告为准。".into()
-            } else {
-                "".into()
+                let Some(ui) = details_window.upgrade() else {
+                    return;
+                };
+                match data {
+                    Ok(Some(data)) => apply_event_details(&ui, data),
+                    Ok(None) => ui.set_status_text("任务已不存在，请刷新列表".into()),
+                    Err(error) => ui.set_status_text(format!("读取详情失败：{error:#}").into()),
+                }
             });
-            let announcement_titles = announcements
-                .iter()
-                .map(|document| document.reference.title.clone())
-                .collect::<Vec<_>>();
-            ui.set_selected_detail(
-                format_event_details(&event, &announcement_titles, &settings).into(),
-            );
-            ui.set_details_active_tab(0);
-            ui.set_override_field_index(0);
-            ui.set_override_announcement_index(0);
-            ui.set_override_value("".into());
-            ui.set_override_reason("".into());
-            ui.set_override_status("".into());
+        });
+    if let Err(error) = spawned {
+        DETAILS_GENERATION.fetch_sub(1, Ordering::AcqRel);
+        operations::log("ERROR", &format!("无法启动详情加载线程：{error}"));
+        ui.set_status_text("读取详情失败：无法启动后台加载线程".into());
+    }
+}
 
-            let field_rows = field_sources
-                .into_iter()
-                .map(|source| FieldSourceRow {
-                    field_name: field_display_name(&source.field_name).into(),
-                    normalized_value: source.normalized_value.unwrap_or_else(|| "—".into()).into(),
-                    raw_value: source.raw_value.unwrap_or_else(|| "—".into()).into(),
-                    source_text: format!("{} · 优先级 {}", source.source, source.priority).into(),
-                    fetched_text: format!("抓取 {}", source.fetched_at.format("%Y-%m-%d %H:%M"))
-                        .into(),
-                })
-                .collect::<Vec<_>>();
-            ui.set_field_source_rows(ModelRc::from(Rc::new(VecModel::from(field_rows))));
-
-            let announcement_rows = announcements
+fn apply_event_details(ui: &MainWindow, data: EventDetailsData) {
+    let EventDetailsData {
+        event,
+        field_sources,
+        announcements,
+        overrides,
+        settings,
+    } = data;
+    ui.set_selected_event_id(event.id.clone().into());
+    ui.set_selected_event_version(event.event_version);
+    ui.set_selected_title(format!("{} · {}", event.name, event.display_code()).into());
+    ui.set_selected_summary(
+        format!(
+            "{} · 股票代码 {} · 申购日 {} · 数据版本 {}",
+            market_name(event.exchange, event.board),
+            event.security_code,
+            event
+                .apply_date
+                .map(|date| date.to_string())
+                .unwrap_or_else(|| "待核验".into()),
+            event.event_version,
+        )
+        .into(),
+    );
+    ui.set_selected_quality(quality_text(event.data_quality_status).into());
+    ui.set_selected_quality_alert(matches!(
+        event.data_quality_status,
+        DataQualityStatus::DataConflict
+            | DataQualityStatus::ManualReviewRequired
+            | DataQualityStatus::Stale
+    ));
+    ui.set_selected_warning(if !event.manual_override_fields.is_empty() {
+        format!(
+            "当前有效人工覆盖：{}。所有原始来源仍保留在“字段来源”中。",
+            event
+                .manual_override_fields
                 .iter()
-                .map(|document| {
-                    let metadata_only = document.local_path.is_empty()
-                        && document.parser_version == "announcement-metadata-v1";
-                    let evidence = if metadata_only {
-                        "程序只保存公告标题和在线链接，不下载或解析正文；请按需打开官方原文核对。"
-                            .into()
-                    } else if document.fields.is_empty() {
-                        "未提取到高置信度字段，请人工查看原文。".into()
-                    } else {
-                        document
-                            .fields
-                            .iter()
-                            .take(6)
-                            .map(|field| {
-                                format!(
-                                    "{}={}（{:.0}%）",
-                                    field_display_name(&field.name),
-                                    field.value,
-                                    field.confidence * 100.0,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("；")
-                    };
-                    let metadata = if metadata_only {
+                .map(|field| field_display_name(field))
+                .collect::<Vec<_>>()
+                .join("、"),
+        )
+        .into()
+    } else if event.data_conflict {
+        "关键字段存在来源冲突，请以最新正式发行公告为准。".into()
+    } else {
+        "".into()
+    });
+    let announcement_titles = announcements
+        .iter()
+        .map(|document| document.reference.title.clone())
+        .collect::<Vec<_>>();
+    ui.set_selected_detail(format_event_details(&event, &announcement_titles, &settings).into());
+    ui.set_details_active_tab(0);
+    ui.set_override_field_index(0);
+    ui.set_override_announcement_index(0);
+    ui.set_override_value("".into());
+    ui.set_override_reason("".into());
+    ui.set_override_status("".into());
+
+    let field_rows = field_sources
+        .into_iter()
+        .map(|source| FieldSourceRow {
+            field_name: field_display_name(&source.field_name).into(),
+            normalized_value: source.normalized_value.unwrap_or_else(|| "—".into()).into(),
+            raw_value: source.raw_value.unwrap_or_else(|| "—".into()).into(),
+            source_text: format!("{} · 优先级 {}", source.source, source.priority).into(),
+            fetched_text: format!("抓取 {}", source.fetched_at.format("%Y-%m-%d %H:%M")).into(),
+        })
+        .collect::<Vec<_>>();
+    ui.set_field_source_rows(ModelRc::from(Rc::new(VecModel::from(field_rows))));
+
+    let announcement_rows = announcements
+        .iter()
+        .map(|document| {
+            let metadata_only = document.local_path.is_empty()
+                && document.parser_version == "announcement-metadata-v1";
+            let evidence = if metadata_only {
+                "程序只保存公告标题和在线链接，不下载或解析正文；请按需打开官方原文核对。".into()
+            } else if document.fields.is_empty() {
+                "未提取到高置信度字段，请人工查看原文。".into()
+            } else {
+                document
+                    .fields
+                    .iter()
+                    .take(6)
+                    .map(|field| {
                         format!(
-                            "{} · {} · 在线公告链接",
-                            document.reference.provider,
-                            document
-                                .reference
-                                .published_at
-                                .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_else(|| "发布时间未知".into()),
+                            "{}={}（{:.0}%）",
+                            field_display_name(&field.name),
+                            field.value,
+                            field.confidence * 100.0,
                         )
-                    } else {
-                        let hash_preview = document.file_hash.chars().take(12).collect::<String>();
-                        format!(
-                            "{} · {} · {} · 历史文件 SHA-256 {}…",
-                            document.reference.provider,
-                            document
-                                .reference
-                                .published_at
-                                .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_else(|| "发布时间未知".into()),
-                            extraction_text(document.status),
-                            hash_preview,
-                        )
-                    };
-                    AnnouncementRow {
-                        id: document.id.clone().into(),
-                        title: document.reference.title.clone().into(),
-                        metadata: metadata.into(),
-                        evidence: evidence.into(),
-                        source_url: document.reference.url.clone().into(),
-                        local_path: document.local_path.clone().into(),
-                        local_available: std::path::Path::new(&document.local_path).is_file(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            ui.set_announcement_rows(ModelRc::from(Rc::new(VecModel::from(announcement_rows))));
-            let mut announcement_choices = vec![slint::SharedString::from("不指定公告")];
-            announcement_choices.extend(
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；")
+            };
+            let metadata = if metadata_only {
+                format!(
+                    "{} · {} · 在线公告链接",
+                    document.reference.provider,
+                    document
+                        .reference
+                        .published_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "发布时间未知".into()),
+                )
+            } else {
+                let hash_preview = document.file_hash.chars().take(12).collect::<String>();
+                format!(
+                    "{} · {} · {} · 历史文件 SHA-256 {}…",
+                    document.reference.provider,
+                    document
+                        .reference
+                        .published_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "发布时间未知".into()),
+                    extraction_text(document.status),
+                    hash_preview,
+                )
+            };
+            AnnouncementRow {
+                id: document.id.clone().into(),
+                title: document.reference.title.clone().into(),
+                metadata: metadata.into(),
+                evidence: evidence.into(),
+                source_url: document.reference.url.clone().into(),
+                local_path: document.local_path.clone().into(),
+                local_available: std::path::Path::new(&document.local_path).is_file(),
+            }
+        })
+        .collect::<Vec<_>>();
+    ui.set_announcement_rows(ModelRc::from(Rc::new(VecModel::from(announcement_rows))));
+    let mut announcement_choices = vec![slint::SharedString::from("不指定公告")];
+    announcement_choices.extend(
+        announcements
+            .iter()
+            .map(|document| slint::SharedString::from(document.reference.title.as_str())),
+    );
+    ui.set_announcement_choices(ModelRc::from(Rc::new(VecModel::from(announcement_choices))));
+
+    let override_rows = overrides
+        .into_iter()
+        .map(|entry| {
+            let announcement_title = entry.announcement_document_id.as_deref().and_then(|id| {
                 announcements
                     .iter()
-                    .map(|document| slint::SharedString::from(document.reference.title.as_str())),
-            );
-            ui.set_announcement_choices(ModelRc::from(Rc::new(VecModel::from(
-                announcement_choices,
-            ))));
-
-            let override_rows = overrides
-                .into_iter()
-                .map(|entry| {
-                    let announcement_title =
-                        entry.announcement_document_id.as_deref().and_then(|id| {
-                            announcements
-                                .iter()
-                                .find(|document| document.id == id)
-                                .map(|document| document.reference.title.as_str())
-                        });
-                    OverrideRow {
-                        id: entry.id.to_string().into(),
-                        summary: format!(
-                            "{} = {}",
-                            field_display_name(&entry.field_name),
-                            entry.override_value
-                        )
-                        .into(),
-                        metadata: format!(
-                            "理由：{} · {}{}{}",
-                            entry.reason,
-                            entry.created_at.format("%Y-%m-%d %H:%M"),
-                            announcement_title
-                                .map(|title| format!(" · 依据公告：{title}"))
-                                .unwrap_or_else(|| " · 未关联依据公告".into()),
-                            entry
-                                .revoked_at
-                                .map(|value| format!(
-                                    " · 已于 {} 撤销",
-                                    value.format("%Y-%m-%d %H:%M")
-                                ))
-                                .unwrap_or_else(|| " · 当前有效".into()),
-                        )
-                        .into(),
-                        can_revoke: entry.revoked_at.is_none(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            ui.set_override_rows(ModelRc::from(Rc::new(VecModel::from(override_rows))));
-            ui.set_show_details(true);
-        }
-        Ok(None) => ui.set_status_text("任务已不存在，请刷新列表".into()),
-        Err(error) => ui.set_status_text(format!("读取详情失败：{error:#}").into()),
-    }
+                    .find(|document| document.id == id)
+                    .map(|document| document.reference.title.as_str())
+            });
+            OverrideRow {
+                id: entry.id.to_string().into(),
+                summary: format!(
+                    "{} = {}",
+                    field_display_name(&entry.field_name),
+                    entry.override_value
+                )
+                .into(),
+                metadata: format!(
+                    "理由：{} · {}{}{}",
+                    entry.reason,
+                    entry.created_at.format("%Y-%m-%d %H:%M"),
+                    announcement_title
+                        .map(|title| format!(" · 依据公告：{title}"))
+                        .unwrap_or_else(|| " · 未关联依据公告".into()),
+                    entry
+                        .revoked_at
+                        .map(|value| format!(" · 已于 {} 撤销", value.format("%Y-%m-%d %H:%M")))
+                        .unwrap_or_else(|| " · 当前有效".into()),
+                )
+                .into(),
+                can_revoke: entry.revoked_at.is_none(),
+            }
+        })
+        .collect::<Vec<_>>();
+    ui.set_override_rows(ModelRc::from(Rc::new(VecModel::from(override_rows))));
+    ui.set_show_details(true);
 }
 
 fn override_field_name(index: i32) -> &'static str {
@@ -2794,6 +3092,26 @@ mod tests {
             first_seen_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn reminder_alerts_follow_settings() {
+        let mut settings = AppSettings::default();
+        let alerts = ReminderAlerts::from_settings(&settings);
+        assert!(alerts.sound && alerts.flash && alerts.toast);
+
+        settings.sound_enabled = false;
+        settings.flash_taskbar = false;
+        settings.toast_enabled = false;
+        let alerts = ReminderAlerts::from_settings(&settings);
+        assert!(!alerts.sound && !alerts.flash && !alerts.toast);
+    }
+
+    #[test]
+    fn reminder_alerts_fail_closed_without_settings() {
+        let alerts = ReminderAlerts::fail_closed();
+        assert_eq!(alerts, ReminderAlerts::default());
+        assert!(!alerts.sound && !alerts.flash && !alerts.toast);
     }
 
     #[test]

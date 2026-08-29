@@ -9,6 +9,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
 use crate::{
     core::{
         critical_change_reason, event_hash, noncritical_change_reason, now_china, plan_reminders,
@@ -100,7 +103,9 @@ impl Database {
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let now = now_china();
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        // 事务内先读旧设置再写入：DEFERRED 在 WAL 下读后升级写会因并发提交
+        // 立即返回 BUSY（读快照失效），必须用 IMMEDIATE 在 BEGIN 时取得写权。
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = settings_from_connection(&transaction)?;
         save_settings_tx(&transaction, settings, &previous, now)?;
         transaction.commit()?;
@@ -110,7 +115,7 @@ impl Database {
     pub fn save_settings_and_replan(&self, settings: &AppSettings) -> Result<()> {
         let now = now_china();
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = settings_from_connection(&transaction)?;
         save_settings_tx(&transaction, settings, &previous, now)?;
         let from = format_date(now.date_naive() - chrono::Duration::days(60));
@@ -163,7 +168,7 @@ impl Database {
 
     pub fn upsert_event(&self, mut event: IpoEvent) -> Result<IpoEvent> {
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut change_notification = None::<(bool, String, ChinaDateTime)>;
         let existing = transaction
             .query_row(
@@ -226,6 +231,16 @@ impl Database {
                 format_dt(event.updated_at)
             ],
         )?;
+        if let Some(previous) = &existing
+            && previous.event_version != event.event_version
+        {
+            carry_forward_issue_status_override(
+                &transaction,
+                &event.id,
+                previous.event_version,
+                event.event_version,
+            )?;
+        }
         let settings = settings_from_connection(&transaction)?;
         transaction.execute(
             "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE ipo_event_id=?3 AND event_version<>?4 AND delivery_state IN (?5,?6,?7)",
@@ -239,7 +254,11 @@ impl Database {
                 DeliveryState::Failed as i32,
             ],
         )?;
-        reconcile_schedule_tx(&transaction, &event, &settings, now_china())?;
+        // 重规划必须使用人工覆盖生效后的事件视图：否则活跃的 Postponed 等
+        // IssueStatus 覆盖会被下一次同步的源数据重规划悄悄撤销。
+        let mut planning = event.clone();
+        apply_manual_overrides(&transaction, &mut planning)?;
+        reconcile_schedule_tx(&transaction, &planning, &settings, now_china())?;
         if let Some((critical, reason, previous_updated_at)) = change_notification {
             enqueue_change_notification_tx(
                 &transaction,
@@ -574,7 +593,7 @@ impl Database {
         }
         let mut deliveries = Vec::new();
         for id in ids {
-            deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.* FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?);
+            deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?);
         }
         let settings = settings_from_connection(&tx)?;
         if settings.secondary_notification_enabled
@@ -636,7 +655,7 @@ impl Database {
 
     fn fail_delivery_at(&self, id: i64, error: &str, now: ChinaDateTime) -> Result<()> {
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let attempt_count: i32 = transaction
             .query_row(
                 "SELECT attempt_count FROM reminder_outbox WHERE id=?1 AND delivery_state=?2",
@@ -760,7 +779,7 @@ impl Database {
         let mut deliveries = Vec::new();
         for id in ids {
             let mut delivery = transaction.query_row(
-                "SELECT s.id,s.reminder_outbox_id,s.provider,r.due_at,r.reminder_level,s.attempt_count,r.message,e.* FROM secondary_notification_outbox s JOIN reminder_outbox r ON r.id=s.reminder_outbox_id JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE s.id=?1 AND s.state=?2",
+                "SELECT s.id,s.reminder_outbox_id,s.provider,r.due_at,r.reminder_level,s.attempt_count,r.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM secondary_notification_outbox s JOIN reminder_outbox r ON r.id=s.reminder_outbox_id JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE s.id=?1 AND s.state=?2",
                 params![id, SECONDARY_LEASED],
                 map_secondary_delivery,
             )?;
@@ -901,7 +920,7 @@ impl Database {
     ) -> Result<Option<i64>> {
         let now = now_china();
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM secondary_notification_attempts WHERE attempted_at>=?1",
             [format_dt(now - chrono::Duration::hours(1))],
@@ -1065,7 +1084,7 @@ impl Database {
                     let successful_sources: String = row.get(6)?;
                     let missing_sources: String = row.get(7)?;
                     Ok(SyncConclusion {
-                        kind: SyncConclusionKind::from_i32(row.get(0)?),
+                        kind: SyncConclusionKind::from_i32_tracked("sync_kind", row.get(0)?),
                         started_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
                         finished_at: parse_dt(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
                         today_count: row.get::<_, i64>(3)? as usize,
@@ -1112,7 +1131,7 @@ impl Database {
                 event_id: row.get(0)?,
                 scheduled_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
                 shown_at: parse_dt(&row.get::<_, String>(2)?).map_err(to_sql_error)?,
-                reminder_level: ReminderLevel::from_i32(row.get(3)?),
+                reminder_level: ReminderLevel::from_i32_tracked("reminder_level", row.get(3)?),
                 delivery_channel: row.get(4)?,
                 result: row.get(5)?,
             })
@@ -1233,7 +1252,7 @@ impl Database {
             let last_success: Option<String> = row.get(2)?;
             Ok(OperationHealthEntry {
                 component: row.get(0)?,
-                state: HealthState::from_i32(row.get(3)?),
+                state: HealthState::from_i32_tracked("health_state", row.get(3)?),
                 last_attempt_at: last_attempt
                     .as_deref()
                     .and_then(|value| parse_dt(value).ok()),
@@ -1374,6 +1393,16 @@ impl Database {
         Ok(())
     }
 
+    /// 调度/投递低频心跳的合并写入：单连接单语句更新两个组件，
+    /// 供运行时主循环每轮使用。
+    pub fn touch_runtime_heartbeats(&self, now: ChinaDateTime) -> Result<()> {
+        self.open()?.execute(
+            "INSERT INTO app_heartbeat(component,heartbeat_at) VALUES('scheduler',?1),('delivery',?1) ON CONFLICT(component) DO UPDATE SET heartbeat_at=excluded.heartbeat_at",
+            params![format_dt(now)],
+        )?;
+        Ok(())
+    }
+
     pub fn source_can_attempt(
         &self,
         source: &str,
@@ -1404,7 +1433,7 @@ impl Database {
 
     pub fn try_claim_source_probe(&self, source: &str, now: ChinaDateTime) -> Result<bool> {
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let values: Option<(Option<String>, Option<String>)> = transaction
             .query_row(
                 "SELECT next_attempt_at,next_probe_at FROM source_backoff WHERE source=?1",
@@ -1806,7 +1835,7 @@ impl Database {
                 },
                 local_path: row.get(8)?,
                 file_hash: row.get(9)?,
-                status: ExtractionStatus::from_i32(row.get(10)?),
+                status: ExtractionStatus::from_i32_tracked("extraction_status", row.get(10)?),
                 text_hash: row.get(11)?,
                 parser_version: row.get(12)?,
                 fields: serde_json::from_str(&fields_json)
@@ -1895,7 +1924,7 @@ impl Database {
         let now = now_china();
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut event = event_from_connection(&transaction, event_id)?.context("发行任务不存在")?;
+        let event = event_from_connection(&transaction, event_id)?.context("发行任务不存在")?;
         if event.event_version != version {
             bail!("发行任务版本已变化，请刷新后重试");
         }
@@ -1905,6 +1934,12 @@ impl Database {
         )?;
         if changed == 0 {
             bail!("人工覆盖记录不存在、已经撤销或属于旧的数据版本");
+        }
+        // 撤销后必须重载事件：此前读出的事件带着被撤销字段的覆盖值，
+        // 直接重规划会让旧覆盖（如 Postponed）残留到提醒计划中。
+        let mut event = event_from_connection(&transaction, event_id)?.context("发行任务不存在")?;
+        if event.event_version != version {
+            bail!("发行任务版本已变化，请刷新后重试");
         }
         apply_manual_overrides(&transaction, &mut event)?;
         let settings = settings_from_connection(&transaction)?;
@@ -1965,20 +2000,46 @@ impl Database {
         let temporary = data_root.join("temp");
         if temporary.exists() {
             for entry in fs::read_dir(temporary)? {
-                let entry = entry?;
-                if entry
-                    .metadata()?
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        crate::operations::log(
+                            "WARN",
+                            &format!("维护：读取临时目录条目失败：{error}"),
+                        );
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let metadata = match plain_file_metadata(&path) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        crate::operations::log(
+                            "WARN",
+                            &format!("维护：读取临时文件元数据失败：{error}"),
+                        );
+                        continue;
+                    }
+                };
+                if metadata
                     .modified()
                     .ok()
                     .and_then(|value| value.elapsed().ok())
                     .is_some_and(|age| age > StdDuration::from_secs(24 * 3600))
                 {
-                    if fs::remove_file(entry.path()).is_ok() {
-                        changed = true;
+                    match fs::remove_file(path) {
+                        Ok(()) => changed = true,
+                        Err(error) => crate::operations::log(
+                            "WARN",
+                            &format!("维护：删除临时文件失败（将继续处理其余条目）：{error}"),
+                        ),
                     }
                 }
             }
         }
+        changed |= cleanup_update_residue(&data_root.join("temp").join("updates"));
+        changed |= cleanup_helper_residue(&std::env::temp_dir());
         Ok(changed)
     }
 
@@ -2068,9 +2129,13 @@ impl Database {
     ) -> Result<PathBuf> {
         fs::create_dir_all(backup_dir)?;
         let timestamp = now_china();
+        // 追加短随机后缀：毫秒时间戳在同一毫秒内碰撞时 rename 会失败；
+        // 唯一命名保证「不覆盖已有备份」。
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
         let target = backup_dir.join(format!(
-            "stock-ipo-reminder-{}.db",
-            timestamp.format("%Y%m%d-%H%M%S-%3f")
+            "stock-ipo-reminder-{}-{}.db",
+            timestamp.format("%Y%m%d-%H%M%S-%3f"),
+            suffix.get(..8).unwrap_or_default()
         ));
         let temporary = backup_dir.join(format!(
             ".stock-ipo-reminder-backup-{}.tmp",
@@ -2687,6 +2752,156 @@ fn enqueue_change_notification_tx(
     Ok(())
 }
 
+/// 更新残留清理的保守年龄阈值：与临时目录清理一致取 24 小时。
+const UPDATE_RESIDUE_MIN_AGE: StdDuration = StdDuration::from_secs(24 * 3600);
+
+fn residue_age(metadata: &fs::Metadata) -> Option<StdDuration> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.elapsed().ok())
+}
+
+/// 检查目录项本身，只允许非 reparse 的普通文件；不得跟随链接离开扫描根目录。
+fn plain_file_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0400 != 0 {
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        return Ok(None);
+    }
+    Ok(Some(metadata))
+}
+
+/// 严格匹配应用生成的更新文件名：
+/// `.StockIpoReminder-<version>-win-x64-<uuid>.msi.part` 与
+/// `StockIpoReminder-<version>-win-x64-<uuid>.msi`。
+fn is_update_residue_name(name: &str) -> bool {
+    let stem = match name.strip_suffix(".msi.part") {
+        Some(stem) => stem,
+        None => match name.strip_suffix(".msi") {
+            Some(stem) => stem,
+            None => return false,
+        },
+    };
+    let stem = stem.strip_prefix('.').unwrap_or(stem);
+    let Some(rest) = stem.strip_prefix("StockIpoReminder-") else {
+        return false;
+    };
+    let Some((version, operation_id)) = rest.rsplit_once("-win-x64-") else {
+        return false;
+    };
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+        && uuid::Uuid::parse_str(operation_id).is_ok()
+}
+
+/// 严格匹配应用更新 helper 在系统 %TEMP% 的残留名：
+/// `StockIpoReminder-Update-<uuid>.exe`。
+fn is_update_helper_residue_name(name: &str) -> bool {
+    name.strip_prefix("StockIpoReminder-Update-")
+        .and_then(|rest| rest.strip_suffix(".exe"))
+        .is_some_and(|operation_id| uuid::Uuid::parse_str(operation_id).is_ok())
+}
+
+/// 扫描受控更新目录（仅当前一层，不递归、不跟随符号链接/junction），
+/// 清理超龄的下载/安装残留。
+fn cleanup_update_residue(update_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(update_dir) else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::operations::log("WARN", &format!("维护：读取更新目录条目失败：{error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match plain_file_metadata(&path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(error) => {
+                crate::operations::log("WARN", &format!("维护：读取更新残留元数据失败：{error}"));
+                continue;
+            }
+        };
+        if residue_age(&metadata).is_none_or(|age| age <= UPDATE_RESIDUE_MIN_AGE) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_update_residue_name(name) {
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => changed = true,
+            Err(error) => crate::operations::log(
+                "WARN",
+                &format!("维护：删除更新残留失败（文件可能被占用，将继续处理其余条目）：{error}"),
+            ),
+        }
+    }
+    changed
+}
+
+/// 清理系统 %TEMP% 中更新 helper 的超龄残留；文件被占用
+/// （sharing violation，例如 helper 仍在运行）时记录并跳过。
+fn cleanup_helper_residue(temp_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(temp_dir) else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::operations::log("WARN", &format!("维护：读取系统临时目录条目失败：{error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match plain_file_metadata(&path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(error) => {
+                crate::operations::log(
+                    "WARN",
+                    &format!("维护：读取更新 helper 残留元数据失败：{error}"),
+                );
+                continue;
+            }
+        };
+        if residue_age(&metadata).is_none_or(|age| age <= UPDATE_RESIDUE_MIN_AGE) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_update_helper_residue_name(name) {
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => changed = true,
+            Err(error) => crate::operations::log(
+                "WARN",
+                &format!("维护：删除更新 helper 残留失败（文件可能正在运行，已跳过）：{error}"),
+            ),
+        }
+    }
+    changed
+}
+
 fn reconcile_schedule_tx(
     tx: &rusqlite::Transaction<'_>,
     event: &IpoEvent,
@@ -2712,8 +2927,8 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
     })?;
     Ok(IpoEvent {
         id: row.get("id")?,
-        exchange: Exchange::from_i32(row.get("exchange")?),
-        board: Board::from_i32(row.get("board")?),
+        exchange: Exchange::from_i32_tracked("exchange", row.get("exchange")?),
+        board: Board::from_i32_tracked("board", row.get("board")?),
         security_code: row.get("security_code")?,
         apply_code: row.get("apply_code")?,
         legacy_code: row.get("legacy_code")?,
@@ -2727,11 +2942,17 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
         ballot_date: parse_optional_date(row.get("ballot_date")?),
         payment_date: parse_optional_date(row.get("payment_date")?),
         listing_date: parse_optional_date(row.get("listing_date")?),
-        status: IssueStatus::from_i32(row.get("issue_status")?),
-        lifecycle_status: LifecycleStatus::from_i32(row.get("lifecycle_status")?),
+        status: IssueStatus::from_i32_tracked("issue_status", row.get("issue_status")?),
+        lifecycle_status: LifecycleStatus::from_i32_tracked(
+            "lifecycle_status",
+            row.get("lifecycle_status")?,
+        ),
         event_version: row.get("event_version")?,
         announcement_url: row.get("announcement_url")?,
-        data_quality_status: DataQualityStatus::from_i32(row.get("data_quality_status")?),
+        data_quality_status: DataQualityStatus::from_i32_tracked(
+            "data_quality_status",
+            row.get("data_quality_status")?,
+        ),
         data_conflict: row.get::<_, i32>("data_conflict")? != 0,
         manual_override_fields: Vec::new(),
         sessions,
@@ -2751,11 +2972,11 @@ fn event_from_connection(connection: &Connection, id: &str) -> Result<Option<Ipo
 }
 
 fn map_delivery(row: &Row<'_>) -> rusqlite::Result<ReminderDelivery> {
-    let event = map_event_offset(row, 6)?;
+    let event = map_event_prefixed(row)?;
     Ok(ReminderDelivery {
         outbox_id: row.get(0)?,
         due_at: parse_dt(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
-        level: ReminderLevel::from_i32(row.get(2)?),
+        level: ReminderLevel::from_i32_tracked("level", row.get(2)?),
         dedupe_key: row.get(3)?,
         attempt_count: row.get(4)?,
         message: row.get(5)?,
@@ -2764,14 +2985,14 @@ fn map_delivery(row: &Row<'_>) -> rusqlite::Result<ReminderDelivery> {
 }
 
 fn map_secondary_delivery(row: &Row<'_>) -> rusqlite::Result<SecondaryNotificationDelivery> {
-    let event = map_event_offset(row, 7)?;
+    let event = map_event_prefixed(row)?;
     Ok(SecondaryNotificationDelivery {
         id: row.get(0)?,
         reminder_outbox_id: row.get(1)?,
         request_attempt_id: 0,
-        provider: SecondaryNotificationProvider::from_i32(row.get(2)?),
+        provider: SecondaryNotificationProvider::from_i32_tracked("provider", row.get(2)?),
         due_at: parse_dt(&row.get::<_, String>(3)?).map_err(to_sql_error)?,
-        level: ReminderLevel::from_i32(row.get(4)?),
+        level: ReminderLevel::from_i32_tracked("level", row.get(4)?),
         attempt_count: row.get(5)?,
         message: row.get(6)?,
         event,
@@ -2815,42 +3036,53 @@ fn prune_secondary_notification_history(connection: &Connection, now: ChinaDateT
     )?;
     Ok(())
 }
-fn map_event_offset(row: &Row<'_>, offset: usize) -> rusqlite::Result<IpoEvent> {
-    let sessions: String = row.get(offset + 22)?;
+/// joined 查询的事件列按显式别名读取（M7）：查询里存在 o.id/r.id 等同名列，
+/// 裸 row.get("id") 会串列；投影见 EVENT_COLUMNS 中 `event_*` 别名。
+fn map_event_prefixed(row: &Row<'_>) -> rusqlite::Result<IpoEvent> {
+    let sessions: String = row.get("event_sessions_json")?;
     let sessions = serde_json::from_str(&sessions).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            offset + 22,
+            row.as_ref()
+                .column_index("event_sessions_json")
+                .unwrap_or(0),
             rusqlite::types::Type::Text,
             error.into(),
         )
     })?;
     Ok(IpoEvent {
-        id: row.get(offset)?,
-        exchange: Exchange::from_i32(row.get(offset + 1)?),
-        board: Board::from_i32(row.get(offset + 2)?),
-        security_code: row.get(offset + 3)?,
-        apply_code: row.get(offset + 4)?,
-        legacy_code: row.get(offset + 5)?,
-        name: row.get(offset + 6)?,
-        apply_date: parse_optional_date(row.get(offset + 7)?),
-        issue_price: row.get(offset + 8)?,
-        lot_size: row.get(offset + 9)?,
-        max_apply_quantity: row.get(offset + 10)?,
-        required_market_value: row.get(offset + 11)?,
-        required_cash: row.get(offset + 12)?,
-        ballot_date: parse_optional_date(row.get(offset + 13)?),
-        payment_date: parse_optional_date(row.get(offset + 14)?),
-        listing_date: parse_optional_date(row.get(offset + 15)?),
-        status: IssueStatus::from_i32(row.get(offset + 16)?),
-        lifecycle_status: LifecycleStatus::from_i32(row.get(offset + 17)?),
-        event_version: row.get(offset + 18)?,
-        announcement_url: row.get(offset + 19)?,
-        data_quality_status: DataQualityStatus::from_i32(row.get(offset + 20)?),
-        data_conflict: row.get::<_, i32>(offset + 21)? != 0,
+        id: row.get("event_id")?,
+        exchange: Exchange::from_i32_tracked("exchange", row.get("event_exchange")?),
+        board: Board::from_i32_tracked("board", row.get("event_board")?),
+        security_code: row.get("event_security_code")?,
+        apply_code: row.get("event_apply_code")?,
+        legacy_code: row.get("event_legacy_code")?,
+        name: row.get("event_name")?,
+        apply_date: parse_optional_date(row.get("event_apply_date")?),
+        issue_price: row.get("event_issue_price")?,
+        lot_size: row.get("event_lot_size")?,
+        max_apply_quantity: row.get("event_max_apply_quantity")?,
+        required_market_value: row.get("event_required_market_value")?,
+        required_cash: row.get("event_required_cash")?,
+        ballot_date: parse_optional_date(row.get("event_ballot_date")?),
+        payment_date: parse_optional_date(row.get("event_payment_date")?),
+        listing_date: parse_optional_date(row.get("event_listing_date")?),
+        status: IssueStatus::from_i32_tracked("issue_status", row.get("event_issue_status")?),
+        lifecycle_status: LifecycleStatus::from_i32_tracked(
+            "lifecycle_status",
+            row.get("event_lifecycle_status")?,
+        ),
+        event_version: row.get("event_event_version")?,
+        announcement_url: row.get("event_announcement_url")?,
+        data_quality_status: DataQualityStatus::from_i32_tracked(
+            "data_quality_status",
+            row.get("event_data_quality_status")?,
+        ),
+        data_conflict: row.get::<_, i32>("event_data_conflict")? != 0,
         manual_override_fields: Vec::new(),
         sessions,
-        first_seen_at: parse_dt(&row.get::<_, String>(offset + 23)?).map_err(to_sql_error)?,
-        updated_at: parse_dt(&row.get::<_, String>(offset + 24)?).map_err(to_sql_error)?,
+        first_seen_at: parse_dt(&row.get::<_, String>("event_first_seen_at")?)
+            .map_err(to_sql_error)?,
+        updated_at: parse_dt(&row.get::<_, String>("event_updated_at")?).map_err(to_sql_error)?,
     })
 }
 
@@ -2879,6 +3111,29 @@ fn apply_manual_overrides(connection: &Connection, event: &mut IpoEvent) -> Resu
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// 发行状态人工覆盖必须跨关键数据版本保持生效，直到用户显式修改或撤销。
+/// 只继承最后一条活跃 IssueStatus 覆盖；其他字段仍沿用“关键版本变化后重新核验”的
+/// 既有语义。
+fn carry_forward_issue_status_override(
+    connection: &Connection,
+    event_id: &str,
+    previous_version: i32,
+    current_version: i32,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO manual_overrides(ipo_event_id,event_version,field_name,override_value,reason,announcement_document_id,created_at)
+         SELECT ipo_event_id,?1,field_name,override_value,reason,announcement_document_id,created_at
+         FROM manual_overrides
+         WHERE id=(
+             SELECT id FROM manual_overrides
+             WHERE ipo_event_id=?2 AND event_version=?3 AND field_name='IssueStatus' AND revoked_at IS NULL
+             ORDER BY id DESC LIMIT 1
+         )",
+        params![current_version, event_id, previous_version],
+    )?;
     Ok(())
 }
 
@@ -2986,8 +3241,11 @@ fn parse_issue_status_override(value: &str) -> Option<IssueStatus> {
     match value.trim() {
         "即将发行" | "正常发行" | "Upcoming" => Some(IssueStatus::Upcoming),
         "申购中" | "Active" => Some(IssueStatus::Active),
-        "延期发行" | "暂缓发行" | "Postponed" => Some(IssueStatus::Postponed),
-        "中止发行" | "Suspended" => Some(IssueStatus::Suspended),
+        // 「延期发行」是可恢复状态；「暂缓发行/暂停发行」与网络采集口径一致，视为中止。
+        "延期发行" | "Postponed" => Some(IssueStatus::Postponed),
+        "暂缓发行" | "暂停发行" | "中止发行" | "Suspended" => {
+            Some(IssueStatus::Suspended)
+        }
         "终止发行" | "Terminated" => Some(IssueStatus::Terminated),
         "发行完成" | "Completed" => Some(IssueStatus::Completed),
         _ => None,
@@ -3122,10 +3380,387 @@ mod tests {
     }
 
     #[test]
+    fn issue_status_override_mapping_splits_postpone_and_suspend() {
+        assert_eq!(
+            parse_issue_status_override("延期发行"),
+            Some(IssueStatus::Postponed)
+        );
+        assert_eq!(
+            parse_issue_status_override("Postponed"),
+            Some(IssueStatus::Postponed)
+        );
+        assert_eq!(
+            parse_issue_status_override("暂缓发行"),
+            Some(IssueStatus::Suspended)
+        );
+        assert_eq!(
+            parse_issue_status_override("暂停发行"),
+            Some(IssueStatus::Suspended)
+        );
+        assert_eq!(
+            parse_issue_status_override("中止发行"),
+            Some(IssueStatus::Suspended)
+        );
+    }
+
+    #[test]
+    fn upsert_replan_respects_manual_status_override() {
+        let test = TestDatabase::new();
+        let database = &test.database;
+        let event = database.upsert_event(test.event()).unwrap();
+        assert!(
+            database.reminder_state_summary().unwrap().pending > 0,
+            "新事件应规划出未投递的申购提醒"
+        );
+
+        database
+            .apply_manual_override(
+                &event.id,
+                event.event_version,
+                "IssueStatus",
+                "延期发行",
+                "测试核验：延期发行",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            database.reminder_state_summary().unwrap().pending,
+            0,
+            "Postponed 覆盖应取消未投递的申购提醒"
+        );
+
+        // 非关键变更再次触发同步重规划；活跃覆盖必须仍然生效。
+        let mut renamed = event.clone();
+        renamed.name = "覆盖测试股份B".into();
+        renamed.updated_at = now_china() + chrono::Duration::seconds(1);
+        let renamed = database.upsert_event(renamed).unwrap();
+        assert_eq!(
+            pending_reminder_rows_excluding_data_changed(database),
+            0,
+            "同步重规划不得绕过人工 Postponed 覆盖重建申购提醒"
+        );
+
+        // 关键字段变化会创建新 event_version；IssueStatus 覆盖仍必须继承到
+        // 新版本，网络的新日期/正常状态不能悄悄解除用户的 Postponed 决定。
+        let mut rescheduled = renamed;
+        rescheduled.apply_date = Some(now_china().date_naive() + chrono::Duration::days(1));
+        rescheduled.status = IssueStatus::Upcoming;
+        rescheduled.lifecycle_status = LifecycleStatus::Scheduled;
+        rescheduled.updated_at = now_china() + chrono::Duration::seconds(2);
+        let rescheduled = database.upsert_event(rescheduled).unwrap();
+        assert_eq!(rescheduled.event_version, event.event_version + 1);
+        let still_overridden = database.event(&event.id).unwrap().unwrap();
+        assert_eq!(still_overridden.status, IssueStatus::Postponed);
+        assert_eq!(still_overridden.event_version, rescheduled.event_version);
+        assert!(
+            still_overridden
+                .manual_override_fields
+                .contains(&"IssueStatus".to_owned())
+        );
+        assert_eq!(pending_reminder_rows_excluding_data_changed(database), 0);
+
+        let override_id: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM manual_overrides WHERE ipo_event_id=?1 AND event_version=?2 AND field_name='IssueStatus' AND revoked_at IS NULL",
+                params![event.id, rescheduled.event_version],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .revoke_manual_override(&event.id, rescheduled.event_version, override_id)
+            .unwrap();
+        assert_eq!(
+            database.event(&event.id).unwrap().unwrap().status,
+            IssueStatus::Upcoming
+        );
+        assert!(
+            pending_reminder_rows_excluding_data_changed(database) > 0,
+            "撤销覆盖后应按当前可信数据重新规划提醒"
+        );
+    }
+
+    fn pending_reminder_rows_excluding_data_changed(database: &Database) -> i64 {
+        database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_outbox WHERE delivery_state=0 AND reminder_level<>90",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn merged_runtime_heartbeats_update_both_components() {
+        let test = TestDatabase::new();
+        test.database.touch_runtime_heartbeats(now_china()).unwrap();
+        let connection = test.database.open().unwrap();
+        for component in ["scheduler", "delivery"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM app_heartbeat WHERE component=?1 AND heartbeat_at IS NOT NULL",
+                    params![component],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "component {component} 应被合并心跳更新");
+        }
+    }
+
+    #[test]
+    fn update_residue_names_are_matched_strictly() {
+        assert!(is_update_residue_name(
+            ".StockIpoReminder-0.3.1-win-x64-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi.part"
+        ));
+        assert!(is_update_residue_name(
+            "StockIpoReminder-0.3.1-win-x64-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi"
+        ));
+        assert!(!is_update_residue_name("stock-ipo-reminder-20260828.db"));
+        assert!(!is_update_residue_name("notes.msi"));
+        assert!(!is_update_residue_name(
+            "StockIpoReminder-0.3.1-win-x64-notauuid.msi"
+        ));
+        assert!(is_update_helper_residue_name(
+            "StockIpoReminder-Update-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe"
+        ));
+        assert!(!is_update_helper_residue_name(
+            "StockIpoReminder-Uninstall-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe"
+        ));
+        assert!(!is_update_helper_residue_name(
+            "StockIpoReminder-MsiUninstall-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe"
+        ));
+        assert!(!is_update_helper_residue_name(
+            "StockIpoReminder-Other-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe"
+        ));
+        assert!(!is_update_helper_residue_name("unrelated.exe"));
+    }
+
+    fn make_file_old(path: &Path) {
+        let old = std::time::SystemTime::now() - StdDuration::from_secs(48 * 3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(old).set_modified(old))
+            .unwrap();
+    }
+
+    #[test]
+    fn cleanup_update_residue_deletes_only_old_matching_plain_files() {
+        let root = std::env::temp_dir().join(format!(
+            "stock-ipo-residue-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let updates = root.join("updates");
+        fs::create_dir_all(&updates).unwrap();
+        let fresh_msi =
+            updates.join("StockIpoReminder-0.3.1-win-x64-8f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi");
+        fs::write(&fresh_msi, b"x").unwrap();
+        let unrelated = updates.join("unrelated.txt");
+        fs::write(&unrelated, b"x").unwrap();
+        make_file_old(&unrelated);
+        let old_msi =
+            updates.join("StockIpoReminder-0.3.2-win-x64-7f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi");
+        fs::write(&old_msi, b"x").unwrap();
+        make_file_old(&old_msi);
+        let old_partial = updates
+            .join(".StockIpoReminder-0.3.2-win-x64-6f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi.part");
+        fs::write(&old_partial, b"x").unwrap();
+        make_file_old(&old_partial);
+        let matching_directory =
+            updates.join("StockIpoReminder-0.3.2-win-x64-5f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi");
+        fs::create_dir(&matching_directory).unwrap();
+
+        assert!(cleanup_update_residue(&updates));
+        assert!(!old_msi.exists());
+        assert!(!old_partial.exists());
+        assert!(fresh_msi.is_file());
+        assert!(unrelated.is_file());
+        assert!(matching_directory.is_dir());
+
+        #[cfg(windows)]
+        {
+            let target = root.join("outside-target.msi");
+            fs::write(&target, b"x").unwrap();
+            let link =
+                updates.join("StockIpoReminder-0.3.2-win-x64-4f2f7b0ac2e94a2c8de4a91f1d0e55b2.msi");
+            if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+                assert!(plain_file_metadata(&link).unwrap().is_none());
+                assert!(!cleanup_update_residue(&updates));
+                assert!(target.is_file());
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_helper_residue_is_scoped_to_old_update_helpers() {
+        let root = std::env::temp_dir().join(format!(
+            "stock-ipo-helper-residue-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old_update = root.join("StockIpoReminder-Update-3f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe");
+        fs::write(&old_update, b"x").unwrap();
+        make_file_old(&old_update);
+        let fresh_update =
+            root.join("StockIpoReminder-Update-2f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe");
+        fs::write(&fresh_update, b"x").unwrap();
+        let old_uninstall =
+            root.join("StockIpoReminder-Uninstall-1f2f7b0ac2e94a2c8de4a91f1d0e55b2.exe");
+        fs::write(&old_uninstall, b"x").unwrap();
+        make_file_old(&old_uninstall);
+
+        assert!(cleanup_helper_residue(&root));
+        assert!(!old_update.exists());
+        assert!(fresh_update.is_file());
+        assert!(old_uninstall.is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn migration_and_integrity_are_compatible() {
         let test = TestDatabase::new();
         test.database.integrity_check().unwrap();
         assert!(test.database.path().exists());
+    }
+
+    #[test]
+    fn deferred_read_then_write_upgrade_fails_after_concurrent_commit() {
+        // M3 机制复现：A 以 DEFERRED 开启事务并完成读取（持有读快照），
+        // B 提交一次写入后，A 再尝试写入会立即得到 BUSY（读快照失效，
+        // busy_timeout 对该场景不生效）。顺序由单线程语句交错精确控制，
+        // 不依赖线程调度。
+        let test = TestDatabase::new();
+        test.database
+            .save_settings(&AppSettings::default())
+            .unwrap();
+        let mut reader = test.database.open().unwrap();
+        let writer = test.database.open().unwrap();
+
+        let tx = reader.transaction().unwrap();
+        let _: Option<String> = tx
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE app_settings SET json_value='from-b',updated_at=?1 WHERE id=1",
+                params![format_dt(now_china())],
+            )
+            .unwrap();
+
+        let error = tx
+            .execute("UPDATE app_settings SET json_value='from-a' WHERE id=1", [])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if failure.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "DEFERRED 读后写升级应立即返回 BUSY，实际：{error}"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn immediate_transactions_serialize_writers_deterministically() {
+        // 修复后的语义：A 用 IMMEDIATE 在 BEGIN 时取得写权并完成读-改-写；
+        // B 的写入在 A 提交前明确失败（短 busy_timeout），A 提交后结果完整，
+        // 不存在读快照失效导致的升级错误或丢失更新。
+        let test = TestDatabase::new();
+        test.database
+            .save_settings(&AppSettings::default())
+            .unwrap();
+        let mut a = test.database.open().unwrap();
+        let b = test.database.open().unwrap();
+        b.busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+
+        let tx = a
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let _: Option<String> = tx
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        tx.execute("UPDATE app_settings SET json_value='from-a' WHERE id=1", [])
+            .unwrap();
+
+        let b_error = b
+            .execute("UPDATE app_settings SET json_value='from-b' WHERE id=1", [])
+            .unwrap_err();
+        assert!(
+            matches!(
+                b_error,
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if failure.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "A 持有写权时 B 的写入应明确 BUSY，实际：{b_error}"
+        );
+        tx.commit().unwrap();
+
+        let committed: String = test
+            .database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT json_value FROM app_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, "from-a");
+    }
+
+    #[test]
+    fn concurrent_read_write_paths_do_not_error() {
+        // 真实读-改-写路径（save_settings_and_replan / upsert_event）并发写：
+        // 全部改为 IMMEDIATE 后 BEGIN 会等待而非升级失败，因此并发下不应出错。
+        let test = TestDatabase::new();
+        let event = test.database.upsert_event(test.event()).unwrap();
+        let settings = AppSettings::default();
+        let mut renamed = event.clone();
+
+        let settings_database = test.database.clone();
+        let rename_database = test.database.clone();
+        let settings_handle = std::thread::spawn(move || {
+            for _ in 0..25 {
+                settings_database
+                    .save_settings_and_replan(&settings)
+                    .unwrap();
+            }
+        });
+        let rename_handle = std::thread::spawn(move || {
+            for index in 0..25 {
+                renamed.name = format!("并发重命名{index}");
+                renamed.updated_at = now_china();
+                rename_database.upsert_event(renamed.clone()).unwrap();
+            }
+        });
+        settings_handle.join().unwrap();
+        rename_handle.join().unwrap();
+
+        test.database
+            .claim_due(20)
+            .unwrap()
+            .first()
+            .cloned()
+            .map(|delivery| test.database.fail_delivery(delivery.outbox_id, "并发验证"))
+            .transpose()
+            .unwrap();
     }
 
     #[test]
