@@ -131,6 +131,7 @@ component Toggle inherits Rectangle {
             color: root.enabled ? #e2e8f0 : #64748b;
             vertical-alignment: center;
             horizontal-stretch: 1;
+            overflow: elide;
         }
     }
     touch := TouchArea {
@@ -686,6 +687,7 @@ export component MainWindow inherits Window {
                 background: #111b2e;
                 ScrollView {
                     VerticalBox {
+                        horizontal-stretch: 1;
                         padding: 10px;
                         spacing: 8px;
                         for source in root.source-health : Rectangle {
@@ -743,6 +745,7 @@ export component MainWindow inherits Window {
             background: #111b2e;
             ScrollView {
                 VerticalBox {
+                    horizontal-stretch: 1;
                     padding-left: root.compact-width ? 10px : 14px;
                     padding-right: root.compact-width ? 10px : 14px;
                     padding-top: root.compact-height ? 10px : 14px;
@@ -836,7 +839,7 @@ export component MainWindow inherits Window {
                             }
                             HorizontalBox {
                                 spacing: 10px;
-                                Toggle { label: "每日 08:00 健康摘要"; checked <=> root.health-summary-enabled; }
+                                Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; }
                                 Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; }
                             }
                             HorizontalBox {
@@ -888,7 +891,7 @@ export component MainWindow inherits Window {
                         background: #0f172a;
                         VerticalBox {
                             padding: 12px;
-                            spacing: 7px;
+                            spacing: 8px;
                             Text { text: "节能同步"; color: #f8fafc; font-size: 18px; font-weight: 600; }
                             HorizontalBox {
                                 height: 34px;
@@ -910,8 +913,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        min-height: 78px;
-                        max-height: 78px;
+                        min-height: 70px;
+                        max-height: 70px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -933,8 +936,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     if root.advanced-settings-expanded || root.secondary-notification-configured || root.secondary-notification-enabled : Rectangle {
-                        min-height: root.compact-width ? 264px : 220px;
-                        max-height: root.compact-width ? 264px : 220px;
+                        min-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 224px : 180px) : (root.compact-width ? 264px : 220px);
+                        max-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 224px : 180px) : (root.compact-width ? 264px : 220px);
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -964,22 +967,22 @@ export component MainWindow inherits Window {
                                     enabled: root.secondary-notification-provider-index > 0;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
-                                ActionButton {
+                                if root.secondary-notification-configured : ActionButton {
                                     label: root.secondary-notification-busy ? "正在测试…" : "发送测试";
                                     compact: root.compact-width;
                                     primary: true;
-                                    enabled: root.secondary-notification-configured && !root.secondary-notification-busy;
+                                    enabled: !root.secondary-notification-busy;
                                     clicked => { root.test-secondary-notification(); }
                                 }
-                                ActionButton {
+                                if root.secondary-notification-configured : ActionButton {
                                     label: "清除凭据";
                                     compact: root.compact-width;
                                     danger: true;
-                                    enabled: root.secondary-notification-configured && !root.secondary-notification-busy;
+                                    enabled: !root.secondary-notification-busy;
                                     clicked => { root.clear-secondary-notification-secret(); }
                                 }
                             }
-                            LineEdit {
+                            if root.secondary-notification-provider-index > 0 : LineEdit {
                                 text <=> root.secondary-notification-secret-entry;
                                 input-type: InputType.password;
                                 placeholder-text: root.secondary-notification-provider-index == 4 ? "输入 PushPlus token；留空表示保留已加密凭据" : "输入官方机器人 Webhook URL；留空表示保留已加密凭据";

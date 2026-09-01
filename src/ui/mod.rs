@@ -15,6 +15,7 @@ mod settings_callbacks;
 mod task_callbacks;
 mod tasks;
 mod update_callbacks;
+mod window_state;
 mod workers;
 
 #[allow(unused_imports)]
@@ -22,7 +23,7 @@ pub(crate) use {
     application_callbacks::*, background_operations::*, callbacks::*, crash_callbacks::*,
     diagnostic_callbacks::*, event_details::*, notification_callbacks::*, presentation::*,
     runtime_bridge::*, secondary_callbacks::*, settings::*, settings_callbacks::*,
-    task_callbacks::*, tasks::*, update_callbacks::*, workers::*,
+    task_callbacks::*, tasks::*, update_callbacks::*, window_state::*, workers::*,
 };
 
 #[cfg(test)]

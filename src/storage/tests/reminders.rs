@@ -65,18 +65,28 @@ fn next_delivery_deadlines_include_retries_and_secondary_leases() {
 }
 
 #[test]
-fn overdue_apply_reminders_collapse_to_the_latest_due_level() {
+fn apply_reminders_are_not_delivered_after_the_trading_window() {
     let test = TestDatabase::new();
     let event = test.database.upsert_event(test.event()).unwrap();
     let date = event.apply_date.unwrap();
     let claim_at = crate::core::at(date, crate::model::time(14, 56));
 
     let deliveries = test.database.claim_due_at(50, claim_at).unwrap();
-    assert_eq!(deliveries.len(), 1);
-    assert_eq!(deliveries[0].level, ReminderLevel::Final);
+    assert!(deliveries.is_empty());
     let summary = test.database.reminder_state_summary().unwrap();
     assert!(summary.collapsed > 0);
-    assert_eq!(summary.leased, 1);
+    assert_eq!(summary.leased, 0);
+    assert!(summary.cancelled > 0);
+}
+
+#[test]
+fn overdue_apply_reminders_are_not_delivered_during_the_lunch_break() {
+    let test = TestDatabase::new();
+    let event = test.database.upsert_event(test.event()).unwrap();
+    let claim_at = crate::core::at(event.apply_date.unwrap(), crate::model::time(12, 0));
+
+    assert!(test.database.claim_due_at(50, claim_at).unwrap().is_empty());
+    assert_eq!(test.database.reminder_state_summary().unwrap().leased, 0);
 }
 
 #[test]
@@ -84,7 +94,7 @@ fn local_delivery_failures_use_bounded_backoff_and_expose_error_summary() {
     let test = TestDatabase::new();
     let event = test.database.upsert_event(test.event()).unwrap();
     let date = event.apply_date.unwrap();
-    let first_attempt = crate::core::at(date, crate::model::time(14, 56));
+    let first_attempt = crate::core::at(date, crate::model::time(10, 0));
     let first = test.database.claim_due_at(50, first_attempt).unwrap();
     assert_eq!(first.len(), 1);
     test.database
@@ -138,7 +148,8 @@ fn local_delivery_failures_use_bounded_backoff_and_expose_error_summary() {
 fn outbox_recovers_across_reopen_at_queue_lease_display_and_confirmation_stages() {
     let test = TestDatabase::new();
     let event = test.database.upsert_event(test.event()).unwrap();
-    let first_claim_at = now_china() - chrono::Duration::minutes(5);
+    let date = event.apply_date.unwrap();
+    let first_claim_at = crate::core::at(date, crate::model::time(10, 0));
 
     let reopened = Database::new(&test.root);
     reopened.initialize().unwrap();
@@ -176,19 +187,23 @@ fn outbox_recovers_across_reopen_at_queue_lease_display_and_confirmation_stages(
     );
 
     let mut today_event = after_display_crash.event(&event.id).unwrap().unwrap();
-    today_event.apply_date = Some(now_china().date_naive());
+    today_event.apply_date = Some(date);
     today_event.lifecycle_status = LifecycleStatus::ActiveUnconfirmed;
-    today_event.updated_at = now_china();
+    today_event.updated_at = crate::core::at(date, crate::model::time(10, 10));
     let today_event = after_display_crash.upsert_event(today_event).unwrap();
     after_display_crash
-        .acknowledge_at(&today_event.id, today_event.event_version, now_china())
+        .acknowledge_at(
+            &today_event.id,
+            today_event.event_version,
+            crate::core::at(date, crate::model::time(10, 10)),
+        )
         .unwrap();
 
     let after_confirmation_crash = Database::new(&test.root);
     after_confirmation_crash.initialize().unwrap();
     assert!(
         after_confirmation_crash
-            .claim_due_at(100, now_china() + chrono::Duration::minutes(3))
+            .claim_due_at(100, crate::core::at(date, crate::model::time(10, 13)))
             .unwrap()
             .is_empty()
     );

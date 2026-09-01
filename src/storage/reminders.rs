@@ -85,14 +85,38 @@ impl Database {
             s.query_map(params![formatted_now, limit as i64], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        for id in &ids {
-            tx.execute("UPDATE reminder_outbox SET delivery_state=1,lease_until=?1,attempt_count=attempt_count+1,updated_at=?2 WHERE id=?3",params![format_dt(lease),format_dt(now),id])?;
-        }
+        let settings = settings_from_connection(&tx)?;
         let mut deliveries = Vec::new();
         for id in ids {
-            deliveries.push(tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?);
+            let mut delivery = tx.query_row("SELECT o.id,o.due_at,o.reminder_level,o.dedupe_key,o.attempt_count,o.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM reminder_outbox o JOIN ipo_events e ON e.id=o.ipo_event_id AND e.event_version=o.event_version WHERE o.id=?1",[id],map_delivery)?;
+            let subscription_interruption = delivery.level as i32 >= ReminderLevel::Advance as i32
+                && delivery.level as i32 <= ReminderLevel::DataChanged as i32;
+            if subscription_interruption
+                && !subscription_reminder_allowed_now(&delivery.event, &settings, now)
+            {
+                tx.execute(
+                    "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE id=?3",
+                    params![DeliveryState::Cancelled as i32, format_dt(now), id],
+                )?;
+                tx.execute(
+                    "UPDATE secondary_notification_outbox
+                     SET state=?1,lease_until=NULL,updated_at=?2
+                     WHERE reminder_outbox_id=?3 AND state IN (?4,?5,?6)",
+                    params![
+                        SECONDARY_CANCELLED,
+                        format_dt(now),
+                        id,
+                        SECONDARY_PENDING,
+                        SECONDARY_LEASED,
+                        SECONDARY_RETRYING,
+                    ],
+                )?;
+                continue;
+            }
+            tx.execute("UPDATE reminder_outbox SET delivery_state=1,lease_until=?1,attempt_count=attempt_count+1,updated_at=?2 WHERE id=?3",params![format_dt(lease),format_dt(now),id])?;
+            delivery.attempt_count += 1;
+            deliveries.push(delivery);
         }
-        let settings = settings_from_connection(&tx)?;
         if settings.secondary_notification_enabled
             && !matches!(
                 settings.secondary_notification_provider,

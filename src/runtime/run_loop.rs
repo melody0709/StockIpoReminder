@@ -124,11 +124,7 @@ pub(crate) fn run_loop(
             next_health_summary_at(&settings, &visible_snapshot, last_health_date, summary_now);
         if health_due.is_some_and(|due_at| due_at <= summary_now) {
             let details = database.health_details()?;
-            let should_send = details.today_task_count > 0
-                || matches!(
-                    details.overall_state,
-                    HealthState::Warning | HealthState::Failed
-                );
+            let should_send = details.today_task_count > 0;
             if should_send {
                 let (state, text) = database.health_text()?;
                 send_ui_event(events, ui_state, UiEvent::Health { state, text })?;

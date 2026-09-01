@@ -61,20 +61,28 @@ pub(crate) fn next_health_summary_at(
 ) -> Option<ChinaDateTime> {
     if !settings.daily_health_summary_enabled
         || last_health_date == Some(now.date_naive())
-        || (snapshot.today_count == 0
-            && !matches!(
-                snapshot.health_state,
-                HealthState::Warning | HealthState::Failed
-            ))
+        // 健康状态仍持续显示在主界面和托盘；没有今日申购任务时不再
+        // 因普通来源 Warning/Failed 单独弹窗打断用户。
+        || snapshot.today_count == 0
     {
         return None;
     }
-    let today = now.date_naive();
-    if !is_workday(today) && snapshot.today_count == 0 {
+    // 是否有“今日任务”由实际申购日期决定，比仅按周末/节假日推算交易日
+    // 更可靠。摘要也只在沪深北正常交易时段呈现，午休顺延到下午开市，
+    // 收市后不补弹。
+    let date = now.date_naive();
+    let value = if now.time() < crate::model::time(9, 30) {
+        at(date, crate::model::time(9, 30))
+    } else if now.time() <= crate::model::time(11, 30) {
+        now
+    } else if now.time() < crate::model::time(13, 0) {
+        at(date, crate::model::time(13, 0))
+    } else if now.time() <= crate::model::time(15, 0) {
+        now
+    } else {
         return None;
-    }
-    let anchor = at(today, crate::model::time(8, 0));
-    Some(anchor.max(now))
+    };
+    Some(value)
 }
 
 #[cfg(test)]

@@ -260,3 +260,56 @@ fn raw_payload_migration_discards_bodies_and_future_runs_keep_metadata_only() {
         LATEST_SCHEMA_VERSION
     );
 }
+
+#[test]
+fn quiet_reminder_migration_cancels_legacy_interruptions() {
+    let test = TestDatabase::new();
+    let now = now_china();
+    let mut event = test.event();
+    event.apply_date = Some(now.date_naive() + chrono::Duration::days(2));
+    event.lifecycle_status = LifecycleStatus::Scheduled;
+    let event = test.database.upsert_event(event).unwrap();
+    let connection = test.database.open().unwrap();
+    connection
+        .execute("DELETE FROM schema_migrations WHERE version=11", [])
+        .unwrap();
+    for (key, level) in [
+        ("legacy-advance", ReminderLevel::Advance),
+        ("legacy-morning", ReminderLevel::Morning),
+        ("legacy-change", ReminderLevel::DataChanged),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO reminder_outbox(
+                    ipo_event_id,event_version,due_at,reminder_level,dedupe_key,
+                    delivery_state,created_at,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+                params![
+                    event.id,
+                    event.event_version,
+                    format_dt(now),
+                    level as i32,
+                    key,
+                    DeliveryState::Pending as i32,
+                    format_dt(now),
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    test.database.initialize().unwrap();
+    let cancelled: i64 = test
+        .database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM reminder_outbox
+             WHERE dedupe_key LIKE 'legacy-%' AND delivery_state=?1",
+            [DeliveryState::Cancelled as i32],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancelled, 3);
+    assert_eq!(test.database.schema_version().unwrap(), 11);
+}

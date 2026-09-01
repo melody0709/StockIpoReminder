@@ -23,12 +23,72 @@ fn critical_change_increments_version_and_outbox_is_claimable() {
     assert_eq!(first.event_version, 1);
     let mut changed = first.clone();
     changed.issue_price = Some(11.0);
-    changed.updated_at = now_china();
+    changed.updated_at = crate::core::at(first.apply_date.unwrap(), crate::model::time(10, 0));
     let changed = test.database.upsert_event(changed).unwrap();
     assert_eq!(changed.event_version, 2);
-    let due = test.database.claim_due(50).unwrap();
-    assert!(!due.is_empty());
-    test.database.complete_delivery(&due[0], "test").unwrap();
+    let due = test
+        .database
+        .claim_due_at(
+            50,
+            crate::core::at(first.apply_date.unwrap(), crate::model::time(10, 0)),
+        )
+        .unwrap();
+    let notification = due
+        .iter()
+        .find(|delivery| delivery.level == ReminderLevel::DataChanged)
+        .unwrap();
+    test.database
+        .complete_delivery(notification, "test")
+        .unwrap();
+}
+
+#[test]
+fn future_critical_change_is_saved_without_immediate_notification() {
+    let test = TestDatabase::new();
+    let now = now_china();
+    let mut original = test.event();
+    original.apply_date = Some(now.date_naive() + chrono::Duration::days(2));
+    original.lifecycle_status = LifecycleStatus::Scheduled;
+    let original = test.database.upsert_event(original).unwrap();
+
+    let mut changed = original.clone();
+    changed.issue_price = Some(11.0);
+    changed.updated_at = crate::core::at(now.date_naive(), crate::model::time(10, 0));
+    let changed = test.database.upsert_event(changed).unwrap();
+    assert_eq!(changed.event_version, original.event_version + 1);
+    let notifications: i64 = test
+        .database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
+            params![changed.id, ReminderLevel::DataChanged as i32],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(notifications, 0);
+}
+
+#[test]
+fn same_day_critical_change_after_trading_is_silent() {
+    let test = TestDatabase::new();
+    let original = test.database.upsert_event(test.event()).unwrap();
+    let mut changed = original.clone();
+    changed.issue_price = Some(11.0);
+    changed.updated_at = crate::core::at(original.apply_date.unwrap(), crate::model::time(15, 1));
+    let changed = test.database.upsert_event(changed).unwrap();
+    assert_eq!(changed.event_version, original.event_version + 1);
+    let notifications: i64 = test
+        .database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
+            params![changed.id, ReminderLevel::DataChanged as i32],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(notifications, 0);
 }
 
 #[test]
@@ -161,7 +221,7 @@ fn missing_optional_fields_retain_known_values_without_false_review() {
 }
 
 #[test]
-fn noncritical_change_enqueues_exactly_one_message_without_version_bump() {
+fn noncritical_change_is_silent_without_version_bump() {
     let test = TestDatabase::new();
     let original = test.database.upsert_event(test.event()).unwrap();
     let mut changed = original.clone();
@@ -172,16 +232,14 @@ fn noncritical_change_enqueues_exactly_one_message_without_version_bump() {
     assert_eq!(saved.event_version, original.event_version);
 
     let connection = test.database.open().unwrap();
-    let (count, message): (i64, String) = connection
-            .query_row(
-                "SELECT COUNT(*), MAX(message) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
-                params![saved.id, ReminderLevel::DataChanged as i32],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-    assert_eq!(count, 1);
-    assert!(message.contains("证券简称"));
-    assert!(message.contains("上市日期"));
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM reminder_outbox WHERE ipo_event_id=?1 AND reminder_level=?2",
+            params![saved.id, ReminderLevel::DataChanged as i32],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
     drop(connection);
 
     changed.updated_at += chrono::Duration::seconds(1);
@@ -196,27 +254,5 @@ fn noncritical_change_enqueues_exactly_one_message_without_version_bump() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
-
-    let delivery = test
-        .database
-        .claim_due_at(100, now_china() + chrono::Duration::minutes(1))
-        .unwrap()
-        .into_iter()
-        .find(|delivery| delivery.level == ReminderLevel::DataChanged)
-        .unwrap();
-    assert!(delivery.message.as_deref().unwrap().contains("仅提醒一次"));
-    test.database.complete_delivery(&delivery, "test").unwrap();
-    assert!(test.database.complete_delivery(&delivery, "test").is_err());
-    let shown_count: i64 = test
-        .database
-        .open()
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM reminder_log WHERE dedupe_key=?1",
-            [delivery.dedupe_key],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(shown_count, 1);
+    assert_eq!(count, 0);
 }

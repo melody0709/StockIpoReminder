@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(windows)]
+static MAIN_WINDOW_NATIVE_PREPARED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Default)]
 pub(crate) struct RuntimeUiBridgeState {
     startup_applied: bool,
@@ -428,7 +431,45 @@ pub(crate) fn force_full_repaint(window: &MainWindow) {
 }
 
 pub(crate) fn show_and_repaint(window: &MainWindow) {
-    let _ = window.show();
+    if let Err(error) = window.show() {
+        operations::log("ERROR", &format!("无法显示主窗口：{error}"));
+        return;
+    }
+    #[cfg(windows)]
+    if MAIN_WINDOW_NATIVE_PREPARED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let weak = window.as_weak();
+        Timer::single_shot(Duration::from_millis(50), move || {
+            let Some(window) = weak.upgrade() else {
+                MAIN_WINDOW_NATIVE_PREPARED.store(false, Ordering::Release);
+                return;
+            };
+            apply_restored_main_window_size(&window);
+            let work_area_ready = windows_integration::fit_window_to_work_area(window.window())
+                .map_or_else(
+                    |error| {
+                        operations::log(
+                            "WARN",
+                            &format!("首次打开主窗口时调整工作区失败：{error:#}"),
+                        );
+                        false
+                    },
+                    |()| true,
+                );
+            let icon_ready = windows_integration::install_window_icon(window.window()).map_or_else(
+                |error| {
+                    operations::log("WARN", &format!("首次打开主窗口时设置图标失败：{error:#}"));
+                    false
+                },
+                |()| true,
+            );
+            if !(work_area_ready && icon_ready) {
+                MAIN_WINDOW_NATIVE_PREPARED.store(false, Ordering::Release);
+            }
+        });
+    }
     force_full_repaint(window);
 
     // The native window and the software renderer finish restoring on

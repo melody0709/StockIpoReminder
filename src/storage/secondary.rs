@@ -131,13 +131,39 @@ impl Database {
                 )?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let settings = settings_from_connection(&transaction)?;
+        let mut eligible_ids = Vec::new();
+        for id in ids {
+            let delivery = transaction.query_row(
+                "SELECT s.id,s.reminder_outbox_id,s.provider,r.due_at,r.reminder_level,s.attempt_count,r.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM secondary_notification_outbox s JOIN reminder_outbox r ON r.id=s.reminder_outbox_id JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE s.id=?1",
+                [id],
+                map_secondary_delivery,
+            )?;
+            let subscription_interruption = delivery.level as i32 >= ReminderLevel::Advance as i32
+                && delivery.level as i32 <= ReminderLevel::DataChanged as i32;
+            if subscription_interruption
+                && !subscription_reminder_allowed_now(&delivery.event, &settings, now)
+            {
+                transaction.execute(
+                    "UPDATE secondary_notification_outbox
+                     SET state=?1,lease_until=NULL,updated_at=?2 WHERE id=?3",
+                    params![SECONDARY_CANCELLED, formatted_now, id],
+                )?;
+            } else {
+                eligible_ids.push(id);
+            }
+        }
+        if eligible_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
         transaction.execute(
             "INSERT INTO secondary_notification_attempts(attempted_at,provider,success,batch_size,error) VALUES(?1,?2,-1,?3,NULL)",
-            params![formatted_now, provider, ids.len() as i64],
+            params![formatted_now, provider, eligible_ids.len() as i64],
         )?;
         let request_attempt_id = transaction.last_insert_rowid();
         let lease = format_dt(now + chrono::Duration::minutes(2));
-        for id in &ids {
+        for id in &eligible_ids {
             transaction.execute(
                 "UPDATE secondary_notification_outbox SET state=?1,lease_until=?2,attempt_count=attempt_count+1,updated_at=?3 WHERE id=?4 AND state IN (?5,?6)",
                 params![
@@ -151,7 +177,7 @@ impl Database {
             )?;
         }
         let mut deliveries = Vec::new();
-        for id in ids {
+        for id in eligible_ids {
             let mut delivery = transaction.query_row(
                 "SELECT s.id,s.reminder_outbox_id,s.provider,r.due_at,r.reminder_level,s.attempt_count,r.message,e.id AS event_id,e.exchange AS event_exchange,e.board AS event_board,e.security_code AS event_security_code,e.apply_code AS event_apply_code,e.legacy_code AS event_legacy_code,e.name AS event_name,e.apply_date AS event_apply_date,e.issue_price AS event_issue_price,e.lot_size AS event_lot_size,e.max_apply_quantity AS event_max_apply_quantity,e.required_market_value AS event_required_market_value,e.required_cash AS event_required_cash,e.ballot_date AS event_ballot_date,e.payment_date AS event_payment_date,e.listing_date AS event_listing_date,e.issue_status AS event_issue_status,e.lifecycle_status AS event_lifecycle_status,e.event_version AS event_event_version,e.announcement_url AS event_announcement_url,e.data_quality_status AS event_data_quality_status,e.data_conflict AS event_data_conflict,e.sessions_json AS event_sessions_json,e.first_seen_at AS event_first_seen_at,e.updated_at AS event_updated_at FROM secondary_notification_outbox s JOIN reminder_outbox r ON r.id=s.reminder_outbox_id JOIN ipo_events e ON e.id=r.ipo_event_id AND e.event_version=r.event_version WHERE s.id=?1 AND s.state=?2",
                 params![id, SECONDARY_LEASED],
@@ -206,10 +232,18 @@ impl Database {
         deliveries: &[SecondaryNotificationDelivery],
         error: &str,
     ) -> Result<()> {
+        self.fail_secondary_deliveries_at(deliveries, error, now_china())
+    }
+
+    pub(super) fn fail_secondary_deliveries_at(
+        &self,
+        deliveries: &[SecondaryNotificationDelivery],
+        error: &str,
+        now: ChinaDateTime,
+    ) -> Result<()> {
         if deliveries.is_empty() {
             return Ok(());
         }
-        let now = now_china();
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
         for delivery in deliveries {

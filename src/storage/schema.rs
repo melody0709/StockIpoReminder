@@ -16,6 +16,7 @@ impl Database {
         migrate_secondary_notifications_v8(&connection)?;
         migrate_raw_payload_metadata_v9(&connection)?;
         migrate_secondary_notification_identity_v10(&connection)?;
+        migrate_quiet_reminders_v11(&connection)?;
         Ok(())
     }
 
@@ -345,6 +346,56 @@ pub(super) fn migrate_secondary_notification_identity_v10(connection: &Connectio
     }
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(10,?1)",
+        [format_dt(now)],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn migrate_quiet_reminders_v11(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=11)",
+        [],
+        |row| row.get::<_, i32>(0),
+    )? != 0;
+    if applied {
+        return Ok(());
+    }
+
+    let now = now_china();
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE reminder_outbox
+         SET delivery_state=?1,lease_until=NULL,updated_at=?2
+         WHERE delivery_state IN (?3,?4,?5)
+           AND (
+               reminder_level IN (?6,?7,?8,?9,?10)
+               OR (
+                   reminder_level=?11
+                   AND EXISTS(
+                       SELECT 1 FROM ipo_events e
+                       WHERE e.id=reminder_outbox.ipo_event_id
+                         AND e.apply_date>?12
+                   )
+               )
+           )",
+        params![
+            DeliveryState::Cancelled as i32,
+            format_dt(now),
+            DeliveryState::Pending as i32,
+            DeliveryState::Leased as i32,
+            DeliveryState::Failed as i32,
+            ReminderLevel::Advance as i32,
+            ReminderLevel::Morning as i32,
+            ReminderLevel::BrokerOpening as i32,
+            ReminderLevel::MarketOpening as i32,
+            ReminderLevel::AfternoonOpening as i32,
+            ReminderLevel::DataChanged as i32,
+            format_date(now.date_naive()),
+        ],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(11,?1)",
         [format_dt(now)],
     )?;
     transaction.commit()?;

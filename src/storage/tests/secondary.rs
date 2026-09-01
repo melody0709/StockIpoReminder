@@ -7,9 +7,9 @@ fn secondary_notification_outbox_retries_independently_and_completes_as_a_batch(
     settings.secondary_notification_enabled = true;
     settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
     test.database.save_settings(&settings).unwrap();
-    test.database.upsert_event(test.event()).unwrap();
+    let event = test.database.upsert_event(test.event()).unwrap();
 
-    let now = now_china();
+    let now = crate::core::at(event.apply_date.unwrap(), crate::model::time(10, 0));
     let local = test.database.claim_due_at(50, now).unwrap();
     assert!(!local.is_empty());
     let first = test.database.claim_secondary_due_at(50, now).unwrap();
@@ -20,7 +20,7 @@ fn secondary_notification_outbox_retries_independently_and_completes_as_a_batch(
             .all(|delivery| delivery.provider == SecondaryNotificationProvider::PushPlus)
     );
     test.database
-        .fail_secondary_deliveries(&first, "fixture unavailable")
+        .fail_secondary_deliveries_at(&first, "fixture unavailable", now)
         .unwrap();
     assert!(
         test.database
@@ -40,7 +40,17 @@ fn secondary_notification_outbox_retries_independently_and_completes_as_a_batch(
     let summary = test.database.secondary_notification_summary().unwrap();
     assert_eq!(summary.delivered, retry.len() as i64);
     assert_eq!(summary.retrying, 0);
-    assert_eq!(summary.requests_last_hour, 2);
+    let request_count: i64 = test
+        .database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM secondary_notification_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(request_count, 2);
     assert!(summary.latest_success_at.is_some());
 }
 
@@ -53,14 +63,22 @@ fn secondary_provider_switch_and_same_provider_reenable_revive_pending_work() {
         ..AppSettings::default()
     };
     test.database.save_settings(&settings).unwrap();
-    test.database.upsert_event(test.event()).unwrap();
-    let now = now_china();
+    let event = test.database.upsert_event(test.event()).unwrap();
+    let now = crate::core::at(event.apply_date.unwrap(), crate::model::time(10, 0));
     assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
 
     settings.secondary_notification_enabled = false;
     test.database.save_settings(&settings).unwrap();
     settings.secondary_notification_enabled = true;
     test.database.save_settings(&settings).unwrap();
+    test.database
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE secondary_notification_outbox SET next_attempt_at=?1,updated_at=?1",
+            [format_dt(now)],
+        )
+        .unwrap();
     let reenabled = test
         .database
         .claim_secondary_due_at(50, now + chrono::Duration::seconds(1))
@@ -72,11 +90,19 @@ fn secondary_provider_switch_and_same_provider_reenable_revive_pending_work() {
             .all(|delivery| { delivery.provider == SecondaryNotificationProvider::PushPlus })
     );
     test.database
-        .fail_secondary_deliveries(&reenabled, "switch fixture")
+        .fail_secondary_deliveries_at(&reenabled, "switch fixture", now)
         .unwrap();
 
     settings.secondary_notification_provider = SecondaryNotificationProvider::WeCom;
     test.database.save_settings(&settings).unwrap();
+    test.database
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE secondary_notification_outbox SET next_attempt_at=?1,updated_at=?1 WHERE provider=?2",
+            params![format_dt(now), SecondaryNotificationProvider::WeCom as i32],
+        )
+        .unwrap();
     let switched = test
         .database
         .claim_secondary_due_at(50, now + chrono::Duration::minutes(2))
@@ -109,8 +135,8 @@ fn v10_migration_changes_secondary_identity_to_reminder_and_provider() {
             ],
         )
         .unwrap();
-    test.database.upsert_event(test.event()).unwrap();
-    let now = now_china();
+    let event = test.database.upsert_event(test.event()).unwrap();
+    let now = crate::core::at(event.apply_date.unwrap(), crate::model::time(10, 0));
     let connection = test.database.open().unwrap();
     let reminder_id: i64 = connection
         .query_row(
@@ -160,8 +186,8 @@ fn secondary_notification_enforces_hourly_request_quota() {
     settings.secondary_notification_enabled = true;
     settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
     test.database.save_settings(&settings).unwrap();
-    test.database.upsert_event(test.event()).unwrap();
-    let now = now_china();
+    let event = test.database.upsert_event(test.event()).unwrap();
+    let now = crate::core::at(event.apply_date.unwrap(), crate::model::time(10, 0));
     assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
     let connection = test.database.open().unwrap();
     connection
@@ -207,8 +233,8 @@ fn secondary_notification_stops_after_five_failed_attempts() {
     settings.secondary_notification_enabled = true;
     settings.secondary_notification_provider = SecondaryNotificationProvider::PushPlus;
     test.database.save_settings(&settings).unwrap();
-    test.database.upsert_event(test.event()).unwrap();
-    let mut now = now_china();
+    let event = test.database.upsert_event(test.event()).unwrap();
+    let mut now = crate::core::at(event.apply_date.unwrap(), crate::model::time(10, 0));
     assert!(!test.database.claim_due_at(50, now).unwrap().is_empty());
 
     for advance_minutes in [0, 2, 8, 24, 55] {
@@ -219,7 +245,7 @@ fn secondary_notification_stops_after_five_failed_attempts() {
             .unwrap();
         assert!(!deliveries.is_empty());
         test.database
-            .fail_secondary_deliveries(&deliveries, "fixture unavailable")
+            .fail_secondary_deliveries_at(&deliveries, "fixture unavailable", attempt_at)
             .unwrap();
     }
     now += chrono::Duration::minutes(120);

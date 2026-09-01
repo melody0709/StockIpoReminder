@@ -177,9 +177,9 @@ pub fn plan_reminders(
         event.sessions.clone()
     };
     sessions.sort_by_key(|s| s.session_number);
-    let Some(first) = sessions.first() else {
+    if sessions.is_empty() {
         return vec![];
-    };
+    }
     let cutoff = effective_cutoff(event, settings);
     let mut due = BTreeMap::<ChinaDateTime, ReminderLevel>::new();
     let mut add = |when, level| {
@@ -192,26 +192,7 @@ pub fn plan_reminders(
     };
     let today = now.date_naive();
     if event.lifecycle_status != LifecycleStatus::Acknowledged && date >= today {
-        add(
-            at(date - Duration::days(1), time(20, 0)),
-            ReminderLevel::Advance,
-        );
-        add(at(date, time(8, 30)), ReminderLevel::Morning);
-        let broker = match event.exchange {
-            Exchange::Shanghai => settings.shanghai_broker_accept_start,
-            Exchange::Shenzhen => settings.shenzhen_broker_accept_start,
-            Exchange::Beijing => settings.beijing_broker_accept_start,
-            _ => first.broker_accept_start.unwrap_or(first.official_start),
-        };
-        if (event.exchange != Exchange::Beijing || settings.beijing_reservation_supported)
-            && broker < first.official_start
-        {
-            add(at(date, broker), ReminderLevel::BrokerOpening);
-        }
-        add(
-            at(date, first.official_start - Duration::minutes(5)),
-            ReminderLevel::MarketOpening,
-        );
+        // 未来任务只静默同步和重规划；当天也只在实际可操作的申购时段内提醒。
         for session in &sessions {
             let mut cursor = session.official_start;
             while cursor < session.official_end {
@@ -223,9 +204,6 @@ pub fn plan_reminders(
         }
         if time(11, 20) < cutoff {
             add(at(date, time(11, 20)), ReminderLevel::NoonBoundary);
-        }
-        if time(12, 55) < cutoff {
-            add(at(date, time(12, 55)), ReminderLevel::AfternoonOpening);
         }
         add_range(
             &mut add,
@@ -286,6 +264,11 @@ pub fn plan_reminders(
             }
         }
     }
+    drop(add);
+    due.retain(|when, level| {
+        *level as i32 > ReminderLevel::Final as i32
+            || subscription_reminder_allowed_now(event, settings, *when)
+    });
     due.into_iter()
         .map(|(when, level)| ReminderItem {
             event_id: event.id.clone(),
@@ -301,6 +284,30 @@ pub fn plan_reminders(
             ),
         })
         .collect()
+}
+
+pub fn subscription_reminder_allowed_now(
+    event: &IpoEvent,
+    settings: &AppSettings,
+    now: ChinaDateTime,
+) -> bool {
+    if event.apply_date != Some(now.date_naive())
+        || event.is_terminal()
+        || event.status == IssueStatus::Postponed
+        || !settings.exchange_enabled(event.exchange)
+    {
+        return false;
+    }
+    let cutoff = effective_cutoff(event, settings);
+    let sessions = if event.sessions.is_empty() {
+        default_sessions(event.exchange, settings)
+    } else {
+        event.sessions.clone()
+    };
+    sessions.into_iter().any(|session| {
+        let end = session.official_end.min(cutoff);
+        session.official_start <= now.time() && now.time() <= end
+    })
 }
 
 fn add_range(
@@ -577,29 +584,6 @@ pub fn critical_change_reason(previous: &IpoEvent, current: &IpoEvent) -> Option
     (!fields.is_empty()).then(|| format!("关键申购字段已变化：{}", fields.join("、")))
 }
 
-pub fn noncritical_change_reason(previous: &IpoEvent, current: &IpoEvent) -> Option<String> {
-    let mut fields = Vec::new();
-    if previous.name != current.name {
-        fields.push("证券简称");
-    }
-    if previous.legacy_code != current.legacy_code {
-        fields.push("历史证券代码");
-    }
-    if previous.ballot_date != current.ballot_date {
-        fields.push("中签结果日期");
-    }
-    if previous.payment_date != current.payment_date {
-        fields.push("缴款日期");
-    }
-    if previous.listing_date != current.listing_date {
-        fields.push("上市日期");
-    }
-    if previous.announcement_url != current.announcement_url {
-        fields.push("公告链接");
-    }
-    (!fields.is_empty()).then(|| format!("普通任务字段已变化：{}", fields.join("、")))
-}
-
 fn critical_event_signature(event: &IpoEvent) -> String {
     format!(
         "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
@@ -703,6 +687,27 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), reminders.len());
+    }
+
+    #[test]
+    fn future_event_has_no_advance_reminder_before_apply_date() {
+        let apply_date = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let reminders = plan_reminders(
+            &event(apply_date),
+            &AppSettings::default(),
+            at(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), time(20, 0)),
+        );
+        assert!(!reminders.is_empty());
+        assert!(
+            reminders
+                .iter()
+                .all(|item| item.due_at.date_naive() >= apply_date)
+        );
+        assert!(
+            reminders
+                .iter()
+                .all(|item| item.level != ReminderLevel::Advance)
+        );
     }
 
     #[test]
@@ -904,22 +909,6 @@ mod tests {
         metadata_only.sessions[0].source_published_at = Some(at(date, time(8, 0)));
         assert!(critical_change_reason(&original, &metadata_only).is_none());
         assert_eq!(event_hash(&original), event_hash(&metadata_only));
-    }
-
-    #[test]
-    fn noncritical_change_detection_excludes_subscription_conditions() {
-        let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
-        let original = event(date);
-        let mut changed = original.clone();
-        changed.name = "测试股份新简称".into();
-        changed.listing_date = Some(date + Duration::days(10));
-        let reason = noncritical_change_reason(&original, &changed).unwrap();
-        assert!(reason.contains("证券简称"));
-        assert!(reason.contains("上市日期"));
-
-        let mut critical_only = original.clone();
-        critical_only.issue_price = Some(11.0);
-        assert!(noncritical_change_reason(&original, &critical_only).is_none());
     }
 
     #[test]

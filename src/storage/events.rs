@@ -34,7 +34,8 @@ impl Database {
     pub fn upsert_event(&self, mut event: IpoEvent) -> Result<IpoEvent> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut change_notification = None::<(bool, String, ChinaDateTime)>;
+        let settings = settings_from_connection(&transaction)?;
+        let mut change_notification = None::<(String, ChinaDateTime)>;
         let existing = transaction
             .query_row(
                 "SELECT * FROM ipo_events WHERE id=?1",
@@ -45,14 +46,13 @@ impl Database {
         if let Some(previous) = &existing {
             retain_known_optional_fields(previous, &mut event);
             let critical_reason = critical_change_reason(previous, &event);
-            let noncritical_reason = noncritical_change_reason(previous, &event);
             let critical_changed = critical_reason.is_some();
             event.event_version = previous.event_version + i32::from(critical_changed);
             event.first_seen_at = previous.first_seen_at;
             change_notification = critical_reason
                 .as_ref()
-                .map(|reason| (true, reason.clone(), previous.updated_at))
-                .or_else(|| noncritical_reason.map(|reason| (false, reason, previous.updated_at)));
+                .filter(|_| data_change_is_actionable_now(previous, &event, &settings))
+                .map(|reason| (reason.clone(), previous.updated_at));
             if critical_changed && previous.lifecycle_status == LifecycleStatus::Acknowledged {
                 event.lifecycle_status = LifecycleStatus::AcknowledgedNeedsReview;
                 transaction.execute("UPDATE acknowledgements SET needs_review_at=?1,review_reason=?2 WHERE ipo_event_id=?3 AND event_version=?4 AND revoked_at IS NULL", params![format_dt(event.updated_at), critical_reason.as_deref(), event.id, previous.event_version])?;
@@ -106,7 +106,6 @@ impl Database {
                 event.event_version,
             )?;
         }
-        let settings = settings_from_connection(&transaction)?;
         transaction.execute(
             "UPDATE reminder_outbox SET delivery_state=?1,lease_until=NULL,updated_at=?2 WHERE ipo_event_id=?3 AND event_version<>?4 AND delivery_state IN (?5,?6,?7)",
             params![
@@ -124,14 +123,8 @@ impl Database {
         let mut planning = event.clone();
         apply_manual_overrides(&transaction, &mut planning)?;
         reconcile_schedule_tx(&transaction, &planning, &settings, now_china())?;
-        if let Some((critical, reason, previous_updated_at)) = change_notification {
-            enqueue_change_notification_tx(
-                &transaction,
-                &event,
-                critical,
-                &reason,
-                previous_updated_at,
-            )?;
+        if let Some((reason, previous_updated_at)) = change_notification {
+            enqueue_change_notification_tx(&transaction, &event, &reason, previous_updated_at)?;
         }
         transaction.commit()?;
         Ok(event)
@@ -233,6 +226,15 @@ impl Database {
     }
 }
 
+fn data_change_is_actionable_now(
+    previous: &IpoEvent,
+    current: &IpoEvent,
+    settings: &AppSettings,
+) -> bool {
+    subscription_reminder_allowed_now(previous, settings, current.updated_at)
+        || subscription_reminder_allowed_now(current, settings, current.updated_at)
+}
+
 pub(super) fn persisted_event_fields_equal(previous: &IpoEvent, current: &IpoEvent) -> bool {
     previous.id == current.id
         && previous.exchange == current.exchange
@@ -304,15 +306,10 @@ pub(super) fn retain_known_optional_fields(previous: &IpoEvent, current: &mut Ip
 pub(super) fn enqueue_change_notification_tx(
     transaction: &rusqlite::Transaction<'_>,
     event: &IpoEvent,
-    critical: bool,
     reason: &str,
     previous_updated_at: ChinaDateTime,
 ) -> Result<()> {
-    let message = if critical {
-        format!("{reason}。请重新核对任务详情；若此前已确认，必须重新确认。")
-    } else {
-        format!("{reason}。关键申购条件未变化，本次变更仅提醒一次。")
-    };
+    let message = format!("{reason}。请重新核对任务详情；若此前已确认，必须重新确认。");
     let fingerprint = sha256(format!(
         "{}|{}|{}|{}|{}",
         event.id,

@@ -2,12 +2,22 @@ use super::*;
 
 pub(crate) fn refresh_snapshot(database: &Database, ui_state: &RuntimeUiState) {
     let events = database.today_events().unwrap_or_default();
+    let today_count = database
+        .settings()
+        .ok()
+        .map(|settings| {
+            events
+                .iter()
+                .filter(|event| settings.exchange_enabled(event.exchange))
+                .count()
+        })
+        .unwrap_or_default();
     let pending = database.pending_count().unwrap_or_default();
     let health = database
         .health_text()
         .unwrap_or_else(|error| (HealthState::Failed, format!("健康状态读取失败：{error}")));
     update_snapshot(ui_state, |value| {
-        value.today_count = events.len();
+        value.today_count = today_count;
         value.pending_count = pending;
         value.health_state = health.0;
         value.health_text = health.1;

@@ -194,6 +194,8 @@ try {
     Assert-Condition ([string]$smoke.implementation -eq 'rust') 'Smoke report is not Rust.'
     Assert-Condition ([long]$smoke.memory.privateBytes -lt [long]$smoke.memory.limitBytes) 'Idle memory gate failed.'
     Assert-Condition ([bool]$smoke.checks.msiAdministrativeExtract -and [bool]$smoke.checks.msiPayloadSelfTest -and [bool]$smoke.checks.selectableInstallDirectoryAuthoring) 'MSI smoke gates failed.'
+    Assert-Condition ([bool]$smoke.checks.defaultStartupTrayOnly) 'Default tray-only startup smoke gate failed.'
+    Assert-Condition ([bool]$smoke.checks.mainWindowSizePersistence) 'Main-window size persistence smoke gate failed.'
     Assert-Condition ([bool]$smoke.checks.reminderWindowVisibleNoFocusSteal) 'Dedicated reminder window smoke gate failed.'
     Assert-Condition ([bool]$smoke.checks.secondLaunchActivatesExistingInstance) 'Second-launch activation smoke gate failed.'
     Assert-Condition ([bool]$smoke.checks.explorerTrayReRegistration) 'Explorer tray re-registration smoke gate failed.'

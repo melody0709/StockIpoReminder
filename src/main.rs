@@ -111,8 +111,24 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         runtime::start(options.data_root.clone(), !options.skip_startup_sync)?;
 
     let ui = MainWindow::new().context("无法创建 Slint 主窗口")?;
-    ui.window()
-        .on_close_requested(|| CloseRequestResponse::HideWindow);
+    let restored_window_size = match prepare_main_window_size_restore(&options.data_root) {
+        Ok(size) => size,
+        Err(error) => {
+            operations::log(
+                "WARN",
+                &format!("恢复主窗口尺寸失败，使用默认大小：{error:#}"),
+            );
+            None
+        }
+    };
+    let close_window = ui.as_weak();
+    let close_data_root = options.data_root.clone();
+    ui.window().on_close_requested(move || {
+        if let Some(window) = close_window.upgrade() {
+            persist_main_window_size(&window, &close_data_root);
+        }
+        CloseRequestResponse::HideWindow
+    });
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     let reminder_window = ReminderWindow::new().context("无法创建专用提醒窗口")?;
     reminder_window
@@ -222,27 +238,31 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         #[cfg(windows)]
         Arc::clone(&tray),
     );
+    let window_size_timer = start_main_window_size_persistence(
+        ui.as_weak(),
+        options.data_root.clone(),
+        restored_window_size,
+    );
 
-    ui.show().context("无法显示主窗口")?;
+    #[cfg(windows)]
     operations::log(
         "INFO",
         &format!(
-            "启动界面与托盘已呈现：elapsedMs={}",
+            "应用已驻留系统托盘，主窗口默认保持隐藏：elapsedMs={}",
             startup_started.elapsed().as_millis()
         ),
     );
-    #[cfg(windows)]
+    #[cfg(not(windows))]
     {
-        let icon_window = ui.as_weak();
-        Timer::single_shot(Duration::from_millis(50), move || {
-            if let Some(window) = icon_window.upgrade() {
-                let _ = windows_integration::fit_window_to_work_area(window.window());
-                let _ = windows_integration::install_window_icon(window.window());
-            }
-        });
-    }
-    if options.background {
-        ui.hide().context("无法隐藏主窗口")?;
+        ui.show().context("无法显示主窗口")?;
+        apply_restored_main_window_size(&ui);
+        operations::log(
+            "INFO",
+            &format!(
+                "启动界面已呈现：elapsedMs={}",
+                startup_started.elapsed().as_millis()
+            ),
+        );
     }
     if let Some(exit_after) = options.exit_after {
         Timer::single_shot(exit_after, || {
@@ -260,6 +280,8 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     // The application is tray-resident: hiding the last visible window must not
     // terminate Slint's event loop. Only an explicit quit action should exit.
     let run_result = slint::run_event_loop_until_quit().context("Slint 事件循环异常");
+    window_size_timer.stop();
+    persist_main_window_size(&ui, &options.data_root);
     let _ = ui.hide();
     let _ = reminder_window.hide();
     // 等 UI 发起的后台数据库/文件操作全部安全收尾，避免进程退出时硬中断事务。
@@ -272,7 +294,6 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
 
 struct RuntimeOptions {
     data_root: PathBuf,
-    background: bool,
     exit_after: Option<Duration>,
     skip_startup_sync: bool,
     skip_auto_start_registration: bool,
@@ -292,7 +313,6 @@ impl RuntimeOptions {
                     .unwrap_or_else(env::temp_dir)
                     .join("StockIpoReminder")
             });
-        let mut background = false;
         let mut exit_after = None;
         let mut skip_startup_sync = false;
         let mut skip_auto_start_registration = false;
@@ -307,7 +327,8 @@ impl RuntimeOptions {
                     index += 1;
                     data_root = PathBuf::from(&arguments[index]);
                 }
-                "--background" => background = true,
+                // 兼容旧版自启动、Watchdog 与发布脚本；Windows 现在默认只驻留托盘。
+                "--background" => {}
                 "--exit-after-seconds" if index + 1 < arguments.len() => {
                     index += 1;
                     exit_after = arguments[index]
@@ -333,7 +354,6 @@ impl RuntimeOptions {
         }
         Self {
             data_root,
-            background,
             exit_after,
             skip_startup_sync,
             skip_auto_start_registration,

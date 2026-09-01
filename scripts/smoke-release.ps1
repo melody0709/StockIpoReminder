@@ -7,6 +7,98 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class StockIpoReminderWindowProbe
+{
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr window, out Rect rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr window,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+
+    public static IntPtr FindVisibleTitledWindow(uint processId, string expectedTitle)
+    {
+        var found = IntPtr.Zero;
+        EnumWindows((window, parameter) =>
+        {
+            GetWindowThreadProcessId(window, out var ownerProcessId);
+            if (ownerProcessId != processId || !IsWindowVisible(window))
+            {
+                return true;
+            }
+
+            var title = new StringBuilder(512);
+            GetWindowText(window, title, title.Capacity);
+            if (String.Equals(title.ToString(), expectedTitle, StringComparison.Ordinal))
+            {
+                found = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    public static bool HasVisibleTitledWindow(uint processId, string expectedTitle)
+    {
+        return FindVisibleTitledWindow(processId, expectedTitle) != IntPtr.Zero;
+    }
+
+    public static bool GrowWindow(IntPtr window, int widthDelta, int heightDelta)
+    {
+        if (!GetWindowRect(window, out var outer))
+        {
+            return false;
+        }
+        const uint NoMoveNoOrderNoActivate = 0x0002 | 0x0004 | 0x0010;
+        return SetWindowPos(
+            window,
+            IntPtr.Zero,
+            0,
+            0,
+            outer.Right - outer.Left + widthDelta,
+            outer.Bottom - outer.Top + heightDelta,
+            NoMoveNoOrderNoActivate);
+    }
+}
+'@
 
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $cargoManifestPath = Join-Path $workspace 'Cargo.toml'
@@ -95,14 +187,20 @@ try {
     $checks.windowsTimeServiceDiagnosed = $true
     $checks.windowsToastDiagnosed = $true
 
-    $process = Start-Process -FilePath $portableExecutable -ArgumentList @('--data-root', $dataRoot, '--background', '--skip-startup-sync', '--skip-auto-start-registration', '--skip-update-check', '--skip-crash-upload', '--no-watchdog', '--exit-after-seconds', '8') -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $portableExecutable -ArgumentList @('--data-root', $dataRoot, '--skip-startup-sync', '--skip-auto-start-registration', '--skip-update-check', '--skip-crash-upload', '--no-watchdog', '--exit-after-seconds', '8') -PassThru
     Start-Sleep -Seconds 3
     $sample = Get-Process -Id $process.Id -ErrorAction Stop
+    $sample.Refresh()
     $privateBytes = [long]$sample.PrivateMemorySize64
     $workingSet = [long]$sample.WorkingSet64
+    $mainWindowVisible = [StockIpoReminderWindowProbe]::HasVisibleTitledWindow(
+        [uint32]$process.Id,
+        'A 股新股申购提醒')
+    Assert-Condition (-not $mainWindowVisible) 'Default startup unexpectedly displayed the main window.'
     Assert-Condition ($privateBytes -lt 100MB) "Idle Private Bytes exceeded 100MB: $privateBytes"
-    Assert-Condition ($process.WaitForExit(20000)) 'Background UI smoke did not exit.'
-    Assert-Condition ($process.ExitCode -eq 0) "Background UI smoke failed: $($process.ExitCode)"
+    Assert-Condition ($process.WaitForExit(20000)) 'Default tray-only startup smoke did not exit.'
+    Assert-Condition ($process.ExitCode -eq 0) "Default tray-only startup smoke failed: $($process.ExitCode)"
+    $checks.defaultStartupTrayOnly = $true
     $checks.backgroundUi = $true
     $checks.privateBytesUnder100Mb = $true
 
@@ -142,6 +240,17 @@ try {
     $checks.windowsRecoveryMessagesDebounced = $true
 
     New-Item -ItemType Directory -Path $instanceDataRoot -Force | Out-Null
+    $initialWindowWidth = 900
+    $initialWindowHeight = 560
+    $windowStatePath = Join-Path $instanceDataRoot 'window-state.json'
+    [System.IO.File]::WriteAllText(
+        $windowStatePath,
+        (@{
+            schemaVersion = 1
+            width = $initialWindowWidth
+            height = $initialWindowHeight
+        } | ConvertTo-Json),
+        [System.Text.UTF8Encoding]::new($false))
     $instanceSupervisor = Start-Process -FilePath $portableExecutable -ArgumentList @(
         '--data-root', $instanceDataRoot,
         '--background',
@@ -149,7 +258,7 @@ try {
         '--skip-auto-start-registration',
         '--skip-update-check',
         '--skip-crash-upload',
-        '--exit-after-seconds', '12') -PassThru -WindowStyle Hidden
+        '--exit-after-seconds', '18') -PassThru -WindowStyle Hidden
     $instanceChild = $null
     $instanceDeadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
     do {
@@ -186,7 +295,40 @@ try {
     } while (-not $activationConfirmed -and [DateTimeOffset]::UtcNow -lt $activationDeadline)
     Assert-Condition $activationConfirmed 'Existing instance did not confirm that the main window became visible.'
     $checks.secondLaunchActivatesExistingInstance = $true
-    Assert-Condition ($instanceSupervisor.WaitForExit(20000)) 'Instance-activation smoke supervisor did not exit.'
+
+    $restoreConfirmed = $false
+    $restoreDeadline = [DateTimeOffset]::UtcNow.AddSeconds(3)
+    do {
+        if ($null -ne $logPath) {
+            try {
+                $restoreConfirmed = [System.IO.File]::ReadAllText($logPath, [System.Text.Encoding]::UTF8) -match (
+                    'logicalWidth=' + $initialWindowWidth +
+                    '\s+logicalHeight=' + $initialWindowHeight +
+                    '.*event=main_window_size_restored')
+            }
+            catch [System.IO.IOException] {}
+        }
+        if (-not $restoreConfirmed) { Start-Sleep -Milliseconds 200 }
+    } while (-not $restoreConfirmed -and [DateTimeOffset]::UtcNow -lt $restoreDeadline)
+    Assert-Condition $restoreConfirmed 'Saved main-window logical size was not restored.'
+
+    $mainWindow = [StockIpoReminderWindowProbe]::FindVisibleTitledWindow(
+        [uint32]$instanceChild.ProcessId,
+        'A 股新股申购提醒')
+    Assert-Condition ($mainWindow -ne [IntPtr]::Zero) 'Activated main window was not found.'
+    Assert-Condition (
+        [StockIpoReminderWindowProbe]::GrowWindow(
+            $mainWindow,
+            120,
+            90)) `
+        'Could not resize the main window for persistence smoke.'
+    Start-Sleep -Seconds 3
+    $savedWindowState = Get-Content -Raw -Encoding UTF8 -LiteralPath $windowStatePath | ConvertFrom-Json
+    Assert-Condition ([int]$savedWindowState.width -gt $initialWindowWidth) 'Resized main-window width was not persisted.'
+    Assert-Condition ([int]$savedWindowState.height -gt $initialWindowHeight) 'Resized main-window height was not persisted.'
+    $checks.mainWindowSizePersistence = $true
+
+    Assert-Condition ($instanceSupervisor.WaitForExit(30000)) 'Instance-activation smoke supervisor did not exit.'
     Assert-Condition ($instanceSupervisor.ExitCode -eq 0) "Instance-activation smoke failed: $($instanceSupervisor.ExitCode)"
 
     Invoke-MsiAdministrativeExtraction $msiPath $msiAdminDirectory
@@ -207,7 +349,11 @@ try {
     $updaterSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'src\updater.rs')
     $crashUploadSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'src\crash_upload.rs')
     $secondaryNotificationSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'src\secondary_notification.rs')
-    $storageSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'src\storage.rs')
+    $storageSource = @(
+        Get-ChildItem -LiteralPath (Join-Path $workspace 'src\storage') -Filter '*.rs' -File |
+            Sort-Object Name |
+            ForEach-Object { Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName }
+    ) -join "`n"
     $buildSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-release.ps1')
     $mainUiSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'ui\main.slint')
     Assert-Condition ($packageSource -match 'ProgramFiles64Folder') 'MSI does not default to 64-bit Program Files.'
@@ -264,7 +410,7 @@ try {
     $checks.secondaryNotificationAuthoring = $true
 
     $report = [ordered]@{
-        schemaVersion = '10'
+        schemaVersion = '11'
         success = $true
         implementation = 'rust'
         version = $Version
@@ -283,7 +429,7 @@ try {
 }
 catch {
     $report = [ordered]@{
-        schemaVersion = '10'
+        schemaVersion = '11'
         success = $false
         implementation = 'rust'
         version = $Version

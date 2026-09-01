@@ -19,9 +19,11 @@ pub(crate) fn wire_application_callbacks(ui: &MainWindow, data_root: PathBuf) {
         }
     });
 
+    let hide_root = data_root;
     let weak = ui.as_weak();
     ui.on_hide_to_tray(move || {
         if let Some(ui) = weak.upgrade() {
+            persist_main_window_size(&ui, &hide_root);
             let _ = ui.hide();
         }
     });

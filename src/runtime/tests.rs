@@ -80,6 +80,55 @@ fn automatic_sync_uses_the_configured_interval() {
 }
 
 #[test]
+fn health_summary_only_runs_for_today_tasks_inside_trading_sessions() {
+    let settings = AppSettings::default();
+    let date = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+    let mut snapshot = RuntimeSnapshot {
+        health_state: HealthState::Warning,
+        ..RuntimeSnapshot::default()
+    };
+
+    assert!(
+        next_health_summary_at(
+            &settings,
+            &snapshot,
+            None,
+            crate::core::at(date, crate::model::time(10, 0)),
+        )
+        .is_none()
+    );
+
+    snapshot.today_count = 1;
+    assert_eq!(
+        next_health_summary_at(
+            &settings,
+            &snapshot,
+            None,
+            crate::core::at(date, crate::model::time(8, 0)),
+        ),
+        Some(crate::core::at(date, crate::model::time(9, 30)))
+    );
+    assert_eq!(
+        next_health_summary_at(
+            &settings,
+            &snapshot,
+            None,
+            crate::core::at(date, crate::model::time(12, 0)),
+        ),
+        Some(crate::core::at(date, crate::model::time(13, 0)))
+    );
+    assert!(
+        next_health_summary_at(
+            &settings,
+            &snapshot,
+            None,
+            crate::core::at(date, crate::model::time(15, 1)),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn automatic_sync_uses_exact_fixed_checks_and_stops_periodic_idle_sync() {
     let date = NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
     let settings = AppSettings::default();
