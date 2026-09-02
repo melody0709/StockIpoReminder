@@ -230,7 +230,7 @@ impl Default for AppSettings {
             secondary_notification_provider: SecondaryNotificationProvider::Disabled,
             auto_start_enabled: true,
             normal_sync_minutes: 30,
-            active_day_sync_minutes: 10,
+            active_day_sync_minutes: 20,
             notification_self_test_completed: false,
             notification_window_test_passed: None,
             notification_toast_test_passed: None,

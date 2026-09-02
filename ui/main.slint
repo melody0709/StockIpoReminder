@@ -257,8 +257,9 @@ export component MainWindow inherits Window {
     in-out property <string> notification-test-question: "你是否观察到刚才的测试？";
     in-out property <string> normal-sync-interval-value: "30";
     in-out property <int> normal-sync-interval-unit-index: 0;
-    in-out property <string> active-sync-interval-value: "10";
+    in-out property <string> active-sync-interval-value: "20";
     in-out property <int> active-sync-interval-unit-index: 0;
+    in-out property <bool> reset-settings-pending: false;
     in-out property <bool> automatic-updates-enabled: false;
     in-out property <bool> update-configured: false;
     in-out property <bool> advanced-settings-expanded: false;
@@ -324,6 +325,7 @@ export component MainWindow inherits Window {
     in-out property <bool> show-exit-confirmation: false;
 
     callback save-settings();
+    callback reset-settings();
     callback sync-now();
     callback refresh-data();
     callback select-task(string);
@@ -905,9 +907,9 @@ export component MainWindow inherits Window {
                                 height: 34px;
                                 spacing: 10px;
                                 Text { width: root.compact-width ? 150px : 190px; text: "当日未确认任务核验"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "10"; }
+                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "20"; }
                                 ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
-                                Text { text: "默认 10 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                                Text { text: "默认 20 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
                             }
                             Text { text: "健康同步确认无任务或任务已确认后，当天停止周期同步；周末无真实提醒时直接睡到下个工作日。上方间隔只用于来源异常重试和当日未确认任务核验；已知提醒、用户操作与系统恢复会按需唤醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                         }
@@ -936,8 +938,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     if root.advanced-settings-expanded || root.secondary-notification-configured || root.secondary-notification-enabled : Rectangle {
-                        min-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 224px : 180px) : (root.compact-width ? 264px : 220px);
-                        max-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 224px : 180px) : (root.compact-width ? 264px : 220px);
+                        min-height: root.secondary-notification-provider-index == 0 ? 210px : 292px;
+                        max-height: root.secondary-notification-provider-index == 0 ? 210px : 292px;
                         border-radius: 9px;
                         border-width: 1px;
                         border-color: #26334a;
@@ -961,10 +963,21 @@ export component MainWindow inherits Window {
                                     model: ["不启用", "企业微信机器人", "钉钉机器人", "飞书机器人", "PushPlus"];
                                     current-index <=> root.secondary-notification-provider-index;
                                 }
+                                Text {
+                                    text: root.secondary-notification-provider-index == 0 ? "选择服务商后可启用第二通知" : "选择服务商后可填写或保留加密凭据";
+                                    color: #94a3b8;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            if root.secondary-notification-provider-index > 0 : HorizontalBox {
+                                height: 34px;
+                                spacing: 10px;
                                 Toggle {
                                     label: "同时发送到第二通道";
                                     checked <=> root.secondary-notification-enabled;
-                                    enabled: root.secondary-notification-provider-index > 0;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                                 if root.secondary-notification-configured : ActionButton {
@@ -1128,6 +1141,7 @@ export component MainWindow inherits Window {
                     HorizontalBox {
                         spacing: 8px;
                         Rectangle { horizontal-stretch: 1; }
+                        ActionButton { label: "恢复默认"; compact: root.compact-width; clicked => { root.reset-settings(); } }
                         ActionButton { label: "保存设置"; compact: root.compact-width; primary: true; clicked => { root.save-settings(); } }
                         ActionButton {
                             label: "安全退出";

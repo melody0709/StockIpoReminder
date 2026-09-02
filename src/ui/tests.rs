@@ -85,7 +85,29 @@ fn sync_interval_parser_supports_minutes_and_hours() {
     );
     assert!(parse_sync_interval("4", 0, "申购日自动同步间隔").is_err());
     assert_eq!(sync_interval_display(120), ("2".into(), 1));
-    assert_eq!(sync_interval_display(10), ("10".into(), 0));
+    assert_eq!(sync_interval_display(20), ("20".into(), 0));
+}
+
+#[test]
+fn settings_reset_uses_all_application_defaults() {
+    let stored = AppSettings {
+        active_day_sync_minutes: 5,
+        normal_sync_minutes: 120,
+        sound_enabled: false,
+        notification_self_test_completed: true,
+        ..AppSettings::default()
+    };
+
+    assert_eq!(
+        settings_base_for_save(stored.clone(), false).normal_sync_minutes,
+        120
+    );
+    assert_eq!(settings_base_for_save(stored, true).normal_sync_minutes, 30);
+
+    let defaults = settings_base_for_save(AppSettings::default(), true);
+    assert_eq!(defaults.active_day_sync_minutes, 20);
+    assert!(defaults.sound_enabled);
+    assert!(!defaults.notification_self_test_completed);
 }
 
 #[test]

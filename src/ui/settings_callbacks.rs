@@ -1,11 +1,37 @@
 use super::*;
 
+pub(crate) fn settings_base_for_save(
+    stored_settings: AppSettings,
+    reset_settings_pending: bool,
+) -> AppSettings {
+    if reset_settings_pending {
+        AppSettings::default()
+    } else {
+        stored_settings
+    }
+}
+
 pub(crate) fn wire_settings_callbacks(
     ui: &MainWindow,
     runtime: RuntimeHandle,
     data_root: PathBuf,
     ui_write_busy: Arc<AtomicBool>,
 ) {
+    let reset_weak = ui.as_weak();
+    ui.on_reset_settings(move || {
+        let Some(ui) = reset_weak.upgrade() else {
+            return;
+        };
+        apply_settings(&ui, &AppSettings::default());
+        ui.set_secondary_notification_secret_entry("".into());
+        ui.set_secondary_notification_configured(false);
+        ui.set_secondary_notification_status("已恢复默认值；保存后将关闭第二通知通道。".into());
+        ui.set_reset_settings_pending(true);
+        ui.set_status_text(
+            "已恢复默认设置；点击“保存设置”后生效。本地任务、缓存和通知凭据不会删除。".into(),
+        );
+    });
+
     let weak = ui.as_weak();
     let settings_runtime = runtime.clone();
     let settings_data_root = data_root.clone();
@@ -18,7 +44,10 @@ pub(crate) fn wire_settings_callbacks(
             {
                 anyhow::bail!("至少需要启用一个市场");
             }
-            let mut settings = settings_runtime.settings()?;
+            let mut settings = settings_base_for_save(
+                settings_runtime.settings()?,
+                ui.get_reset_settings_pending(),
+            );
             settings.auto_start_enabled = ui.get_auto_start();
             settings.shanghai_enabled = ui.get_shanghai_enabled();
             settings.shenzhen_enabled = ui.get_shenzhen_enabled();
@@ -114,6 +143,7 @@ pub(crate) fn wire_settings_callbacks(
                 } else {
                     ui.set_status_text("设置已保存，提醒计划已重算".into());
                     ui.set_secondary_notification_secret_entry("".into());
+                    ui.set_reset_settings_pending(false);
                 }
                 if let Ok(saved_settings) = &saved_settings {
                     apply_settings(&ui, saved_settings);
