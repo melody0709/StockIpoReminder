@@ -194,7 +194,6 @@ pub(crate) fn record_notification_test_result(
         1 => settings.notification_toast_test_passed = Some(passed),
         2 => settings.notification_balloon_test_passed = Some(passed),
         3 => settings.notification_sound_test_passed = Some(passed),
-        4 => settings.notification_flash_test_passed = Some(passed),
         _ => anyhow::bail!("提醒通道测试类型无效"),
     }
     settings.notification_self_test_completed = settings.notification_tests_complete();

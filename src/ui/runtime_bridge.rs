@@ -77,7 +77,6 @@ pub(crate) fn install_runtime_ui_bridge(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReminderAlerts {
     pub(crate) sound: bool,
-    pub(crate) flash: bool,
     pub(crate) toast: bool,
 }
 
@@ -85,7 +84,6 @@ impl ReminderAlerts {
     pub(crate) fn from_settings(settings: &AppSettings) -> Self {
         Self {
             sound: settings.sound_enabled,
-            flash: settings.flash_taskbar,
             toast: cfg!(windows) && settings.toast_enabled,
         }
     }
@@ -143,7 +141,10 @@ pub(crate) fn drain_runtime_ui(
         if let Ok(mut state) = bridge_state.lock() {
             state.startup_applied = true;
         }
-        if settings.onboarding_completed && !skip_auto_start_registration {
+        let onboarding_completed = settings.onboarding_completed
+            || settings.notification_self_test_completed
+            || settings.notification_tests_complete();
+        if onboarding_completed && !skip_auto_start_registration {
             match env::current_exe() {
                 Ok(executable) => {
                     if let Err(error) = windows_integration::set_auto_start(
@@ -162,7 +163,7 @@ pub(crate) fn drain_runtime_ui(
         }
         apply_settings(&ui, &settings);
         refresh_secondary_notification_ui(&ui, data_root, &settings, runtime);
-        if !settings.onboarding_completed {
+        if !onboarding_completed {
             ui.set_active_page(3);
         }
         if settings.automatic_updates_enabled && update_configured && !skip_update_check {
@@ -241,22 +242,19 @@ pub(crate) fn drain_runtime_ui(
         reminder_window.set_can_acknowledge(batch.can_acknowledge);
         let shown = show_dedicated_reminder(&reminder_window);
         // 设置读取失败时 fail-closed：不回退默认值，避免在用户明确关闭
-        // 声音/闪烁/Toast 的情况下误触发提醒副作用。
+        // 声音/Toast 的情况下误触发提醒副作用。
         let alerts = match runtime.settings() {
             Ok(settings) => ReminderAlerts::from_settings(&settings),
             Err(error) => {
                 operations::log(
                     "ERROR",
-                    &format!("提醒呈现时读取设置失败，跳过声音/闪烁/Toast 副作用：{error:#}"),
+                    &format!("提醒呈现时读取设置失败，跳过声音/Toast 副作用：{error:#}"),
                 );
                 ReminderAlerts::fail_closed()
             }
         };
         if alerts.sound {
             windows_integration::play_alert();
-        }
-        if alerts.flash {
-            windows_integration::flash_window(reminder_window.window());
         }
         #[cfg(windows)]
         if alerts.toast {

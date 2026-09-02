@@ -230,31 +230,3 @@ pub fn window_is_foreground(window: &slint::Window) -> Result<bool> {
 pub(crate) fn clamp_window_dimension(current: u32, minimum: u32, available: u32) -> u32 {
     current.min(available).max(minimum.min(available))
 }
-
-pub fn flash_window(window: &slint::Window) {
-    #[cfg(windows)]
-    {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let handle = window.window_handle();
-        let Ok(raw) = handle.window_handle() else {
-            return;
-        };
-        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
-            return;
-        };
-        let info = FLASHWINFO {
-            cbSize: size_of::<FLASHWINFO>() as u32,
-            hwnd: HWND(raw.hwnd.get() as *mut _),
-            dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
-            uCount: 5,
-            dwTimeout: 0,
-        };
-        unsafe {
-            let _ = FlashWindowEx(&info);
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = window;
-    }
-}

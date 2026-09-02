@@ -186,7 +186,6 @@ pub struct AppSettings {
     pub safety_cutoff: NaiveTime,
     pub beijing_reservation_supported: bool,
     pub sound_enabled: bool,
-    pub flash_taskbar: bool,
     pub toast_enabled: bool,
     pub daily_health_summary_enabled: bool,
     pub post_apply_reminders_enabled: bool,
@@ -203,7 +202,6 @@ pub struct AppSettings {
     pub notification_toast_test_passed: Option<bool>,
     pub notification_balloon_test_passed: Option<bool>,
     pub notification_sound_test_passed: Option<bool>,
-    pub notification_flash_test_passed: Option<bool>,
     pub onboarding_completed: bool,
 }
 
@@ -219,7 +217,6 @@ impl Default for AppSettings {
             safety_cutoff: time(14, 55),
             beijing_reservation_supported: false,
             sound_enabled: true,
-            flash_taskbar: true,
             toast_enabled: true,
             daily_health_summary_enabled: true,
             post_apply_reminders_enabled: true,
@@ -236,7 +233,6 @@ impl Default for AppSettings {
             notification_toast_test_passed: None,
             notification_balloon_test_passed: None,
             notification_sound_test_passed: None,
-            notification_flash_test_passed: None,
             onboarding_completed: false,
         }
     }
@@ -258,7 +254,6 @@ impl AppSettings {
                 || self.notification_toast_test_passed == Some(true)
                 || self.notification_balloon_test_passed == Some(true))
             && (!self.sound_enabled || self.notification_sound_test_passed == Some(true))
-            && (!self.flash_taskbar || self.notification_flash_test_passed == Some(true))
     }
 
     pub fn notification_tests_started(&self) -> bool {
@@ -266,7 +261,6 @@ impl AppSettings {
             || self.notification_toast_test_passed.is_some()
             || self.notification_balloon_test_passed.is_some()
             || self.notification_sound_test_passed.is_some()
-            || self.notification_flash_test_passed.is_some()
     }
 }
 

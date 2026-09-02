@@ -50,6 +50,9 @@ pub(crate) fn sync_interval_display(minutes: i32) -> (String, i32) {
 }
 
 pub(crate) fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
+    let notification_tests_complete =
+        settings.notification_self_test_completed || settings.notification_tests_complete();
+    let onboarding_completed = settings.onboarding_completed || notification_tests_complete;
     ui.set_auto_start(settings.auto_start_enabled);
     ui.set_shanghai_enabled(settings.shanghai_enabled);
     ui.set_shenzhen_enabled(settings.shenzhen_enabled);
@@ -78,7 +81,6 @@ pub(crate) fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
     ui.set_safety_cutoff(settings.safety_cutoff.format("%H:%M").to_string().into());
     ui.set_beijing_reservation(settings.beijing_reservation_supported);
     ui.set_sound_enabled(settings.sound_enabled);
-    ui.set_flash_taskbar(settings.flash_taskbar);
     ui.set_toast_enabled(settings.toast_enabled);
     ui.set_health_summary_enabled(settings.daily_health_summary_enabled);
     ui.set_post_apply_reminders_enabled(settings.post_apply_reminders_enabled);
@@ -95,8 +97,8 @@ pub(crate) fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
     let (active_value, active_unit) = sync_interval_display(settings.active_day_sync_minutes);
     ui.set_active_sync_interval_value(active_value.into());
     ui.set_active_sync_interval_unit_index(active_unit);
-    ui.set_notification_test_completed(settings.notification_self_test_completed);
-    ui.set_onboarding_completed(settings.onboarding_completed);
+    ui.set_notification_test_completed(notification_tests_complete);
+    ui.set_onboarding_completed(onboarding_completed);
     let (window_status, window_level) =
         notification_test_display(settings.notification_window_test_passed, "提醒窗口");
     ui.set_notification_window_test_status(window_status.into());
@@ -113,18 +115,14 @@ pub(crate) fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
         notification_test_display(settings.notification_sound_test_passed, "声音");
     ui.set_notification_sound_test_status(sound_status.into());
     ui.set_notification_sound_test_level(sound_level);
-    let (flash_status, flash_level) =
-        notification_test_display(settings.notification_flash_test_passed, "任务栏闪烁");
-    ui.set_notification_flash_test_status(flash_status.into());
-    ui.set_notification_flash_test_level(flash_level);
     let (platform_status, platform_level) =
         toast_platform_display(&windows_integration::toast_diagnostics());
     ui.set_notification_platform_status(platform_status.into());
     ui.set_notification_platform_level(platform_level);
     ui.set_notification_test_status(
-        if settings.notification_self_test_completed && !settings.notification_tests_started() {
+        if notification_tests_complete && !settings.notification_tests_started() {
             "旧版整体测试已通过；建议使用上方按钮逐项复测".into()
-        } else if settings.notification_self_test_completed {
+        } else if notification_tests_complete {
             "当前启用的提醒通道已确认；系统通知的 Toast 或气泡回退至少一项可用".into()
         } else if settings.notification_tests_started() {
             "仍有启用的通道未测试或未通过，请逐项处理".into()

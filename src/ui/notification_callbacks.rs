@@ -75,13 +75,6 @@ pub(crate) fn wire_notification_callbacks(
                 windows_integration::play_alert();
                 ("确认声音测试", "你是否听到了 Windows 提示音？")
             }
-            4 => {
-                windows_integration::flash_window(ui.window());
-                (
-                    "确认任务栏闪烁测试",
-                    "你是否观察到本程序的任务栏按钮闪烁或突出显示？",
-                )
-            }
             _ => return,
         };
         ui.set_notification_test_channel(channel);

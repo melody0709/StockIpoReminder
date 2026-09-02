@@ -101,6 +101,30 @@ component NavButton inherits Rectangle {
     touch := TouchArea { clicked => { root.clicked(); } }
 }
 
+component SettingsTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <bool> compact: false;
+    callback clicked();
+    min-width: root.compact ? 92px : 118px;
+    min-height: 38px;
+    max-height: 38px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.selected ? #3b82f6 : #334155;
+    background: root.selected ? #1d4ed8 : touch.has-hover ? #253552 : #17233a;
+    Text {
+        text: root.label;
+        color: root.selected ? white : #cbd5e1;
+        font-size: root.compact ? 13px : 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
 component Toggle inherits Rectangle {
     in-out property <bool> checked: false;
     in property <string> label;
@@ -137,6 +161,33 @@ component Toggle inherits Rectangle {
     touch := TouchArea {
         enabled: root.enabled;
         clicked => { if (root.enabled) { root.checked = !root.checked; } }
+    }
+}
+
+component NotificationTestItem inherits Rectangle {
+    in property <string> label;
+    in property <string> status;
+    in property <int> level: 0;
+    in property <bool> compact: false;
+    callback clicked();
+    min-width: root.compact ? 250px : 320px;
+    min-height: 40px;
+    max-height: 40px;
+    background: transparent;
+    HorizontalBox {
+        spacing: 8px;
+        ActionButton {
+            label: root.label;
+            compact: root.compact;
+            clicked => { root.clicked(); }
+        }
+        Text {
+            text: root.status;
+            color: root.level == 1 ? #86efac : root.level == 2 ? #fca5a5 : #fcd34d;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
     }
 }
 
@@ -232,7 +283,6 @@ export component MainWindow inherits Window {
     in-out property <string> safety-cutoff: "14:55";
     in-out property <bool> beijing-reservation: false;
     in-out property <bool> sound-enabled: true;
-    in-out property <bool> flash-taskbar: true;
     in-out property <bool> toast-enabled: true;
     in-out property <bool> health-summary-enabled: true;
     in-out property <bool> post-apply-reminders-enabled: true;
@@ -245,13 +295,11 @@ export component MainWindow inherits Window {
     in-out property <string> notification-toast-test-status: "未测试";
     in-out property <string> notification-balloon-test-status: "未测试";
     in-out property <string> notification-sound-test-status: "未测试";
-    in-out property <string> notification-flash-test-status: "未测试";
     in-out property <int> notification-window-test-level: 0;
     in-out property <int> notification-platform-level: 0;
     in-out property <int> notification-toast-test-level: 0;
     in-out property <int> notification-balloon-test-level: 0;
     in-out property <int> notification-sound-test-level: 0;
-    in-out property <int> notification-flash-test-level: 0;
     in-out property <int> notification-test-channel: -1;
     in-out property <string> notification-test-title: "确认提醒通道测试";
     in-out property <string> notification-test-question: "你是否观察到刚才的测试？";
@@ -260,9 +308,9 @@ export component MainWindow inherits Window {
     in-out property <string> active-sync-interval-value: "20";
     in-out property <int> active-sync-interval-unit-index: 0;
     in-out property <bool> reset-settings-pending: false;
+    in-out property <int> settings-section: 0;
     in-out property <bool> automatic-updates-enabled: false;
     in-out property <bool> update-configured: false;
-    in-out property <bool> advanced-settings-expanded: false;
     in-out property <bool> update-available: false;
     in-out property <string> update-version: "";
     in-out property <string> update-status: "正在读取安全更新配置…";
@@ -745,414 +793,417 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-color: #26334a;
             background: #111b2e;
-            ScrollView {
-                VerticalBox {
-                    horizontal-stretch: 1;
-                    padding-left: root.compact-width ? 10px : 14px;
-                    padding-right: root.compact-width ? 10px : 14px;
-                    padding-top: root.compact-height ? 10px : 14px;
-                    padding-bottom: root.compact-height ? 10px : 14px;
-                    spacing: root.compact-height ? 10px : 12px;
-                    if !root.onboarding-completed : Rectangle {
-                        min-height: 62px;
-                        max-height: 62px;
-                        border-radius: 8px;
-                        border-width: 1px;
-                        border-color: #d97706;
-                        background: #3a2510;
+            VerticalBox {
+                padding-left: root.compact-width ? 10px : 14px;
+                padding-right: root.compact-width ? 10px : 14px;
+                padding-top: root.compact-height ? 10px : 14px;
+                padding-bottom: root.compact-height ? 10px : 14px;
+                spacing: root.compact-height ? 8px : 10px;
+                if !root.onboarding-completed : Rectangle {
+                    min-height: root.compact-width ? 74px : 58px;
+                    max-height: root.compact-width ? 74px : 58px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #d97706;
+                    background: #3a2510;
+                    HorizontalBox {
+                        padding: 10px;
+                        spacing: 10px;
                         Text {
-                            text: "首次使用请确认市场、券商受理时间和安全截止时间，并完成一次提醒通道测试。测试通过之前会持续显示此提示。";
+                            text: "首次使用请确认市场、券商受理时间和安全截止时间，并完成一次提醒通道测试。";
                             color: #fcd34d;
                             wrap: word-wrap;
                             vertical-alignment: center;
-                            x: 12px; width: parent.width - 24px;
+                            horizontal-stretch: 1;
+                        }
+                        ActionButton {
+                            label: "去完成测试";
+                            compact: root.compact-width;
+                            clicked => { root.settings-section = 1; }
                         }
                     }
-                    Rectangle {
-                        min-height: 88px;
-                        max-height: 88px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
+                }
+                HorizontalBox {
+                    spacing: root.compact-width ? 6px : 8px;
+                    SettingsTab { label: "常用"; selected: root.settings-section == 0; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.settings-section = 0; } }
+                    SettingsTab { label: "通知与测试"; selected: root.settings-section == 1; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.settings-section = 1; } }
+                    SettingsTab { label: "同步"; selected: root.settings-section == 2; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.settings-section = 2; } }
+                    SettingsTab { label: "高级与维护"; selected: root.settings-section == 3; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.settings-section = 3; } }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: transparent;
+                    ScrollView {
                         VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "启用市场"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            HorizontalBox {
-                                spacing: 12px;
-                                Toggle { label: "沪市主板 / 科创板"; checked <=> root.shanghai-enabled; }
-                                Toggle { label: "深市主板 / 创业板"; checked <=> root.shenzhen-enabled; }
-                                Toggle { label: "北交所"; checked <=> root.beijing-enabled; }
-                            }
-                        }
-                    }
-                    Rectangle {
-                        min-height: root.compact-width ? 264px : 188px;
-                        max-height: root.compact-width ? 264px : 188px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "券商受理与安全截止"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: "时间格式 HH:mm。安全截止应在 13:00–15:00，建议保留几分钟券商处理余量。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
-                            if !root.compact-width : HorizontalBox {
-                                spacing: 12px;
-                                LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
-                                LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
-                                LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
-                                LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
-                            }
-                            if root.compact-width : VerticalBox {
-                                spacing: 8px;
-                                HorizontalBox {
+                            horizontal-stretch: 1;
+                            padding: 1px;
+                            spacing: root.compact-height ? 8px : 10px;
+                            if root.settings-section == 0 : VerticalBox {
+                                spacing: root.compact-height ? 8px : 10px;
+                                if !root.compact-width : HorizontalBox {
                                     spacing: 10px;
-                                    LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
-                                    LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
+                                    Rectangle {
+                                        min-height: 132px;
+                                        max-height: 132px;
+                                        horizontal-stretch: 1;
+                                        border-radius: 9px;
+                                        border-width: 1px;
+                                        border-color: #26334a;
+                                        background: #0f172a;
+                                        VerticalBox {
+                                            padding: 12px;
+                                            spacing: 8px;
+                                            Text { text: "启用市场"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                            HorizontalBox {
+                                                spacing: 8px;
+                                                Toggle { label: "沪市主板 / 科创板"; checked <=> root.shanghai-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "深市主板 / 创业板"; checked <=> root.shenzhen-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "北交所"; checked <=> root.beijing-enabled; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        min-height: 132px;
+                                        max-height: 132px;
+                                        horizontal-stretch: 1;
+                                        border-radius: 9px;
+                                        border-width: 1px;
+                                        border-color: #26334a;
+                                        background: #0f172a;
+                                        VerticalBox {
+                                            padding: 12px;
+                                            spacing: 8px;
+                                            Text { text: "后续提醒与启动"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                            HorizontalBox {
+                                                spacing: 8px;
+                                                Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; horizontal-stretch: 1; }
+                                            }
+                                            HorizontalBox {
+                                                spacing: 8px;
+                                                Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                    }
                                 }
-                                HorizontalBox {
-                                    spacing: 10px;
-                                    LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
-                                    LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                                if root.compact-width : Rectangle {
+                                    min-height: 176px;
+                                    max-height: 176px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "启用市场"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Toggle { label: "沪市主板 / 科创板"; checked <=> root.shanghai-enabled; }
+                                        Toggle { label: "深市主板 / 创业板"; checked <=> root.shenzhen-enabled; }
+                                        Toggle { label: "北交所"; checked <=> root.beijing-enabled; }
+                                    }
                                 }
-                            }
-                            Toggle { label: "我的券商支持北交所开盘前预约申购"; checked <=> root.beijing-reservation; }
-                        }
-                    }
-                    Rectangle {
-                        min-height: root.compact-width ? 500px : 456px;
-                        max-height: root.compact-width ? 500px : 456px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "提醒通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Toggle { label: "声音"; checked <=> root.sound-enabled; }
-                                Toggle { label: "临近截止闪烁任务栏"; checked <=> root.flash-taskbar; }
-                                Toggle { label: "系统通知（Toast，失败时回退气泡）"; checked <=> root.toast-enabled; }
-                            }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; }
-                                Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; }
-                            }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; }
-                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
-                                Text { text: "后续提醒仅在你确认已申购后安排；程序不会读取账户、持仓或判断中签"; color: #64748b; font-size: 12px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
-                            }
-                            Text {
-                                text: root.notification-platform-status;
-                                color: root.notification-platform-level == 1 ? #86efac : root.notification-platform-level == 2 ? #fca5a5 : #fcd34d;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                            }
-                            HorizontalBox {
-                                spacing: 10px;
-                                ActionButton { label: "测试置顶提醒窗"; compact: root.compact-width; clicked => { root.test-notification-channel(0); } }
-                                Text { text: root.notification-window-test-status; color: root.notification-window-test-level == 1 ? #86efac : root.notification-window-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
-                                ActionButton { label: "测试 Windows Toast"; compact: root.compact-width; clicked => { root.test-notification-channel(1); } }
-                                Text { text: root.notification-toast-test-status; color: root.notification-toast-test-level == 1 ? #86efac : root.notification-toast-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
-                            }
-                            HorizontalBox {
-                                spacing: 10px;
-                                ActionButton { label: "测试气泡回退"; compact: root.compact-width; clicked => { root.test-notification-channel(2); } }
-                                Text { text: root.notification-balloon-test-status; color: root.notification-balloon-test-level == 1 ? #86efac : root.notification-balloon-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
-                                ActionButton { label: "测试声音"; compact: root.compact-width; clicked => { root.test-notification-channel(3); } }
-                                Text { text: root.notification-sound-test-status; color: root.notification-sound-test-level == 1 ? #86efac : root.notification-sound-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
-                            }
-                            HorizontalBox {
-                                spacing: 10px;
-                                ActionButton { label: "测试任务栏闪烁"; compact: root.compact-width; clicked => { root.test-notification-channel(4); } }
-                                Text { text: root.notification-flash-test-status; color: root.notification-flash-test-level == 1 ? #86efac : root.notification-flash-test-level == 2 ? #fca5a5 : #fcd34d; vertical-alignment: center; horizontal-stretch: 1; }
-                                Text { text: "Toast 与气泡回退任一通过即可满足系统通知测试"; color: #64748b; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
-                            }
-                            Text {
-                                text: root.notification-test-status;
-                                color: root.notification-test-completed ? #86efac : #fcd34d;
-                                vertical-alignment: center;
-                                wrap: word-wrap;
-                            }
-                        }
-                    }
-                    Rectangle {
-                        min-height: 176px;
-                        max-height: 176px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "节能同步"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "来源异常重试"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
-                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
-                                Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
-                            }
-                            HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                Text { width: root.compact-width ? 150px : 190px; text: "当日未确认任务核验"; color: #cbd5e1; vertical-alignment: center; }
-                                LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "20"; }
-                                ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
-                                Text { text: "默认 20 分钟，不得大于普通日期间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
-                            }
-                            Text { text: "健康同步确认无任务或任务已确认后，当天停止周期同步；周末无真实提醒时直接睡到下个工作日。上方间隔只用于来源异常重试和当日未确认任务核验；已知提醒、用户操作与系统恢复会按需唤醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
-                        }
-                    }
-                    Rectangle {
-                        min-height: 70px;
-                        max-height: 70px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        HorizontalBox {
-                            padding: 12px;
-                            spacing: 12px;
-                            VerticalBox {
-                                horizontal-stretch: 1;
-                                spacing: 4px;
-                                Text { text: "高级可选功能"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                                Text { text: "第二通知、自动更新和崩溃报告默认关闭，不影响本地提醒；仅在确实需要时配置。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
-                            }
-                            ActionButton {
-                                label: root.advanced-settings-expanded ? "收起高级功能" : "展开高级功能";
-                                compact: root.compact-width;
-                                clicked => { root.advanced-settings-expanded = !root.advanced-settings-expanded; }
-                            }
-                        }
-                    }
-                    if root.advanced-settings-expanded || root.secondary-notification-configured || root.secondary-notification-enabled : Rectangle {
-                        min-height: root.secondary-notification-provider-index == 0 ? 210px : 292px;
-                        max-height: root.secondary-notification-provider-index == 0 ? 210px : 292px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "高级 · 第二通知通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text {
-                                text: root.secondary-notification-status;
-                                color: root.secondary-notification-configured ? #86efac : #94a3b8;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                                horizontal-stretch: 1;
-                            }
-                            HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                ComboBox {
-                                    width: root.compact-width ? 170px : 200px;
-                                    model: ["不启用", "企业微信机器人", "钉钉机器人", "飞书机器人", "PushPlus"];
-                                    current-index <=> root.secondary-notification-provider-index;
+                                if root.compact-width : Rectangle {
+                                    min-height: 176px;
+                                    max-height: 176px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "后续提醒与启动"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; }
+                                        Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; }
+                                        Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; }
+                                        Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
+                                    }
                                 }
-                                Text {
-                                    text: root.secondary-notification-provider-index == 0 ? "选择服务商后可启用第二通知" : "选择服务商后可填写或保留加密凭据";
-                                    color: #94a3b8;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    wrap: word-wrap;
+                                Rectangle {
+                                    min-height: root.compact-width ? 264px : 188px;
+                                    max-height: root.compact-width ? 264px : 188px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "券商受理与安全截止"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: "时间格式 HH:mm。安全截止应在 13:00–15:00，建议保留几分钟券商处理余量。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                        if !root.compact-width : HorizontalBox {
+                                            spacing: 12px;
+                                            LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
+                                            LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
+                                            LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
+                                            LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                                        }
+                                        if root.compact-width : VerticalBox {
+                                            spacing: 8px;
+                                            HorizontalBox {
+                                                spacing: 10px;
+                                                LabeledInput { label: "沪市券商受理开始"; value <=> root.shanghai-start; horizontal-stretch: 1; }
+                                                LabeledInput { label: "深市券商受理开始"; value <=> root.shenzhen-start; horizontal-stretch: 1; }
+                                            }
+                                            HorizontalBox {
+                                                spacing: 10px;
+                                                LabeledInput { label: "北交所券商受理开始"; value <=> root.beijing-start; horizontal-stretch: 1; }
+                                                LabeledInput { label: "安全截止时间"; value <=> root.safety-cutoff; horizontal-stretch: 1; }
+                                            }
+                                        }
+                                        Toggle { label: "我的券商支持北交所开盘前预约申购"; checked <=> root.beijing-reservation; }
+                                    }
                                 }
                             }
-                            if root.secondary-notification-provider-index > 0 : HorizontalBox {
-                                height: 34px;
-                                spacing: 10px;
-                                Toggle {
-                                    label: "同时发送到第二通道";
-                                    checked <=> root.secondary-notification-enabled;
+                            if root.settings-section == 1 : VerticalBox {
+                                spacing: root.compact-height ? 8px : 10px;
+                                Rectangle {
+                                    min-height: root.compact-width ? 184px : 116px;
+                                    max-height: root.compact-width ? 184px : 116px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "提醒呈现"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        if !root.compact-width : HorizontalBox {
+                                            spacing: 8px;
+                                            Toggle { label: "声音"; checked <=> root.sound-enabled; horizontal-stretch: 1; }
+                                            Toggle { label: "系统通知（Toast，失败时回退气泡）"; checked <=> root.toast-enabled; horizontal-stretch: 1; }
+                                        }
+                                        if root.compact-width : VerticalBox {
+                                            spacing: 8px;
+                                            Toggle { label: "声音"; checked <=> root.sound-enabled; }
+                                            Toggle { label: "系统通知（Toast，失败时回退气泡）"; checked <=> root.toast-enabled; }
+                                        }
+                                    }
                                 }
-                                Rectangle { horizontal-stretch: 1; }
-                                if root.secondary-notification-configured : ActionButton {
-                                    label: root.secondary-notification-busy ? "正在测试…" : "发送测试";
-                                    compact: root.compact-width;
-                                    primary: true;
-                                    enabled: !root.secondary-notification-busy;
-                                    clicked => { root.test-secondary-notification(); }
-                                }
-                                if root.secondary-notification-configured : ActionButton {
-                                    label: "清除凭据";
-                                    compact: root.compact-width;
-                                    danger: true;
-                                    enabled: !root.secondary-notification-busy;
-                                    clicked => { root.clear-secondary-notification-secret(); }
-                                }
-                            }
-                            if root.secondary-notification-provider-index > 0 : LineEdit {
-                                text <=> root.secondary-notification-secret-entry;
-                                input-type: InputType.password;
-                                placeholder-text: root.secondary-notification-provider-index == 4 ? "输入 PushPlus token；留空表示保留已加密凭据" : "输入官方机器人 Webhook URL；留空表示保留已加密凭据";
-                                enabled: root.secondary-notification-provider-index > 0;
-                            }
-                            Text {
-                                text: "仅允许企业微信、钉钉、飞书官方 HTTPS Webhook 或 PushPlus token。凭据由 Windows DPAPI 绑定当前用户加密，不写入数据库、日志、诊断 ZIP 或命令行。发送请求禁止重定向，最多重试 5 次，并限制为每小时 20 个批次。";
-                                color: #64748b;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                            }
-                        }
-                    }
-                    if root.advanced-settings-expanded || root.update-configured : Rectangle {
-                        min-height: 148px;
-                        max-height: 148px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "高级 · 安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
-                                Rectangle { horizontal-stretch: 1; }
-                                ActionButton {
-                                    label: "检查更新";
-                                    compact: root.compact-width;
-                                    enabled: root.update-configured;
-                                    clicked => { root.check-for-updates(); }
-                                }
-                                ActionButton {
-                                    label: root.update-version == "" ? "下载并安装" : "安装 " + root.update-version;
-                                    compact: root.compact-width;
-                                    primary: true;
-                                    enabled: root.update-available;
-                                    clicked => { root.install-update(); }
+                                Rectangle {
+                                    min-height: root.compact-width ? 320px : 236px;
+                                    max-height: root.compact-width ? 320px : 236px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "测试提醒通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text {
+                                            text: root.notification-platform-status;
+                                            color: root.notification-platform-level == 1 ? #86efac : root.notification-platform-level == 2 ? #fca5a5 : #fcd34d;
+                                            font-size: 12px;
+                                            wrap: word-wrap;
+                                        }
+                                        if !root.compact-width : HorizontalBox {
+                                            spacing: 10px;
+                                            NotificationTestItem { label: "测试置顶提醒窗"; status: root.notification-window-test-status; level: root.notification-window-test-level; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.test-notification-channel(0); } }
+                                            NotificationTestItem { label: "测试 Windows Toast"; status: root.notification-toast-test-status; level: root.notification-toast-test-level; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.test-notification-channel(1); } }
+                                        }
+                                        if !root.compact-width : HorizontalBox {
+                                            spacing: 10px;
+                                            NotificationTestItem { label: "测试气泡回退"; status: root.notification-balloon-test-status; level: root.notification-balloon-test-level; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.test-notification-channel(2); } }
+                                            NotificationTestItem { label: "测试声音"; status: root.notification-sound-test-status; level: root.notification-sound-test-level; compact: root.compact-width; horizontal-stretch: 1; clicked => { root.test-notification-channel(3); } }
+                                        }
+                                        if root.compact-width : VerticalBox {
+                                            spacing: 8px;
+                                            NotificationTestItem { label: "测试置顶提醒窗"; status: root.notification-window-test-status; level: root.notification-window-test-level; compact: root.compact-width; clicked => { root.test-notification-channel(0); } }
+                                            NotificationTestItem { label: "测试 Windows Toast"; status: root.notification-toast-test-status; level: root.notification-toast-test-level; compact: root.compact-width; clicked => { root.test-notification-channel(1); } }
+                                            NotificationTestItem { label: "测试气泡回退"; status: root.notification-balloon-test-status; level: root.notification-balloon-test-level; compact: root.compact-width; clicked => { root.test-notification-channel(2); } }
+                                            NotificationTestItem { label: "测试声音"; status: root.notification-sound-test-status; level: root.notification-sound-test-level; compact: root.compact-width; clicked => { root.test-notification-channel(3); } }
+                                        }
+                                        Text { text: "Windows Toast 与气泡回退任一通过，即可满足系统通知测试。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.notification-test-status; color: root.notification-test-completed ? #86efac : #fcd34d; vertical-alignment: center; wrap: word-wrap; }
+                                    }
                                 }
                             }
-                            Text { text: "只接受 HTTPS、固定证书签名的 CMS 清单，以及哈希和 Authenticode 证书均匹配的 MSI；安装仍需你明确点击。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
-                        }
-                    }
-                    if root.advanced-settings-expanded || root.crash-upload-configured || root.crash-upload-enabled : Rectangle {
-                        min-height: 172px;
-                        max-height: 172px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "高级 · 脱敏崩溃报告"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.crash-upload-status; color: root.crash-upload-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Toggle {
-                                    label: "异常退出后自动发送下一份报告";
-                                    checked <=> root.crash-upload-enabled;
-                                    enabled: root.crash-upload-configured;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                ActionButton {
-                                    label: root.crash-upload-busy ? "正在发送…" : "发送最近报告";
-                                    compact: root.compact-width;
-                                    primary: true;
-                                    enabled: root.crash-upload-configured && !root.crash-upload-busy;
-                                    clicked => { root.upload-crash-report(); }
-                                }
-                                ActionButton {
-                                    label: "隐私政策";
-                                    compact: root.compact-width;
-                                    enabled: root.crash-upload-configured;
-                                    clicked => { root.open-crash-upload-privacy(); }
+                            if root.settings-section == 2 : Rectangle {
+                                min-height: 200px;
+                                max-height: 200px;
+                                border-radius: 9px;
+                                border-width: 1px;
+                                border-color: #26334a;
+                                background: #0f172a;
+                                VerticalBox {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    Text { text: "节能同步"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                    Text { text: "健康且没有待确认任务时，每个工作日最多进行一次发现同步；下方间隔只用于异常重试和当日未确认任务核验。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                    HorizontalBox {
+                                        height: 34px;
+                                        spacing: 10px;
+                                        Text { width: root.compact-width ? 150px : 190px; text: "来源异常重试"; color: #cbd5e1; vertical-alignment: center; }
+                                        LineEdit { width: 110px; text <=> root.normal-sync-interval-value; placeholder-text: "30"; }
+                                        ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.normal-sync-interval-unit-index; }
+                                        Text { text: "默认 30 分钟"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                                    }
+                                    HorizontalBox {
+                                        height: 34px;
+                                        spacing: 10px;
+                                        Text { width: root.compact-width ? 150px : 190px; text: "当日未确认任务核验"; color: #cbd5e1; vertical-alignment: center; }
+                                        LineEdit { width: 110px; text <=> root.active-sync-interval-value; placeholder-text: "20"; }
+                                        ComboBox { width: 110px; model: ["分钟", "小时"]; current-index <=> root.active-sync-interval-unit-index; }
+                                        Text { text: "默认 20 分钟，不得大于来源异常重试间隔"; color: #64748b; font-size: 12px; vertical-alignment: center; }
+                                    }
+                                    Text { text: "任务已确认、没有真实提醒或处于周末时，程序会按需休眠到下一次必要唤醒；手动同步不受自动同步窗口限制。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
                                 }
                             }
-                            Text { text: "仅发送 Watchdog 生成的 JSON；不发送数据库、日志、公告正文、命令行、路径、用户名、设备标识、账户、持仓或凭据。过去 24 小时最多尝试 3 次。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
-                        }
-                    }
-                    Rectangle {
-                        min-height: root.compact-width ? 148px : 126px;
-                        max-height: root.compact-width ? 148px : 126px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #26334a;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "本地缓存与数据"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
-                            HorizontalBox {
-                                spacing: 10px;
-                                ActionButton {
-                                    label: "打开本地缓存目录";
-                                    compact: root.compact-width;
-                                    clicked => { root.open-data-folder(); }
+                            if root.settings-section == 3 : VerticalBox {
+                                spacing: root.compact-height ? 8px : 10px;
+                                Text { text: "通知与自动化"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                Rectangle {
+                                    min-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 238px : 210px) : (root.compact-width ? 348px : 292px);
+                                    max-height: root.secondary-notification-provider-index == 0 ? (root.compact-width ? 238px : 210px) : (root.compact-width ? 348px : 292px);
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "第二通知通道"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: root.secondary-notification-status; color: root.secondary-notification-configured ? #86efac : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        HorizontalBox {
+                                            height: 34px;
+                                            spacing: 10px;
+                                            ComboBox { width: root.compact-width ? 170px : 200px; model: ["不启用", "企业微信机器人", "钉钉机器人", "飞书机器人", "PushPlus"]; current-index <=> root.secondary-notification-provider-index; }
+                                            Text { text: root.secondary-notification-provider-index == 0 ? "选择服务商后可启用第二通知" : "选择服务商后可填写或保留加密凭据"; color: #94a3b8; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                                        }
+                                        if root.secondary-notification-provider-index > 0 : HorizontalBox {
+                                            height: 34px;
+                                            spacing: 10px;
+                                            Toggle { label: "同时发送到第二通道"; checked <=> root.secondary-notification-enabled; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            if root.secondary-notification-configured : ActionButton { label: root.secondary-notification-busy ? "正在测试…" : "发送测试"; compact: root.compact-width; primary: true; enabled: !root.secondary-notification-busy; clicked => { root.test-secondary-notification(); } }
+                                            if root.secondary-notification-configured : ActionButton { label: "清除凭据"; compact: root.compact-width; danger: true; enabled: !root.secondary-notification-busy; clicked => { root.clear-secondary-notification-secret(); } }
+                                        }
+                                        if root.secondary-notification-provider-index > 0 : LineEdit { text <=> root.secondary-notification-secret-entry; input-type: InputType.password; placeholder-text: root.secondary-notification-provider-index == 4 ? "输入 PushPlus token；留空表示保留已加密凭据" : "输入官方机器人 Webhook URL；留空表示保留已加密凭据"; enabled: root.secondary-notification-provider-index > 0; }
+                                        Text { text: "仅允许企业微信、钉钉、飞书官方 HTTPS Webhook 或 PushPlus token。凭据由 Windows DPAPI 绑定当前用户加密，不写入数据库、日志、诊断 ZIP 或命令行。发送请求禁止重定向，最多重试 5 次，并限制为每小时 20 个批次。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                                    }
                                 }
-                                Text {
-                                    text: "包含数据库、公告 PDF、日志、备份和诊断文件；打开目录不会清理或修改数据。";
-                                    color: #64748b;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    wrap: word-wrap;
+                                Rectangle {
+                                    min-height: 148px;
+                                    max-height: 148px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        HorizontalBox {
+                                            spacing: 10px;
+                                            Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            ActionButton { label: "检查更新"; compact: root.compact-width; enabled: root.update-configured; clicked => { root.check-for-updates(); } }
+                                            ActionButton { label: root.update-version == "" ? "下载并安装" : "安装 " + root.update-version; compact: root.compact-width; primary: true; enabled: root.update-available; clicked => { root.install-update(); } }
+                                        }
+                                        Text { text: "只接受 HTTPS、固定证书签名的 CMS 清单，以及哈希和 Authenticode 证书均匹配的 MSI；安装仍需你明确点击。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                                    }
                                 }
-                            }
-                        }
-                    }
-                    Rectangle {
-                        min-height: 126px;
-                        max-height: 126px;
-                        border-radius: 9px;
-                        border-width: 1px;
-                        border-color: #7f1d1d;
-                        background: #0f172a;
-                        VerticalBox {
-                            padding: 12px;
-                            spacing: 8px;
-                            Text { text: "安装与卸载"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                            Text { text: root.uninstall-status; color: root.uninstall-available ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
-                            HorizontalBox {
-                                spacing: 10px;
-                                Text { text: "默认卸载只移除程序并保留数据库、设置、公告缓存和备份。"; color: #94a3b8; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
-                                ActionButton {
-                                    label: "卸载程序";
-                                    compact: root.compact-width;
-                                    danger: true;
-                                    enabled: root.uninstall-available;
-                                    clicked => {
-                                        root.uninstall-purge-data = false;
-                                        root.uninstall-confirmation-text = "";
-                                        root.show-uninstall-confirmation = true;
+                                Rectangle {
+                                    min-height: 172px;
+                                    max-height: 172px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "脱敏崩溃报告"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: root.crash-upload-status; color: root.crash-upload-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        HorizontalBox {
+                                            spacing: 10px;
+                                            Toggle { label: "异常退出后自动发送下一份报告"; checked <=> root.crash-upload-enabled; enabled: root.crash-upload-configured; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            ActionButton { label: root.crash-upload-busy ? "正在发送…" : "发送最近报告"; compact: root.compact-width; primary: true; enabled: root.crash-upload-configured && !root.crash-upload-busy; clicked => { root.upload-crash-report(); } }
+                                            ActionButton { label: "隐私政策"; compact: root.compact-width; enabled: root.crash-upload-configured; clicked => { root.open-crash-upload-privacy(); } }
+                                        }
+                                        Text { text: "仅发送 Watchdog 生成的 JSON；不发送数据库、日志、公告正文、命令行、路径、用户名、设备标识、账户、持仓或凭据。过去 24 小时最多尝试 3 次。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                }
+                                Text { text: "本地维护"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                Rectangle {
+                                    min-height: root.compact-width ? 148px : 126px;
+                                    max-height: root.compact-width ? 148px : 126px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #26334a;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "本地缓存与数据"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: root.data-root-text; color: #94a3b8; font-size: 12px; overflow: elide; }
+                                        HorizontalBox {
+                                            spacing: 10px;
+                                            ActionButton { label: "打开本地缓存目录"; compact: root.compact-width; clicked => { root.open-data-folder(); } }
+                                            Text { text: "包含数据库、公告 PDF、日志、备份和诊断文件；打开目录不会清理或修改数据。"; color: #64748b; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    min-height: 126px;
+                                    max-height: 126px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: #7f1d1d;
+                                    background: #0f172a;
+                                    VerticalBox {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Text { text: "安装与卸载"; color: #f8fafc; font-size: 18px; font-weight: 600; }
+                                        Text { text: root.uninstall-status; color: root.uninstall-available ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        HorizontalBox {
+                                            spacing: 10px;
+                                            Text { text: "默认卸载只移除程序并保留数据库、设置、公告缓存和备份。"; color: #94a3b8; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                                            ActionButton {
+                                                label: "卸载程序";
+                                                compact: root.compact-width;
+                                                danger: true;
+                                                enabled: root.uninstall-available;
+                                                clicked => {
+                                                    root.uninstall-purge-data = false;
+                                                    root.uninstall-confirmation-text = "";
+                                                    root.show-uninstall-confirmation = true;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Rectangle { horizontal-stretch: 1; }
-                        ActionButton { label: "恢复默认"; compact: root.compact-width; clicked => { root.reset-settings(); } }
-                        ActionButton { label: "保存设置"; compact: root.compact-width; primary: true; clicked => { root.save-settings(); } }
-                        ActionButton {
-                            label: "安全退出";
-                            compact: root.compact-width;
-                            danger: true;
-                            clicked => {
-                                if (root.pending-count > 0) {
-                                    root.show-exit-confirmation = true;
-                                } else {
-                                    root.exit-app();
-                                }
+                }
+                HorizontalBox {
+                    min-height: 38px;
+                    max-height: 38px;
+                    spacing: 8px;
+                    Text {
+                        text: root.reset-settings-pending ? "已恢复默认值，点击保存后才会生效。" : "切换设置分区不会丢失未保存的修改。";
+                        color: root.reset-settings-pending ? #fcd34d : #94a3b8;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    ActionButton { label: "恢复默认"; compact: root.compact-width; clicked => { root.reset-settings(); } }
+                    ActionButton { label: "保存设置"; compact: root.compact-width; primary: true; clicked => { root.save-settings(); } }
+                    ActionButton {
+                        label: "安全退出";
+                        compact: root.compact-width;
+                        danger: true;
+                        clicked => {
+                            if (root.pending-count > 0) {
+                                root.show-exit-confirmation = true;
+                            } else {
+                                root.exit-app();
                             }
                         }
                     }

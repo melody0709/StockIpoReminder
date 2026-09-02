@@ -66,7 +66,6 @@ pub(crate) fn wire_settings_callbacks(
             }
             settings.beijing_reservation_supported = ui.get_beijing_reservation();
             settings.sound_enabled = ui.get_sound_enabled();
-            settings.flash_taskbar = ui.get_flash_taskbar();
             settings.toast_enabled = ui.get_toast_enabled();
             settings.daily_health_summary_enabled = ui.get_health_summary_enabled();
             settings.post_apply_reminders_enabled = ui.get_post_apply_reminders_enabled();

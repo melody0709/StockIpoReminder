@@ -36,20 +36,19 @@ fn filter_event(exchange: Exchange, status: LifecycleStatus) -> IpoEvent {
 fn reminder_alerts_follow_settings() {
     let mut settings = AppSettings::default();
     let alerts = ReminderAlerts::from_settings(&settings);
-    assert!(alerts.sound && alerts.flash && alerts.toast);
+    assert!(alerts.sound && alerts.toast);
 
     settings.sound_enabled = false;
-    settings.flash_taskbar = false;
     settings.toast_enabled = false;
     let alerts = ReminderAlerts::from_settings(&settings);
-    assert!(!alerts.sound && !alerts.flash && !alerts.toast);
+    assert!(!alerts.sound && !alerts.toast);
 }
 
 #[test]
 fn reminder_alerts_fail_closed_without_settings() {
     let alerts = ReminderAlerts::fail_closed();
     assert_eq!(alerts, ReminderAlerts::default());
-    assert!(!alerts.sound && !alerts.flash && !alerts.toast);
+    assert!(!alerts.sound && !alerts.toast);
 }
 
 #[test]
@@ -116,9 +115,6 @@ fn notification_self_test_requires_each_enabled_channel() {
     settings.notification_window_test_passed = Some(true);
     settings.notification_balloon_test_passed = Some(true);
     settings.notification_sound_test_passed = Some(true);
-    assert!(!settings.notification_tests_complete());
-
-    settings.notification_flash_test_passed = Some(true);
     assert!(settings.notification_tests_complete());
 
     settings.notification_balloon_test_passed = Some(false);
@@ -128,6 +124,24 @@ fn notification_self_test_requires_each_enabled_channel() {
     settings.notification_toast_test_passed = Some(false);
     settings.toast_enabled = false;
     assert!(settings.notification_tests_complete());
+}
+
+#[test]
+fn legacy_taskbar_settings_are_ignored_without_blocking_notification_setup() {
+    let mut settings = AppSettings::default();
+    settings.notification_window_test_passed = Some(true);
+    settings.notification_balloon_test_passed = Some(true);
+    settings.notification_sound_test_passed = Some(true);
+    let mut json = serde_json::to_value(settings).unwrap();
+    let object = json.as_object_mut().unwrap();
+    object.insert("flashTaskbar".into(), true.into());
+    object.insert("notificationFlashTestPassed".into(), true.into());
+
+    let restored: AppSettings = serde_json::from_value(json).unwrap();
+    assert!(restored.notification_tests_complete());
+    let saved = serde_json::to_value(restored).unwrap();
+    assert!(saved.get("flashTaskbar").is_none());
+    assert!(saved.get("notificationFlashTestPassed").is_none());
 }
 
 #[test]
