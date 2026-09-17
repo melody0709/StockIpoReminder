@@ -151,11 +151,15 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 ## 签名与安全自动更新
 
-仓库已提供 Authenticode、RFC 3161 时间戳、detached CMS 更新清单、证书指纹固定和 CI 手动签名发布主路径。正式签名构建必须同时配置具有 Code Signing EKU 的证书和 HTTPS 稳定版更新清单地址；应用只对已安装的 MSI 版本开放自动更新，便携版继续手动更新。启动时自动检查默认关闭，且未配置正式更新源时不会执行联网检查。
+本项目不依赖 CA 代码签名证书即可实现可信自动更新：应用内置仓库中的 Minisign 公钥（`assets/update-signing/stock-ipo-update.pub`），更新清单由维护者在本地用仓库外加密私钥签名，清单再声明 MSI 的版本、大小和 SHA-256，Windows Installer 负责实际升级。Authenticode 签名变为完全可选的能力，与更新信任互不相关。
 
-客户端会依次验证 HTTPS、CMS 清单签名、固定证书 SHA-256、产品和 stable 通道、递增版本、最低 Windows Build、安装包大小与 SHA-256，以及 MSI Authenticode 信任和相同证书指纹。只有全部通过并由用户明确点击后才调用 Windows Installer；下载或验证失败不会启动安装。
+更新源固定为 GitHub Releases stable/latest 的 `update-manifest.json` 与 `.minisig`，编译进客户端，不存在“漏配环境变量导致更新功能缺失”的正式包。应用只对已安装的 MSI 版本开放自动更新，便携版继续手动下载替换。
 
-当前本机生成的 `0.3.7` 基线没有接入正式 CA 证书，因此发布清单仍明确记录 `signed: false`，设置页会显示自动更新未配置。Windows SmartScreen 或安全软件仍可能显示“未知发布者”；请核对 `SHA256SUMS.txt`。正式签名和更新源部署见 `docs/release-signing-and-updates.md`。
+客户端验证顺序固定：先对清单原始字节验证 Minisign 预哈希签名（拒绝 legacy 非预哈希签名，成功前不解析任何字段），再校验 schema v2、产品、stable 通道、严格递增版本、RFC 3339 发布时间、最低 Windows Build、安装包文件名与版本一致、无凭据 HTTPS URL、大小范围和 SHA-256 格式；下载时同时执行响应大小上限、声明长度和增量 SHA-256 校验；安装 helper 只接收数据目录和父进程 PID，全部材料从受控 pending 目录重新读取验证，并以只读句柄锁定 MSI 直到 Windows Installer 结束。只有全部通过且用户明确点击“重启并更新”后才退出主程序并安装。
+
+启动及每日自动检查默认关闭；独立的“发现更新后自动下载”开关默认关闭，且只对自动检查发现的更新生效。下载完成并重新验证后提供“重启并更新”一键升级；应用关闭或 Windows 重启后，已验证的待安装更新会恢复为就绪状态。同一版本只主动提醒一次。
+
+没有 Authenticode 证书时，UAC、SmartScreen 和“未知发布者”提示属正常现象，程序不会绕过这些系统安全交互；请通过 `SHA256SUMS.txt` 与 Minisign 签名核对发布包。密钥保管、发版步骤与信任边界见 `docs/release-signing-and-updates.md`。
 
 ## 可选崩溃报告共享
 
@@ -180,16 +184,19 @@ rtk cmd /c build.bat
 rtk cmd /c build.bat --rebuild
 rtk cmd /c build.bat --package
 rtk cmd /c build.bat --package --sign
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-update-manifest.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
 ```
 
 唯一可直接运行的开发版本位于 `build\run\x64-release\StockIpoReminder.exe`。Cargo 缓存和测试二进制位于 `build\cargo`；MSI 与便携包位于 `build\packages\<version>`。
 
 日常测试使用四来源和公告元数据检索的固定真实响应裁剪，不把随机网络访问混入单元测试。联网端到端验收必须使用独立 `--data-root`，不得污染正式数据。
 
-当前 Rust 固定 fixture、SQLite 迁移、字段来源、公告链接关联、确认与 Outbox 恢复、同步调度、来源覆盖结论、退避/探测、备份、诊断、版本升级保护、安全卸载、更新清单、崩溃报告隐私约束、第二通知通道安全边界和有界采集查询回归测试共 115 项。
+设置页更新区域显示当前版本与可用版本，并在签名清单提供相对发布说明文件时给出“发布说明”入口；清单中的该字段只解析为与更新源同目录的安全 HTTPS 地址，不接受绝对 URL、其他主机或路径穿越。
+
+当前 Rust 固定 fixture、SQLite 迁移、字段来源、公告链接关联、确认与 Outbox 恢复、同步调度、来源覆盖结论、退避/探测、备份、诊断、版本升级保护、安全卸载、Minisign 更新签名、pending 恢复、发布说明地址解析、崩溃报告隐私约束、第二通知通道安全边界和有界采集查询回归测试共 169 项。
 
 ## 仓库结构
 

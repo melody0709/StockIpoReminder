@@ -1,5 +1,14 @@
 name: signed-release
 
+# 本工作流只做：构建 + 可选 Authenticode + 发布级自动校验。
+# 它不产出 Minisign 更新清单，也不创建或发布 GitHub Release：
+#   1. 更新私钥保存在仓库外，清单必须由维护者在本地执行
+#      pwsh -File scripts/sign-update-manifest.ps1 生成。
+#   2. GitHub Draft Release 的创建、资产复核与 stable/latest 发布见
+#      docs/release-signing-and-updates.md 的“本地发版顺序”。
+# 没有代码签名证书时可以跳过本工作流：Authenticode 是可选能力，
+# 在本地执行 rtk cmd /c build.bat --package 即可得到等价的未签名发布目录。
+
 on:
   workflow_dispatch:
 
@@ -33,18 +42,35 @@ jobs:
         shell: cmd
         env:
           STOCK_IPO_SIGNING_PFX_PASSWORD: ${{ secrets.STOCK_IPO_SIGNING_PFX_PASSWORD }}
-          STOCK_IPO_UPDATE_FEED_URL: ${{ vars.STOCK_IPO_UPDATE_FEED_URL }}
           STOCK_IPO_CRASH_REPORT_URL: ${{ vars.STOCK_IPO_CRASH_REPORT_URL }}
           STOCK_IPO_CRASH_REPORT_PRIVACY_URL: ${{ vars.STOCK_IPO_CRASH_REPORT_PRIVACY_URL }}
         run: build.bat --package --sign
 
+      - name: Install minisign
+        shell: pwsh
+        run: |
+          $version = '0.12'
+          $zip = Join-Path $env:RUNNER_TEMP 'minisign-win64.zip'
+          Invoke-WebRequest -Uri "https://github.com/jedisct1/minisign/releases/download/$version/minisign-$version-win64.zip" -OutFile $zip
+          $extract = Join-Path $env:RUNNER_TEMP 'minisign'
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract
+          $directory = (Get-ChildItem -LiteralPath $extract -Recurse -Filter minisign.exe | Select-Object -First 1).DirectoryName
+          Add-Content -Path $env:GITHUB_PATH -Value $directory
+
       - name: Validate signed release
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
+
+      - name: Report workflow scope
+        shell: pwsh
+        run: |
+          Write-Host 'Build + optional Authenticode + validation only.'
+          Write-Host 'No Minisign update manifest is produced here, and no GitHub Release is created.'
+          Write-Host 'Publishing requires scripts/sign-update-manifest.ps1 locally, then a Draft Release reviewed per docs/release-signing-and-updates.md.'
 
       - name: Remove signing certificate
         if: always()

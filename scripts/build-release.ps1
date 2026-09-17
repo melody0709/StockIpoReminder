@@ -10,7 +10,6 @@ param(
     [string]$SigningCertificateThumbprint = $env:STOCK_IPO_SIGNING_CERTIFICATE_THUMBPRINT,
     [string]$SigningPasswordEnvironmentVariable = 'STOCK_IPO_SIGNING_PFX_PASSWORD',
     [string]$TimestampUrl = 'https://timestamp.digicert.com',
-    [string]$UpdateFeedUrl = $env:STOCK_IPO_UPDATE_FEED_URL,
     [string]$CrashReportUrl = $env:STOCK_IPO_CRASH_REPORT_URL,
     [string]$CrashReportPrivacyUrl = $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL
 )
@@ -205,18 +204,6 @@ function Invoke-SignToolSign {
     if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $Path with exit code $LASTEXITCODE" }
 }
 
-function Write-DetachedCmsSignature {
-    param([string]$ContentPath, [string]$OutputPath)
-    Add-Type -AssemblyName System.Security
-    $content = [System.Security.Cryptography.Pkcs.ContentInfo]::new([System.IO.File]::ReadAllBytes($ContentPath))
-    $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new($content, $true)
-    $signer = [System.Security.Cryptography.Pkcs.CmsSigner]::new($signingCertificate)
-    $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
-    $signer.DigestAlgorithm = [System.Security.Cryptography.Oid]::new('2.16.840.1.101.3.4.2.1')
-    $cms.ComputeSignature($signer, $false)
-    [System.IO.File]::WriteAllBytes($OutputPath, $cms.Encode())
-}
-
 $cargoText = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath
 $configuredVersion = [regex]::Match(
     $cargoText,
@@ -237,10 +224,12 @@ $signTool = $null
 $signingCertificate = $null
 $importedSigningCertificates = @()
 $signerSha256 = $null
-$previousUpdateFeedUrl = $env:STOCK_IPO_UPDATE_FEED_URL
-$previousUpdateSignerSha256 = $env:STOCK_IPO_UPDATE_SIGNER_SHA256
 $previousCrashReportUrl = $env:STOCK_IPO_CRASH_REPORT_URL
 $previousCrashReportPrivacyUrl = $env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL
+$updatePublicKeyPath = Join-Path $workspace 'assets\update-signing\stock-ipo-update.pub'
+if (-not (Test-Path -LiteralPath $updatePublicKeyPath -PathType Leaf)) {
+    throw "Repository update-signing public key is missing: $updatePublicKeyPath"
+}
 $crashReportConfigured = -not [string]::IsNullOrWhiteSpace($CrashReportUrl) -and -not [string]::IsNullOrWhiteSpace($CrashReportPrivacyUrl)
 if ([string]::IsNullOrWhiteSpace($CrashReportUrl) -ne [string]::IsNullOrWhiteSpace($CrashReportPrivacyUrl)) {
     throw 'Crash reporting requires both STOCK_IPO_CRASH_REPORT_URL and STOCK_IPO_CRASH_REPORT_PRIVACY_URL.'
@@ -258,12 +247,12 @@ else {
     Remove-Item Env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL -ErrorAction SilentlyContinue
 }
 
+# -Sign 只代表可选的 Authenticode 签名（EXE/MSI）。
+# 应用内自动更新的信任根是仓库内置的 Minisign 公钥，与本开关无关；
+# 更新清单由 scripts/sign-update-manifest.ps1 在构建之后单独签名。
 if ($Sign) {
     if (-not (Test-CredentialFreeHttpsUrl $TimestampUrl)) {
         throw 'Signed releases require a credential-free HTTPS RFC3161 timestamp URL.'
-    }
-    if (-not (Test-CredentialFreeHttpsUrl $UpdateFeedUrl)) {
-        throw 'Signed releases require STOCK_IPO_UPDATE_FEED_URL or -UpdateFeedUrl with a credential-free HTTPS manifest URL.'
     }
     $signTool = Get-SignToolPath
     $signingCertificate = Get-SigningCertificate
@@ -274,12 +263,6 @@ if ($Sign) {
     })
     if ($codeSigningEku.Count -eq 0) { throw 'The signing certificate is missing the Code Signing EKU.' }
     $signerSha256 = Get-CertificateSha256 $signingCertificate
-    $env:STOCK_IPO_UPDATE_SIGNER_SHA256 = $signerSha256
-    $env:STOCK_IPO_UPDATE_FEED_URL = $UpdateFeedUrl
-}
-else {
-    Remove-Item Env:STOCK_IPO_UPDATE_SIGNER_SHA256 -ErrorAction SilentlyContinue
-    Remove-Item Env:STOCK_IPO_UPDATE_FEED_URL -ErrorAction SilentlyContinue
 }
 
 New-Item -ItemType Directory -Path `
@@ -392,35 +375,8 @@ try {
         $item = Get-Item -LiteralPath $path
         [ordered]@{ name = $item.Name; sizeBytes = $item.Length; sha256 = Get-Sha256Hex $path }
     }
-    $updateManifestName = $null
-    $updateSignatureName = $null
-    if ($Sign -and $PackageMode -in @('Msi', 'All')) {
-        $installerArtifact = @($artifacts | Where-Object { $_.name -like '*.msi' }) | Select-Object -First 1
-        if ($null -eq $installerArtifact) { throw 'Signed update manifest requires an MSI artifact.' }
-        $updateManifestName = 'update-manifest.json'
-        $updateSignatureName = 'update-manifest.json.p7s'
-        $updateManifestPath = Join-Path $releaseDirectory $updateManifestName
-        $updateManifest = [ordered]@{
-            schemaVersion = 1
-            product = 'StockIpoReminder'
-            channel = 'stable'
-            version = $Version
-            publishedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
-            minimumWindowsBuild = 19041
-            releaseNotesUrl = 'RELEASE_NOTES.md'
-            installer = [ordered]@{
-                url = $installerArtifact.name
-                sha256 = $installerArtifact.sha256
-                sizeBytes = $installerArtifact.sizeBytes
-                signerSha256 = $signerSha256
-            }
-        }
-        [System.IO.File]::WriteAllText(
-            $updateManifestPath,
-            ($updateManifest | ConvertTo-Json -Depth 6),
-            [System.Text.UTF8Encoding]::new($false))
-        Write-DetachedCmsSignature -ContentPath $updateManifestPath -OutputPath (Join-Path $releaseDirectory $updateSignatureName)
-    }
+    # update-manifest.json 与 .minisig 由 scripts/sign-update-manifest.ps1 在构建后
+    # 生成并回填下面两个字段和公钥 key ID；这里先固定签名算法为 minisign。
     $releaseManifest = [ordered]@{
         product = 'StockIpoReminder'
         displayName = 'Stock IPO Reminder'
@@ -434,9 +390,9 @@ try {
         signed = [bool]$Sign
         signerSha256 = $signerSha256
         timestampUrl = $(if ($Sign) { $TimestampUrl } else { $null })
-        updateFeedUrl = $(if ($Sign) { $UpdateFeedUrl } else { $null })
-        updateManifest = $updateManifestName
-        updateManifestSignature = $updateSignatureName
+        updateManifest = $null
+        updateManifestSignature = $null
+        updateSignatureAlgorithm = 'minisign'
         crashReportUrl = $(if ($crashReportConfigured) { $CrashReportUrl } else { $null })
         crashReportPrivacyUrl = $(if ($crashReportConfigured) { $CrashReportPrivacyUrl } else { $null })
         testsExecuted = -not $SkipTests
@@ -462,10 +418,6 @@ try {
     Write-Host "Rust packages created: $releaseDirectory"
 }
 finally {
-    if ($null -eq $previousUpdateFeedUrl) { Remove-Item Env:STOCK_IPO_UPDATE_FEED_URL -ErrorAction SilentlyContinue }
-    else { $env:STOCK_IPO_UPDATE_FEED_URL = $previousUpdateFeedUrl }
-    if ($null -eq $previousUpdateSignerSha256) { Remove-Item Env:STOCK_IPO_UPDATE_SIGNER_SHA256 -ErrorAction SilentlyContinue }
-    else { $env:STOCK_IPO_UPDATE_SIGNER_SHA256 = $previousUpdateSignerSha256 }
     if ($null -eq $previousCrashReportUrl) { Remove-Item Env:STOCK_IPO_CRASH_REPORT_URL -ErrorAction SilentlyContinue }
     else { $env:STOCK_IPO_CRASH_REPORT_URL = $previousCrashReportUrl }
     if ($null -eq $previousCrashReportPrivacyUrl) { Remove-Item Env:STOCK_IPO_CRASH_REPORT_PRIVACY_URL -ErrorAction SilentlyContinue }

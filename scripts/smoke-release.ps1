@@ -369,15 +369,20 @@ try {
     Assert-Condition ($deploymentSource -match 'validate_current_user_data_root' -and $deploymentSource -match 'validate_purge_confirmation') 'Application uninstall helper does not enforce data-root and confirmation validation.'
     $purgePhrase = -join @([char]0x5220, [char]0x9664, [char]0x5F53, [char]0x524D, [char]0x7528, [char]0x6237, [char]0x6570, [char]0x636E)
     Assert-Condition ($mainUiSource.IndexOf($purgePhrase, [StringComparison]::Ordinal) -ge 0) 'Uninstall UI does not expose the explicit current-user data deletion confirmation phrase.'
-    Assert-Condition ($updaterSource -match 'CryptVerifyDetachedMessageSignature' -and $updaterSource -match 'WinVerifyTrust') 'Updater does not verify both detached CMS and Authenticode signatures.'
-    Assert-Condition ($updaterSource -match 'TRUSTED_UPDATE_SIGNER_SHA256' -and $updaterSource -match 'normalize_sha256') 'Updater does not pin a normalized signing-certificate SHA-256 fingerprint.'
-    Assert-Condition ($updaterSource -match 'validated_https_url' -and $updaterSource -match 'installer\.sha256') 'Updater does not enforce HTTPS and installer SHA-256 validation.'
-    Assert-Condition ($buildSource -match 'signtool' -and $buildSource -match "'/tr'" -and $buildSource -match 'SignedCms') 'Release build does not author timestamped Authenticode and detached CMS signatures.'
+    Assert-Condition ($updaterSource -match 'minisign_verify' -and $updaterSource -match 'verify_minisign_signature') 'Updater does not verify Minisign signatures.'
+    Assert-Condition ($updaterSource -match 'UPDATE_PUBLIC_KEY' -and $updaterSource -match 'include_str!') 'Updater does not embed the repository Minisign trust root.'
+    Assert-Condition ($updaterSource -match 'allow_legacy|verify\(.*false\)' -or $updaterSource -match 'verify\(manifest_bytes, &signature, false\)') 'Updater does not reject legacy non-pre-hashed signatures.'
+    Assert-Condition ($updaterSource -match 'validated_https_url' -and $updaterSource -match 'installer\.sha256' -and $updaterSource -match 'normalize_sha256') 'Updater does not enforce HTTPS and installer SHA-256 validation.'
+    Assert-Condition ($updaterSource -match 'try_acquire_supervisor') 'Update helper does not wait for the Watchdog supervisor mutex.'
+    Assert-Condition ($buildSource -match 'signtool' -and $buildSource -match "'/tr'") 'Release build does not author optional timestamped Authenticode signing.'
+    Assert-Condition (-not ($buildSource -match 'SignedCms')) 'Release build must no longer generate detached CMS update signatures.'
     Assert-Condition (
         $mainUiSource.Contains('automatic-updates-enabled') -and
+        $mainUiSource.Contains('automatic-update-download-enabled') -and
         $mainUiSource.Contains('check-for-updates') -and
+        $mainUiSource.Contains('download-update') -and
         $mainUiSource.Contains('install-update')) `
-        'Settings UI does not expose the signed update workflow.'
+        'Settings UI does not expose the signed update workflow with the separate auto-download consent.'
     Assert-Condition (
         $crashUploadSource.Contains('STOCK_IPO_CRASH_REPORT_PRIVACY_URL') -and
         $crashUploadSource.Contains('Policy::none()') -and

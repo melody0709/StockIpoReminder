@@ -310,9 +310,15 @@ export component MainWindow inherits Window {
     in-out property <bool> reset-settings-pending: false;
     in-out property <int> settings-section: 0;
     in-out property <bool> automatic-updates-enabled: false;
+    in-out property <bool> automatic-update-download-enabled: false;
     in-out property <bool> update-configured: false;
     in-out property <bool> update-available: false;
+    in-out property <bool> update-ready: false;
+    in-out property <bool> update-downloading: false;
+    in-out property <bool> update-download-failed: false;
+    in-out property <int> update-download-progress: -1;
     in-out property <string> update-version: "";
+    in-out property <string> update-release-notes-url: "";
     in-out property <string> update-status: "正在读取安全更新配置…";
     in-out property <bool> crash-upload-enabled: false;
     in-out property <bool> crash-upload-configured: false;
@@ -389,7 +395,9 @@ export component MainWindow inherits Window {
     callback test-notification-channel(int);
     callback complete-notification-test(int, bool);
     callback check-for-updates();
+    callback download-update();
     callback install-update();
+    callback open-release-notes();
     callback upload-crash-report();
     callback open-crash-upload-privacy();
     callback test-secondary-notification();
@@ -1085,8 +1093,8 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 Rectangle {
-                                    min-height: 148px;
-                                    max-height: 148px;
+                                    min-height: 240px;
+                                    max-height: 240px;
                                     border-radius: 9px;
                                     border-width: 1px;
                                     border-color: #26334a;
@@ -1095,15 +1103,25 @@ export component MainWindow inherits Window {
                                         padding: 12px;
                                         spacing: 8px;
                                         Text { text: "安全自动更新"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                                        Text { text: root.update-status; color: root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        Text { text: "当前版本 " + root.app-version + (root.update-version == "" ? "" : "　可用版本 " + root.update-version); color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                        Text { text: root.update-status; color: root.update-ready || root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
                                         HorizontalBox {
+                                            height: 34px;
                                             spacing: 10px;
-                                            Toggle { label: "启动时自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
+                                            Toggle { label: "启动时及每日自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
                                             Rectangle { horizontal-stretch: 1; }
-                                            ActionButton { label: "检查更新"; compact: root.compact-width; enabled: root.update-configured; clicked => { root.check-for-updates(); } }
-                                            ActionButton { label: root.update-version == "" ? "下载并安装" : "安装 " + root.update-version; compact: root.compact-width; primary: true; enabled: root.update-available; clicked => { root.install-update(); } }
+                                            ActionButton { label: "检查更新"; compact: root.compact-width; enabled: root.update-configured && !root.update-downloading; clicked => { root.check-for-updates(); } }
+                                            if root.update-available && !root.update-ready : ActionButton { label: root.update-download-failed ? "重试下载" : root.update-downloading ? "正在下载 " + root.update-download-progress + "%" : "下载更新"; compact: root.compact-width; enabled: !root.update-downloading; clicked => { root.download-update(); } }
+                                            ActionButton { label: root.update-version == "" ? "重启并更新" : "重启并更新至 " + root.update-version; compact: root.compact-width; primary: true; enabled: root.update-ready; clicked => { root.install-update(); } }
                                         }
-                                        Text { text: "只接受 HTTPS、固定证书签名的 CMS 清单，以及哈希和 Authenticode 证书均匹配的 MSI；安装仍需你明确点击。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
+                                        HorizontalBox {
+                                            height: 34px;
+                                            spacing: 10px;
+                                            Toggle { label: "发现更新后自动下载（默认关闭）"; checked <=> root.automatic-update-download-enabled; enabled: root.update-configured; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            if root.update-release-notes-url != "" : ActionButton { label: "发布说明"; compact: root.compact-width; clicked => { root.open-release-notes(); } }
+                                        }
+                                        Text { text: "更新清单由内置 Minisign 公钥验证，安装前复核大小和 SHA-256；仅自动检查发现的更新会自动下载。未购买代码签名证书时，Windows 可能显示“未知发布者”与 UAC 确认，属正常安全提示。"; color: #64748b; font-size: 12px; wrap: word-wrap; }
                                     }
                                 }
                                 Rectangle {

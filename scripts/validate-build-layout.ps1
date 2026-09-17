@@ -129,7 +129,7 @@ if (Test-Path -LiteralPath $packagesRoot -PathType Container) {
             'RELEASE_NOTES.md',
             'release-manifest.json',
             'update-manifest.json',
-            'update-manifest.json.p7s',
+            'update-manifest.json.minisig',
             'SHA256SUMS.txt'
         )
         foreach ($entry in Get-ChildItem -LiteralPath $versionDirectory.FullName -Force) {

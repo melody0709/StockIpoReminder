@@ -56,7 +56,7 @@ set "SKIP_TESTS="
 if /I "!MODE!"=="Runtime" set "SKIP_TESTS=-SkipTests"
 set "SIGN_ARGS="
 if "!SIGN_RELEASE!"=="1" set "SIGN_ARGS=-Sign"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\build-release.ps1" -PackageMode "!MODE!" !SKIP_TESTS! !SIGN_ARGS!
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\build-release.ps1" -PackageMode "!MODE!" !SKIP_TESTS! !SIGN_ARGS!
 if errorlevel 1 exit /b !ERRORLEVEL!
 
 echo Build Success
@@ -65,7 +65,7 @@ if /I not "!MODE!"=="Runtime" echo Packages: %CD%\build\packages
 exit /b 0
 
 :clean
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\clean-build.ps1"
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\clean-build.ps1"
 exit /b !ERRORLEVEL!
 
 :usage
@@ -76,7 +76,11 @@ echo   --rebuild           Clean generated trees, then build runtime
 echo   --package           Build, test, and create MSI plus Portable ZIP
 echo   --package-msi       Build, test, and create MSI only
 echo   --package-portable  Build, test, and create Portable ZIP only
-echo   --sign              Sign EXE/MSI and emit a detached-CMS update manifest using configured credentials
+echo   --sign              Optional Authenticode signing of EXE/MSI using configured credentials
+echo.
+echo In-app auto-update trust is always compiled in via the repository Minisign public
+echo key; the signed update manifest is produced separately by
+echo   pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-update-manifest.ps1
 exit /b 0
 
 :usage_error

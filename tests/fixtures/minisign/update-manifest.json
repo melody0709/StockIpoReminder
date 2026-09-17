@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "product": "StockIpoReminder",
+  "channel": "stable",
+  "version": "9.9.9",
+  "publishedAtUtc": "2026-09-09T00:00:00Z",
+  "minimumWindowsBuild": 19041,
+  "releaseNotesUrl": "RELEASE_NOTES.md",
+  "installer": {
+    "url": "StockIpoReminder-9.9.9-win-x64.msi",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sizeBytes": 1024
+  }
+}

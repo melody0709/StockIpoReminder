@@ -1,72 +1,72 @@
 # 发布签名与安全自动更新
 
-本文说明 Stock IPO Reminder 的正式 Authenticode 签名和稳定版自动更新流程。未提供正式证书和 HTTPS 更新源时，构建仍可用于内部测试，但 `release-manifest.json` 会明确记录 `signed: false`，应用内自动更新保持关闭。
+本文说明 Stock IPO Reminder 的无 CA 证书自动更新方案：应用内置 Minisign 公钥验证更新清单，清单声明 MSI 的版本、大小和 SHA-256，Windows Installer 负责实际升级。Authenticode 代码签名变为完全可选能力，`signed: false` 与“Minisign 更新签名有效”可以同时成立。
 
 ## 信任模型
 
-- EXE 与 MSI 使用同一张具有 Code Signing EKU 的 Authenticode 证书签名，并使用 RFC 3161 HTTPS 时间戳。
-- 构建时把签名证书的 SHA-256 指纹和稳定版更新清单 HTTPS URL 编译进 EXE。
-- `update-manifest.json` 使用同一证书生成 detached CMS/PKCS#7 签名 `update-manifest.json.p7s`。
-- 客户端先验证 CMS 签名和固定证书指纹，再检查产品、stable 通道、版本、最低 Windows Build、MSI 大小和 SHA-256。
-- 下载完成后再次验证 MSI SHA-256、Windows Authenticode 信任和固定证书指纹，全部通过后才允许用户明确启动安装。
+- 信任根是编译进 EXE 的 Minisign 公钥（仓库内 `assets/update-signing/stock-ipo-update.pub`），对应私钥保存在仓库外并加密。正式构建始终包含该公钥和固定 GitHub stable feed，不存在“漏设环境变量导致更新功能未配置”的正式包。
+- 更新源固定为 `https://github.com/melody0709/StockIpoReminder/releases/latest/download/update-manifest.json` 及其 `.minisig`。
+- `update-manifest.json` 为 schema v2：Minisign 默认预哈希签名覆盖清单写盘后的原始 UTF-8 字节；客户端以 `allow_legacy=false` 验证，拒绝 legacy 非预哈希签名。
+- 客户端验证顺序固定：先验证清单原始字节签名（成功前不解析任何字段），再校验产品、stable 通道、严格 `x.y.z` 递增版本、RFC 3339 发布时间、最低 Windows Build、安装包文件名与版本一致、无凭据无 fragment 的 HTTPS URL、大小范围和 SHA-256 格式。
+- 下载时同时执行响应大小上限、声明长度和增量 SHA-256 校验；下载完成提交到受控 pending 目录（`数据目录\updates\pending`），应用关闭或重启后可恢复为就绪状态，恢复时全部材料重新验证。
+- 安装 helper 只接收数据目录和父进程 PID；它从受控 pending 目录重新验证清单签名、版本、大小和 MSI SHA-256，并以禁止写入和删除共享的只读句柄锁定 MSI 直到 `msiexec` 结束。
+- 只有用户明确点击“重启并更新”后才退出主程序；helper 等待父进程退出、轮询取得 Watchdog supervisor 互斥量后执行 `msiexec /i ... /passive /norestart`。成功后从 `HKLM\Software\StockIpoReminder\InstallFolder` 启动新版本；返回 `3010` 提示重启 Windows；失败或取消 UAC 时保留可重试 pending 并恢复启动当前版本。
 - 更新只允许升级到更高的 `x.y.z` 版本；WiX Major Upgrade 继续负责程序文件事务回滚。数据迁移前仍由应用创建并校验 SQLite 备份。
 - 便携版不会静默转换为安装版，应用内自动更新入口只对已由本产品 MSI 注册的安装版开放。
+- 私钥丢失或泄露时，旧客户端不能安全接受未经旧私钥授权的新钥匙；必须停止自动更新并发布需要人工安装的新引导版。
 
-## 本地或隔离签名机
+Minisign 解决的是“应用确认更新确实由项目维护者发布”，不是“Windows 显示已认证发布者”。没有 Authenticode 时 UAC、SmartScreen 和“未知发布者”提示属正常现象，本项目不绕过任何系统安全交互。
 
-优先把私钥导入签名机当前用户证书存储，并只传递 SHA-1 证书查找指纹：
+## 密钥管理
 
-```text
-set STOCK_IPO_SIGNING_CERTIFICATE_THUMBPRINT=<certificate SHA-1 thumbprint>
-set STOCK_IPO_UPDATE_FEED_URL=https://updates.example.com/stock-ipo-reminder/stable/update-manifest.json
-rtk cmd /c build.bat --package --sign
-```
+| 内容 | 存放位置 | 用途 |
+| --- | --- | --- |
+| 私钥 | `C:\Users\kawae\OneDrive\vault\StockIpoReminder\update-signing\stock-ipo-update.key` | 本地签署 `update-manifest.json`（强密码加密） |
+| 密码备忘 | 同目录 `stock-ipo-update.password.txt` | 仅在忘记密码前临时存在，记入密码管理器后删除 |
+| 公钥原件 | 同目录 `stock-ipo-update.pub` | 私钥恢复与人工复核 |
+| 公钥副本 | `assets/update-signing/stock-ipo-update.pub` | 提交仓库并编译进 EXE |
 
-也可以通过短生命周期 PFX 文件签名。密码只能通过指定环境变量传递，不写入命令、仓库或日志。构建脚本把 PFX 临时导入当前用户证书存储，`signtool` 仅按指纹选取证书，完成后删除临时导入项，密码不会作为 `signtool` 命令行参数出现：
+- 私钥必须设置强密码；不得使用 `-W` 无密码模式生成正式私钥。
+- 私钥不得进入 Git、构建目录、诊断包、日志、命令行正文或 GitHub Release；OneDrive 不算离线备份，另保留两份离线加密备份。
+- 首次生成见 `scripts/generate-update-signing-key.ps1`（已生成正式密钥对后不要重复运行）。
+- 暂不实现多密钥、在线密钥服务或自动轮换；确需轮换时，先用旧私钥签署一个同时内置新公钥的过渡版本。
 
-```text
-set STOCK_IPO_SIGNING_PFX_PATH=D:\secure\stock-ipo-reminder-signing.pfx
-set STOCK_IPO_SIGNING_PFX_PASSWORD=<secret>
-set STOCK_IPO_UPDATE_FEED_URL=https://updates.example.com/stock-ipo-reminder/stable/update-manifest.json
-rtk cmd /c build.bat --package --sign
-```
+## 本地发版顺序
 
-签名构建会拒绝缺少 Code Signing EKU、缺少私钥、非 HTTPS 时间戳或非 HTTPS 更新源。默认时间戳服务为 `https://timestamp.digicert.com`，可通过 `scripts/build-release.ps1 -TimestampUrl` 显式替换。
-
-## 发布文件
-
-签名发布目录除 MSI、便携 ZIP、发布清单和校验和外，还包含：
+1. 修改 `Cargo.toml` 版本并更新 `RELEASE_NOTES.md`。
+2. 运行测试和 `rtk cmd /c build.bat --package`，得到最终 MSI 和便携 ZIP。
+3. 根据最终 MSI 生成并签名 `update-manifest.json`：
 
 ```text
-update-manifest.json
-update-manifest.json.p7s
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-update-manifest.ps1
 ```
 
-应先完整运行 smoke、签名/更新集成测试和 release audit，再把以下文件原子发布到稳定版更新目录：
+脚本会让 minisign 交互式询问私钥密码（密码不进入命令行）；签名后自动用编译进客户端的同一公钥复核，回填 `release-manifest.json` 的 `updateManifest`、`updateManifestSignature`、`updateSignatureAlgorithm=minisign` 和公钥 key ID，最后重新生成 `SHA256SUMS.txt`。
 
-```text
-StockIpoReminder-<version>-win-x64.msi
-RELEASE_NOTES.md
-update-manifest.json.p7s
-update-manifest.json
-```
+4. 运行验证（见下节），全部通过后创建 GitHub Draft Release 并一次上传全部资产：MSI、便携 ZIP、`README.md`、`RELEASE_NOTES.md`、`release-manifest.json`、`SHA256SUMS.txt`、`update-manifest.json`、`update-manifest.json.minisig`。
+5. 通过经过身份验证的 Draft 下载重新验证全部资产的名称、大小、哈希和 Minisign 签名；验证通过后一次性把 Draft 发布为 stable/latest。不得发布后再补传或覆盖更新清单和 MSI——Draft 中资产的上传先后顺序不构成安全边界，真正的发布边界是“完整 Draft 一次性公开”。
+6. 发布后从公开的 `releases/latest/download/update-manifest.json` 和 `.minisig` 再做一次只读验证。
 
-最后发布 `update-manifest.json`，避免客户端先看到尚未上传完整的版本。不得覆盖旧 MSI；保留至少一个已知稳定版本，供人工回滚和故障调查。
+## 可选 Authenticode
+
+如未来取得代码签名证书，`rtk cmd /c build.bat --package --sign` 可为 EXE/MSI 提供带 RFC 3161 时间戳的 Authenticode 签名（证书放当前用户存储或短生命周期 PFX，密码仅经环境变量传递）。该开关不再决定客户端是否包含更新能力，也不再生成 CMS 清单。
 
 ## CI 密钥保护
 
+- Minisign 私钥永不上 CI；CI 只做构建、测试和可选 Authenticode。
 - 正式 PFX 只存放在受保护的 CI secret 或独立签名服务中，不提交 Base64、密码或私钥文件。
-- 发布工作流仅允许手动触发，并应绑定需要审批的 GitHub Environment。
+- 发布工作流仅允许手动触发，并绑定需要审批的 GitHub Environment。
 - PFX 只写入 runner 临时目录，签名完成后在 `finally` 中删除；构建产物中不得包含 PFX。
 - 日志不得打印 PFX 密码、私钥内容或带凭据 URL。
-- 发布前必须核对 `release-manifest.json` 的 `signed`、`signerSha256`、`timestampUrl`、更新清单文件名和所有 SHA-256。
+- 发布前必须核对 `release-manifest.json` 的 `signed`、`signerSha256`、`timestampUrl`、更新清单文件名、`updateSignatureAlgorithm` 和所有 SHA-256。
 
 ## 验证
 
 ```text
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
-rtk powershell -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-signing-update.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
+rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-update-helper-recovery.ps1
 ```
 
-`test-signing-update.ps1` 创建一天有效的临时代码签名证书，验证 Authenticode 文件签名、detached CMS、证书固定、安装包哈希和清单篡改拒绝，随后删除测试证书。测试只允许自测命令接受“唯一信任错误为临时自签根”；生产下载和安装路径仍强制要求 Windows 系统信任。它不替代正式 CA 证书、RFC 3161 时间戳和线上 HTTPS 更新源验收。
+`test-signing-update.ps1` 在沙盒生成一次性无密码 Minisign 测试密钥（绝不进入生产信任根），验证预哈希签名接受、篡改清单拒绝、错误密钥拒绝、正式信任根拒绝测试密钥、legacy 签名拒绝和安装包哈希拒绝。`audit-release.ps1` 会在发布目录存在更新清单时，用仓库公钥和发布 EXE 各自复核一遍。`test-update-helper-recovery.ps1` 用生产密钥签名的 pending 加无效 MSI 验证安装助手的验签、锁定、等待与失败恢复路径（不触发 UAC）。真实 MSI 闭环（引导版升级到更高测试版本、UAC 取消、安装失败、`3010` 与正常成功路径）需在本机用独立 `--data-root` 人工执行并记录。

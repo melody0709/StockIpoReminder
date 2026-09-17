@@ -86,6 +86,7 @@ pub(crate) fn apply_settings(ui: &MainWindow, settings: &AppSettings) {
     ui.set_post_apply_reminders_enabled(settings.post_apply_reminders_enabled);
     ui.set_listing_reminders_enabled(settings.listing_reminders_enabled);
     ui.set_automatic_updates_enabled(settings.automatic_updates_enabled);
+    ui.set_automatic_update_download_enabled(settings.automatic_update_download_enabled);
     ui.set_crash_upload_enabled(settings.crash_report_upload_enabled);
     ui.set_secondary_notification_enabled(settings.secondary_notification_enabled);
     ui.set_secondary_notification_provider_index(secondary_provider_index(

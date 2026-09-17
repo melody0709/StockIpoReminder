@@ -1,13 +1,15 @@
 use std::{
     env, fs,
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -22,45 +24,64 @@ use std::os::windows::process::CommandExt;
 use windows::{
     Wdk::System::SystemServices::RtlGetVersion,
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0},
-        Security::{
-            Cryptography::{
-                CERT_CONTEXT, CERT_SHA256_HASH_PROP_ID, CRYPT_VERIFY_MESSAGE_PARA,
-                CertFreeCertificateContext, CertGetCertificateContextProperty,
-                CryptVerifyDetachedMessageSignature, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
-            },
-            WinTrust::{
-                WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-                WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
-                WTD_SAFER_FLAG, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-                WTD_UICONTEXT_INSTALL, WTHelperGetProvCertFromChain,
-                WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust,
-            },
-        },
+        Foundation::{CloseHandle, ERROR_SUCCESS, WAIT_OBJECT_0},
+        Storage::FileSystem::FILE_SHARE_READ,
         System::{
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
             SystemInformation::OSVERSIONINFOW,
             Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, WaitForSingleObject},
         },
     },
-    core::{PCWSTR, PWSTR},
+    core::PCWSTR,
 };
 
 const MANIFEST_LIMIT: u64 = 256 * 1024;
 const SIGNATURE_LIMIT: u64 = 256 * 1024;
 const INSTALLER_LIMIT: u64 = 200 * 1024 * 1024;
+const UPDATE_STATE_FILE: &str = "update-state.json";
+const PENDING_MANIFEST_FILE: &str = "update-manifest.json";
+const PENDING_SIGNATURE_FILE: &str = "update-manifest.json.minisig";
+/// 自动检查的最小间隔（小时）；手动检查不受此限制。
+const AUTOMATIC_CHECK_INTERVAL_HOURS: i64 = 24;
+/// 等待 Watchdog 释放 supervisor 锁的上限；超时取消安装而不是依赖固定睡眠。
+const SUPERVISOR_WAIT_LIMIT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const PROCESS_SYNCHRONIZE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
 
-pub const UPDATE_FEED_URL: &str = match option_env!("STOCK_IPO_UPDATE_FEED_URL") {
-    Some(value) => value,
-    None => "",
-};
-pub const TRUSTED_UPDATE_SIGNER_SHA256: &str = match option_env!("STOCK_IPO_UPDATE_SIGNER_SHA256") {
-    Some(value) => value,
-    None => "",
-};
+/// 稳定版更新 feed 固定编译进客户端，避免漏设环境变量导致正式包缺少更新能力。
+pub const UPDATE_FEED_URL: &str =
+    "https://github.com/melody0709/StockIpoReminder/releases/latest/download/update-manifest.json";
+/// 信任根：仓库内置的 Minisign 公钥（私钥保存在仓库外并加密）。
+const UPDATE_PUBLIC_KEY: &str = include_str!("../assets/update-signing/stock-ipo-update.pub");
+
+/// 更新通知的带类型激活参数；不得与股票事件 ID 混用。
+pub const ACTIVATION_UPDATE_AVAILABLE: &str = "update:available";
+pub const ACTIVATION_UPDATE_READY: &str = "update:ready";
+
+pub fn is_update_activation(value: &str) -> bool {
+    value == ACTIVATION_UPDATE_AVAILABLE || value == ACTIVATION_UPDATE_READY
+}
+
+/// 把清单中的发布说明文件名解析为与更新源同目录的安全 HTTPS URL。
+/// 只接受不含协议、主机和路径分隔符的相对文件名，避免清单把用户导向任意站点。
+pub fn release_notes_url(manifest: &UpdateManifest) -> Option<String> {
+    let value = manifest.release_notes_url.as_deref()?.trim();
+    if value.is_empty()
+        || value.contains(['/', '\\'])
+        || value.contains("://")
+        || !value
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    let base = validated_https_url(UPDATE_FEED_URL, "更新清单").ok()?;
+    let joined = base.join(value).ok()?;
+    validated_https_url(joined.as_str(), "发布说明").ok()?;
+    Some(joined.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,7 +89,6 @@ pub struct UpdateInstaller {
     pub url: String,
     pub sha256: String,
     pub size_bytes: u64,
-    pub signer_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +107,15 @@ pub struct UpdateManifest {
 #[derive(Debug, Clone)]
 pub struct AvailableUpdate {
     pub manifest: UpdateManifest,
+    manifest_bytes: Vec<u8>,
+    signature_bytes: Vec<u8>,
     installer_url: Url,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingUpdate {
+    pub manifest: UpdateManifest,
+    pub installer_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -96,31 +124,74 @@ pub enum UpdateCheck {
     Available(AvailableUpdate),
 }
 
+/// 运行状态（不进入 AppSettings 或 SQLite）：记录自动检查节流、
+/// 每版本一次性提醒和待安装版本。Option 字段缺失时 serde 自动回填
+/// None；schemaVersion 缺失或非 1 视为文件损坏，由读取方回退默认值。
+/// 未来新增非 Option 字段时在该字段上单独标注 `#[serde(default)]`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateState {
+    pub schema_version: u32,
+    pub last_automatic_check_at_utc: Option<String>,
+    pub last_notified_version: Option<String>,
+    pub pending_version: Option<String>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            last_automatic_check_at_utc: None,
+            last_notified_version: None,
+            pending_version: None,
+        }
+    }
+}
+
+static UPDATE_STATE_MUTEX: Mutex<()> = Mutex::new(());
+
 pub fn configured() -> bool {
-    !UPDATE_FEED_URL.trim().is_empty() && normalize_sha256(TRUSTED_UPDATE_SIGNER_SHA256).is_ok()
+    trusted_public_key().is_ok()
 }
 
 pub fn configuration_status() -> String {
     if configured() {
-        "安全自动更新已配置：启动时检查签名清单，安装前复核哈希与 Authenticode。".into()
+        "安全自动更新已配置：内置 Minisign 公钥验证签名清单，安装前复核大小与 SHA-256。".into()
     } else {
-        "当前构建未嵌入可信更新源和签名证书指纹；自动更新保持关闭。".into()
+        "当前构建未正确嵌入更新签名公钥；自动更新保持关闭。".into()
     }
 }
 
+pub fn trusted_public_key() -> Result<minisign_verify::PublicKey> {
+    minisign_verify::PublicKey::decode(UPDATE_PUBLIC_KEY).context("无法解析内置更新签名公钥")
+}
+
+/// 验证清单原始字节的 Minisign 预哈希签名；成功前调用方不得解析清单字段。
+pub fn verify_minisign_signature(
+    manifest_bytes: &[u8],
+    signature_bytes: &[u8],
+    public_key: &minisign_verify::PublicKey,
+) -> Result<()> {
+    let signature_text =
+        std::str::from_utf8(signature_bytes).context("更新清单签名不是有效的 UTF-8 文本")?;
+    let signature = minisign_verify::Signature::decode(signature_text)
+        .context("无法解析更新清单 Minisign 签名")?;
+    public_key
+        .verify(manifest_bytes, &signature, false)
+        .map_err(|error| anyhow::anyhow!("更新清单 Minisign 签名验证失败：{error}"))
+}
+
 pub fn check_for_update() -> Result<UpdateCheck> {
-    if !configured() {
-        bail!("当前构建未配置可信更新源或签名证书指纹");
-    }
     let manifest_url = validated_https_url(UPDATE_FEED_URL, "更新清单")?;
-    let signature_url = detached_signature_url(&manifest_url)?;
+    let signature_url = minisign_signature_url(&manifest_url)?;
     let client = update_client()?;
     let manifest_bytes = fetch_limited(&client, &manifest_url, MANIFEST_LIMIT, "更新清单")?;
-    let signature = fetch_limited(&client, &signature_url, SIGNATURE_LIMIT, "更新清单签名")?;
-    verify_detached_signature(&manifest_bytes, &signature, TRUSTED_UPDATE_SIGNER_SHA256)?;
+    let signature_bytes = fetch_limited(&client, &signature_url, SIGNATURE_LIMIT, "更新清单签名")?;
+    let public_key = trusted_public_key()?;
+    verify_minisign_signature(&manifest_bytes, &signature_bytes, &public_key)?;
     let manifest: UpdateManifest =
         serde_json::from_slice(&manifest_bytes).context("无法解析签名更新清单")?;
-    let installer_url = validate_manifest(&manifest, &manifest_url, TRUSTED_UPDATE_SIGNER_SHA256)?;
+    let installer_url = validate_manifest(&manifest, &manifest_url)?;
     if compare_versions(&manifest.version, env!("CARGO_PKG_VERSION"))?
         != std::cmp::Ordering::Greater
     {
@@ -128,12 +199,23 @@ pub fn check_for_update() -> Result<UpdateCheck> {
     }
     Ok(UpdateCheck::Available(AvailableUpdate {
         manifest,
+        manifest_bytes,
+        signature_bytes,
         installer_url,
     }))
 }
 
-/// 下载/验签过程的清理守卫：helper 成功启动前任何失败都尽力删除已生成的
-/// 更新文件（.part 与改名后的 .msi），避免失败残留长期占用磁盘。
+/// 待安装更新的受控目录；其中的文件名全部由程序按清单版本生成。
+pub fn pending_directory(data_root: &Path) -> PathBuf {
+    data_root.join("updates").join("pending")
+}
+
+pub fn pending_installer_file_name(version: &str) -> String {
+    format!("StockIpoReminder-{version}-win-x64.msi")
+}
+
+/// 下载/验签过程的清理守卫：pending 提交成功前任何失败都尽力删除已生成的
+/// 更新文件（.part 与提交后的 .msi），避免失败残留长期占用磁盘。
 struct PendingUpdateFile {
     paths: Vec<PathBuf>,
     armed: bool,
@@ -171,50 +253,159 @@ impl Drop for PendingUpdateFile {
     }
 }
 
-pub fn download_and_request_install(data_root: &Path, update: &AvailableUpdate) -> Result<String> {
+/// 下载 MSI 并把清单、签名与安装包一起提交到受控 pending 目录。
+/// 不退出应用；安装由 [`request_install`] 单独触发。
+pub fn download_and_verify_update(
+    data_root: &Path,
+    update: &AvailableUpdate,
+    progress: Option<&dyn Fn(u64, u64)>,
+) -> Result<PendingUpdate> {
     if crate::deployment::installed_msi_product_code()?.is_none() {
         bail!("自动更新只支持由 Windows Installer 管理的安装版");
     }
     let client = update_client()?;
-    let directory = data_root.join("temp").join("updates");
-    fs::create_dir_all(&directory).context("无法创建更新下载目录")?;
-    let (partial, installer) =
-        update_download_paths(&directory, &update.manifest.version, Uuid::new_v4());
+    let temporary = data_root.join("temp").join("updates");
+    fs::create_dir_all(&temporary).context("无法创建更新下载目录")?;
+    let partial = partial_download_path(&temporary, &update.manifest.version, Uuid::new_v4());
     let mut guard = PendingUpdateFile::new(partial.clone());
-    let result = (|| -> Result<()> {
-        download_installer(&client, update, &partial)?;
+    let result = (|| -> Result<PendingUpdate> {
+        download_installer(&client, update, &partial, progress)?;
+        let pending_root = pending_directory(data_root);
+        fs::create_dir_all(&pending_root).context("无法创建待安装更新目录")?;
+        let installer = pending_root.join(pending_installer_file_name(&update.manifest.version));
         fs::rename(&partial, &installer).context("无法提交已验证的更新安装包")?;
         guard.track(installer.clone());
-        verify_authenticode(&installer, TRUSTED_UPDATE_SIGNER_SHA256)?;
-        dispatch_install_helper(data_root, &installer, &update.manifest.installer.sha256)?;
-        Ok(())
+        write_pending_file(&pending_root, PENDING_MANIFEST_FILE, &update.manifest_bytes)?;
+        write_pending_file(
+            &pending_root,
+            PENDING_SIGNATURE_FILE,
+            &update.signature_bytes,
+        )?;
+        remove_stale_pending_files(&pending_root, &update.manifest.installer.url)?;
+        mutate_update_state(data_root, |state| {
+            state.pending_version = Some(update.manifest.version.clone());
+        })?;
+        Ok(PendingUpdate {
+            manifest: update.manifest.clone(),
+            installer_path: installer,
+        })
     })();
     if result.is_ok() {
-        // helper 成功启动后由安装流程接管安装包；失败路径由守卫清理。
+        // pending 已完整提交，由安装流程或下次启动的恢复逻辑接管。
         guard.disarm();
     }
-    result.map(|()| {
-        format!(
-            "{} 已下载并通过签名校验；程序退出后将启动 Windows Installer",
-            update.manifest.version
-        )
+    result
+}
+
+fn partial_download_path(directory: &Path, version: &str, operation_id: Uuid) -> PathBuf {
+    directory.join(format!(
+        ".StockIpoReminder-{version}-win-x64-{}.msi.part",
+        operation_id.simple()
+    ))
+}
+
+fn write_pending_file(pending_root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let target = pending_root.join(name);
+    let temporary = pending_root.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temporary, bytes).context("无法写入待安装更新文件")?;
+    if let Err(error) = operations::atomic_replace_file(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("无法提交待安装更新文件");
+    }
+    Ok(())
+}
+
+/// pending 目录中只保留当前清单对应的三个文件；其余旧版本残留和崩溃
+/// 遗留的 .tmp 中间文件一律删除，避免长期占用磁盘。
+fn remove_stale_pending_files(pending_root: &Path, keep_installer: &str) -> Result<()> {
+    for entry in fs::read_dir(pending_root).context("无法读取待安装更新目录")? {
+        let entry = entry.context("无法读取待安装更新目录条目")?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stale =
+            (name.ends_with(".msi") || name.ends_with(".minisig") || name.ends_with(".tmp"))
+                && name != keep_installer
+                && name != PENDING_MANIFEST_FILE
+                && name != PENDING_SIGNATURE_FILE;
+        if stale
+            && let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(anyhow::anyhow!("清理过期待安装更新失败：{error}"));
+        }
+    }
+    Ok(())
+}
+
+/// 从受控 pending 目录重新验证全部材料：清单签名、schema、版本、
+/// Windows Build、安装包大小与 SHA-256。主进程与 helper 共用此入口。
+pub fn verify_pending(data_root: &Path) -> Result<PendingUpdate> {
+    let directory = pending_directory(data_root);
+    let manifest_bytes =
+        fs::read(directory.join(PENDING_MANIFEST_FILE)).context("缺少待安装更新清单")?;
+    let signature_bytes =
+        fs::read(directory.join(PENDING_SIGNATURE_FILE)).context("缺少待安装更新清单签名")?;
+    let public_key = trusted_public_key()?;
+    verify_minisign_signature(&manifest_bytes, &signature_bytes, &public_key)?;
+    let manifest: UpdateManifest =
+        serde_json::from_slice(&manifest_bytes).context("无法解析待安装更新清单")?;
+    let base = validated_https_url(UPDATE_FEED_URL, "更新清单")?;
+    validate_manifest(&manifest, &base)?;
+    if compare_versions(&manifest.version, env!("CARGO_PKG_VERSION"))?
+        != std::cmp::Ordering::Greater
+    {
+        bail!("待安装更新版本不高于当前版本，已拒绝");
+    }
+    let installer_path = directory.join(&manifest.installer.url);
+    let metadata = fs::metadata(&installer_path).context("缺少待安装更新安装包")?;
+    if metadata.len() != manifest.installer.size_bytes {
+        bail!("待安装更新安装包大小与清单不一致");
+    }
+    if sha256_file(&installer_path)? != normalize_sha256(&manifest.installer.sha256)? {
+        bail!("待安装更新安装包 SHA-256 与清单不一致");
+    }
+    Ok(PendingUpdate {
+        manifest,
+        installer_path,
     })
 }
 
-fn update_download_paths(
-    directory: &Path,
-    version: &str,
-    operation_id: Uuid,
-) -> (PathBuf, PathBuf) {
-    let operation_id = operation_id.simple();
-    (
-        directory.join(format!(
-            ".StockIpoReminder-{version}-win-x64-{operation_id}.msi.part"
-        )),
-        directory.join(format!(
-            "StockIpoReminder-{version}-win-x64-{operation_id}.msi"
-        )),
-    )
+/// 删除 pending 目录中的全部受控文件并清空状态中的待安装版本。
+pub fn cleanup_pending(data_root: &Path) {
+    let directory = pending_directory(data_root);
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Err(error) = fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                operations::log("WARN", &format!("清理待安装更新文件失败：{error}"));
+            }
+        }
+    }
+    let _ = mutate_update_state(data_root, |state| state.pending_version = None);
+}
+
+/// pending 目录中是否确实存在清单材料；用于区分“没有待安装更新”和“待安装更新损坏”。
+pub fn pending_manifest_present(data_root: &Path) -> bool {
+    pending_directory(data_root)
+        .join(PENDING_MANIFEST_FILE)
+        .is_file()
+}
+
+/// 确认 pending 完整后启动安装 helper；helper 只接收 data_root 和父进程 PID，
+/// 全部材料由它自己从受控目录重新读取并验证。
+pub fn request_install(data_root: &Path) -> Result<String> {
+    verify_pending(data_root)?;
+    dispatch_install_helper(data_root)?;
+    Ok("待安装更新已重新验证；程序退出后将启动 Windows Installer 完成升级".into())
 }
 
 pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
@@ -232,14 +423,11 @@ pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
     }
     let result = (|| -> Result<String> {
         let data_root = argument_path(arguments, "--data-root").context("缺少数据目录")?;
-        let installer = argument_path(arguments, "--installer").context("缺少更新安装包")?;
-        let expected_sha256 =
-            argument_value(arguments, "--sha256").context("缺少更新安装包哈希")?;
         let parent_pid = argument_value(arguments, "--parent-pid")
             .context("缺少父进程编号")?
             .parse::<u32>()
             .context("父进程编号无效")?;
-        run_install_helper(&data_root, &installer, &expected_sha256, parent_pid)
+        run_install_helper(&data_root, parent_pid)
     })();
     if let Some(data_root) = argument_path(arguments, "--data-root") {
         let _ = write_update_result(&data_root, &result);
@@ -284,10 +472,10 @@ fn validated_https_url(value: &str, label: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn detached_signature_url(manifest_url: &Url) -> Result<Url> {
+fn minisign_signature_url(manifest_url: &Url) -> Result<Url> {
     let mut signature = manifest_url.clone();
     signature.set_fragment(None);
-    signature.set_path(&format!("{}.p7s", manifest_url.path()));
+    signature.set_path(&format!("{}.minisig", manifest_url.path()));
     Ok(signature)
 }
 
@@ -316,21 +504,22 @@ fn fetch_limited(client: &Client, url: &Url, limit: u64, label: &str) -> Result<
     Ok(bytes)
 }
 
-fn validate_manifest(manifest: &UpdateManifest, base_url: &Url, signer: &str) -> Result<Url> {
-    if manifest.schema_version != 1
+fn validate_manifest(manifest: &UpdateManifest, base_url: &Url) -> Result<Url> {
+    if manifest.schema_version != 2
         || manifest.product != "StockIpoReminder"
         || manifest.channel != "stable"
     {
         bail!("更新清单产品、通道或 schema 不受支持");
     }
     parse_version(&manifest.version)?;
-    let expected_signer = normalize_sha256(signer)?;
-    if normalize_sha256(&manifest.installer.signer_sha256)? != expected_signer {
-        bail!("更新清单中的安装包签名证书与当前应用固定证书不一致");
-    }
+    DateTime::parse_from_rfc3339(&manifest.published_at_utc)
+        .context("更新清单发布时间不是有效的 RFC 3339 时间")?;
     normalize_sha256(&manifest.installer.sha256)?;
     if manifest.installer.size_bytes == 0 || manifest.installer.size_bytes > INSTALLER_LIMIT {
         bail!("更新安装包大小超出允许范围");
+    }
+    if manifest.installer.url != pending_installer_file_name(&manifest.version) {
+        bail!("更新安装包文件名与清单版本不匹配");
     }
     if manifest.minimum_windows_build > current_windows_build()? {
         bail!(
@@ -344,7 +533,12 @@ fn validate_manifest(manifest: &UpdateManifest, base_url: &Url, signer: &str) ->
     validated_https_url(installer_url.as_str(), "更新安装包")
 }
 
-fn download_installer(client: &Client, update: &AvailableUpdate, target: &Path) -> Result<()> {
+fn download_installer(
+    client: &Client,
+    update: &AvailableUpdate,
+    target: &Path,
+    progress: Option<&dyn Fn(u64, u64)>,
+) -> Result<()> {
     let mut response = client
         .get(update.installer_url.clone())
         .send()
@@ -373,6 +567,9 @@ fn download_installer(client: &Client, update: &AvailableUpdate, target: &Path) 
         }
         hasher.update(&buffer[..count]);
         file.write_all(&buffer[..count])?;
+        if let Some(progress) = progress {
+            progress(total, update.manifest.installer.size_bytes);
+        }
     }
     file.sync_all()?;
     if total != update.manifest.installer.size_bytes {
@@ -385,7 +582,7 @@ fn download_installer(client: &Client, update: &AvailableUpdate, target: &Path) 
     Ok(())
 }
 
-fn dispatch_install_helper(data_root: &Path, installer: &Path, sha256: &str) -> Result<()> {
+fn dispatch_install_helper(data_root: &Path) -> Result<()> {
     let current_executable = env::current_exe()?;
     let helper = env::temp_dir().join(format!(
         "StockIpoReminder-Update-{}.exe",
@@ -400,10 +597,6 @@ fn dispatch_install_helper(data_root: &Path, installer: &Path, sha256: &str) -> 
         &parent_pid,
         "--data-root",
         data_root.to_string_lossy().as_ref(),
-        "--installer",
-        installer.to_string_lossy().as_ref(),
-        "--sha256",
-        sha256,
     ]);
     command
         .stdin(Stdio::null())
@@ -416,23 +609,91 @@ fn dispatch_install_helper(data_root: &Path, installer: &Path, sha256: &str) -> 
     Ok(())
 }
 
-fn run_install_helper(
-    data_root: &Path,
-    installer: &Path,
-    expected_sha256: &str,
-    parent_pid: u32,
-) -> Result<String> {
-    if !configured() {
-        bail!("当前构建未固定可信更新签名证书");
-    }
-    validate_installer_path(data_root, installer)?;
-    let actual = sha256_file(installer)?;
-    if actual != normalize_sha256(expected_sha256)? {
-        bail!("安装助手复核更新安装包 SHA-256 失败");
-    }
-    verify_authenticode(installer, TRUSTED_UPDATE_SIGNER_SHA256)?;
+fn run_install_helper(data_root: &Path, parent_pid: u32) -> Result<String> {
+    // 只信任受控 pending 目录中的材料；命令行不携带哈希或安装包路径。
+    let pending = verify_pending(data_root)?;
+    let installer = pending.installer_path;
+    // 以禁止写入和删除共享的方式持有安装包句柄直到 msiexec 结束。
+    let installer_lock = open_installer_read_locked(&installer)?;
+    // 锁定后在锁保护下重新验证内容：关闭“验证完成后、取得锁之前”
+    // 安装包被替换的 TOCTOU 窗口。
+    verify_locked_installer(&installer, &pending.manifest.installer)?;
     wait_for_parent_exit(parent_pid)?;
-    thread::sleep(Duration::from_millis(1200));
+    // 轮询取得 supervisor 锁即证明 Watchdog 已观察到正常退出并释放旧 EXE。
+    let supervisor = wait_for_supervisor_mutex(data_root)?;
+    let exit_code = run_msiexec(&installer)?;
+    drop(installer_lock);
+    if exit_code != 0 && exit_code != 3010 {
+        // 安装失败或用户取消 UAC：保留可重试 pending，并恢复启动当前版本。
+        drop(supervisor);
+        if let Err(error) = relaunch_installed_app() {
+            operations::log(
+                "WARN",
+                &format!("更新失败后恢复启动当前版本失败：{error:#}"),
+            );
+        }
+        bail!("Windows Installer 更新失败：exit={exit_code}");
+    }
+    cleanup_pending(data_root);
+    if exit_code == 3010 {
+        drop(supervisor);
+        return Ok("更新安装成功，需要重新启动 Windows 后完成".into());
+    }
+    drop(supervisor);
+    relaunch_installed_app().context("更新安装成功，但自动启动新版本失败")?;
+    Ok("更新安装成功，已启动新版本".into())
+}
+
+#[cfg(windows)]
+fn open_installer_read_locked(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+        .with_context(|| format!("无法锁定待安装更新安装包：{}", path.display()))
+}
+
+/// 在只读锁保护下复核安装包大小与 SHA-256；与清单声明一致才继续安装。
+fn verify_locked_installer(path: &Path, expected: &UpdateInstaller) -> Result<()> {
+    let metadata = fs::metadata(path).context("无法读取锁定的更新安装包")?;
+    if metadata.len() != expected.size_bytes {
+        bail!("锁定后的更新安装包大小与清单不一致");
+    }
+    if sha256_file(path)? != normalize_sha256(&expected.sha256)? {
+        bail!("锁定后的更新安装包 SHA-256 与清单不一致");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_installer_read_locked(_path: &Path) -> Result<fs::File> {
+    bail!("当前平台不支持 MSI 自动更新")
+}
+
+#[cfg(windows)]
+fn wait_for_supervisor_mutex(data_root: &Path) -> Result<windows_integration::SingleInstance> {
+    let deadline = Instant::now() + SUPERVISOR_WAIT_LIMIT;
+    loop {
+        if let Some(instance) =
+            windows_integration::SingleInstance::try_acquire_supervisor(data_root)?
+        {
+            return Ok(instance);
+        }
+        if Instant::now() >= deadline {
+            bail!("等待 Watchdog 释放单实例锁超时，已取消更新安装");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_supervisor_mutex(_data_root: &Path) -> Result<()> {
+    bail!("当前平台不支持 MSI 自动更新")
+}
+
+#[cfg(windows)]
+fn run_msiexec(installer: &Path) -> Result<i32> {
     let msiexec = env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
@@ -449,41 +710,69 @@ fn run_install_helper(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let status = command
         .status()
         .context("无法启动 Windows Installer 更新")?;
-    let exit_code = status.code().unwrap_or(-1);
-    if exit_code != 0 && exit_code != 3010 {
-        bail!("Windows Installer 更新失败：exit={exit_code}");
-    }
-    let _ = fs::remove_file(installer);
-    Ok(if exit_code == 3010 {
-        "更新安装成功，需要重新启动 Windows 后完成".into()
-    } else {
-        "更新安装成功，请重新启动应用".into()
-    })
+    Ok(status.code().unwrap_or(-1))
 }
 
-fn validate_installer_path(data_root: &Path, installer: &Path) -> Result<()> {
-    if installer
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        bail!("更新安装包路径包含非法上级目录跳转");
+#[cfg(not(windows))]
+fn run_msiexec(_installer: &Path) -> Result<i32> {
+    bail!("当前平台不支持 MSI 自动更新")
+}
+
+/// 从 HKLM\Software\StockIpoReminder\InstallFolder 读取安装目录并启动应用。
+fn relaunch_installed_app() -> Result<()> {
+    let folder = installed_folder_from_registry()?;
+    let executable = folder.join("StockIpoReminder.exe");
+    if !executable.is_file() {
+        bail!("安装目录中没有找到可执行文件：{}", executable.display());
     }
-    let expected = data_root.join("temp").join("updates");
-    let full = absolute(installer)?;
-    let root = absolute(&expected)?;
-    if !full.starts_with(&root)
-        || !full
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("msi"))
-    {
-        bail!("更新安装包不在当前数据目录的受控更新目录中");
-    }
+    let mut command = Command::new(&executable);
+    command
+        .arg("--background")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.spawn().context("无法启动已安装的应用")?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn installed_folder_from_registry() -> Result<PathBuf> {
+    let sub_key = wide_null(r"Software\StockIpoReminder");
+    let value_name = wide_null("InstallFolder");
+    let mut buffer = [0u16; 1024];
+    let mut size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub_key.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        bail!("无法读取安装目录注册表值：error=0x{:08x}", status.0 as u32);
+    }
+    let length = (size as usize) / std::mem::size_of::<u16>();
+    let text = String::from_utf16_lossy(&buffer[..length]);
+    let path = PathBuf::from(text.trim_end_matches('\0'));
+    if !path.is_absolute() {
+        bail!("注册表安装目录不是绝对路径");
+    }
+    Ok(path)
+}
+
+#[cfg(not(windows))]
+fn installed_folder_from_registry() -> Result<PathBuf> {
+    bail!("当前平台不支持读取 Windows 安装目录")
 }
 
 fn write_update_result(data_root: &Path, result: &Result<String>) -> Result<()> {
@@ -504,31 +793,36 @@ fn run_bundle_self_test(arguments: &[String]) -> Result<i32> {
     let manifest_path = argument_path(arguments, "--manifest").context("缺少更新清单")?;
     let signature_path = argument_path(arguments, "--signature").context("缺少清单签名")?;
     let installer_path = argument_path(arguments, "--installer").context("缺少安装包")?;
-    let signer = argument_value(arguments, "--signer").context("缺少签名证书指纹")?;
+    let public_key_path = argument_path(arguments, "--public-key").context("缺少验签公钥")?;
     let report_path = argument_path(arguments, "--report").context("缺少自测试报告")?;
-    let allow_untrusted_test_root = arguments
-        .iter()
-        .any(|value| value == "--allow-untrusted-test-root");
     let result = (|| -> Result<UpdateManifest> {
         let manifest_bytes = fs::read(&manifest_path)?;
-        let signature = fs::read(&signature_path)?;
-        verify_detached_signature(&manifest_bytes, &signature, &signer)?;
+        let signature_bytes = fs::read(&signature_path)?;
+        let public_key =
+            minisign_verify::PublicKey::from_file(&public_key_path).context("无法读取验签公钥")?;
+        verify_minisign_signature(&manifest_bytes, &signature_bytes, &public_key)?;
         let manifest: UpdateManifest = serde_json::from_slice(&manifest_bytes)?;
         let base = Url::parse("https://updates.example.invalid/update-manifest.json")?;
-        validate_manifest(&manifest, &base, &signer)?;
-        if sha256_file(&installer_path)? != normalize_sha256(&manifest.installer.sha256)? {
-            bail!("安装包 SHA-256 与清单不一致");
+        validate_manifest(&manifest, &base)?;
+        if installer_path.file_name().and_then(|value| value.to_str())
+            != Some(manifest.installer.url.as_str())
+        {
+            bail!("安装包文件名与更新清单不一致");
         }
-        verify_authenticode_with_policy(&installer_path, &signer, allow_untrusted_test_root)?;
+        let metadata = fs::metadata(&installer_path)?;
+        if metadata.len() != manifest.installer.size_bytes {
+            bail!("安装包大小与更新清单不一致");
+        }
+        if sha256_file(&installer_path)? != normalize_sha256(&manifest.installer.sha256)? {
+            bail!("安装包 SHA-256 与更新清单不一致");
+        }
         Ok(manifest)
     })();
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let report = match &result {
-        Ok(manifest) => {
-            json!({"success": true, "version": manifest.version, "signerSha256": normalize_sha256(&signer)?})
-        }
+        Ok(manifest) => json!({"success": true, "version": manifest.version}),
         Err(error) => json!({"success": false, "error": format!("{error:#}")}),
     };
     fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -577,14 +871,6 @@ fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering> {
     Ok(parse_version(left)?.cmp(&parse_version(right)?))
 }
 
-fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_owned())
-    } else {
-        Ok(env::current_dir()?.join(path))
-    }
-}
-
 fn argument_path(arguments: &[String], name: &str) -> Option<PathBuf> {
     arguments
         .windows(2)
@@ -599,158 +885,91 @@ fn argument_value(arguments: &[String], name: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
-#[cfg(windows)]
-fn verify_detached_signature(content: &[u8], signature: &[u8], expected: &str) -> Result<()> {
-    let mut parameters = CRYPT_VERIFY_MESSAGE_PARA {
-        cbSize: std::mem::size_of::<CRYPT_VERIFY_MESSAGE_PARA>() as u32,
-        dwMsgAndCertEncodingType: (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING).0,
-        ..Default::default()
-    };
-    let content_pointers = [content.as_ptr()];
-    let content_lengths = [u32::try_from(content.len()).context("更新清单过大")?];
-    let mut signer_certificate: *mut CERT_CONTEXT = std::ptr::null_mut();
-    unsafe {
-        CryptVerifyDetachedMessageSignature(
-            &mut parameters,
-            0,
-            signature,
-            1,
-            content_pointers.as_ptr(),
-            content_lengths.as_ptr(),
-            Some(&mut signer_certificate),
-        )
-    }
-    .context("更新清单 CMS/PKCS#7 签名无效")?;
-    if signer_certificate.is_null() {
-        bail!("更新清单签名没有返回签名证书");
-    }
-    let actual = certificate_sha256(signer_certificate);
-    unsafe {
-        let _ = CertFreeCertificateContext(Some(signer_certificate));
-    }
-    if actual? != normalize_sha256(expected)? {
-        bail!("更新清单签名证书与应用固定证书不一致");
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn verify_detached_signature(_content: &[u8], _signature: &[u8], _expected: &str) -> Result<()> {
-    bail!("当前平台不支持 Windows 更新签名验证")
-}
-
-#[cfg(windows)]
-fn certificate_sha256(certificate: *const CERT_CONTEXT) -> Result<String> {
-    let mut length = 0u32;
-    unsafe {
-        CertGetCertificateContextProperty(certificate, CERT_SHA256_HASH_PROP_ID, None, &mut length)
-    }
-    .context("无法读取签名证书 SHA-256 指纹长度")?;
-    let mut bytes = vec![0u8; length as usize];
-    unsafe {
-        CertGetCertificateContextProperty(
-            certificate,
-            CERT_SHA256_HASH_PROP_ID,
-            Some(bytes.as_mut_ptr().cast()),
-            &mut length,
-        )
-    }
-    .context("无法读取签名证书 SHA-256 指纹")?;
-    bytes.truncate(length as usize);
-    Ok(hex::encode(bytes))
-}
-
-#[cfg(windows)]
-fn verify_authenticode(path: &Path, expected_signer: &str) -> Result<()> {
-    verify_authenticode_with_policy(path, expected_signer, false)
-}
-
-#[cfg(windows)]
-fn verify_authenticode_with_policy(
-    path: &Path,
-    expected_signer: &str,
-    allow_untrusted_test_root: bool,
-) -> Result<()> {
-    let wide = wide_null(path.to_string_lossy().as_ref());
-    let mut file_info = WINTRUST_FILE_INFO {
-        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
-        pcwszFilePath: PCWSTR(wide.as_ptr()),
-        hFile: HANDLE::default(),
-        pgKnownSubject: std::ptr::null_mut(),
-    };
-    let mut data = WINTRUST_DATA {
-        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: WINTRUST_DATA_0 {
-            pFile: &mut file_info,
-        },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        pwszURLReference: PWSTR::null(),
-        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_SAFER_FLAG,
-        dwUIContext: WTD_UICONTEXT_INSTALL,
-        ..Default::default()
-    };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    let status = unsafe {
-        WinVerifyTrust(
-            HWND::default(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        )
-    };
-    const CERT_E_UNTRUSTEDROOT: u32 = 0x800B_0109;
-    let accepted_test_root = allow_untrusted_test_root && status as u32 == CERT_E_UNTRUSTEDROOT;
-    let signer = if status == 0 || accepted_test_root {
-        let provider = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
-        if provider.is_null() {
-            Err(anyhow::anyhow!("无法读取 Authenticode 提供者数据"))
-        } else {
-            let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
-            if signer.is_null() {
-                Err(anyhow::anyhow!("无法读取 Authenticode 签名者"))
-            } else {
-                let certificate = unsafe { WTHelperGetProvCertFromChain(signer, 0) };
-                if certificate.is_null() || unsafe { (*certificate).pCert }.is_null() {
-                    Err(anyhow::anyhow!("无法读取 Authenticode 签名证书"))
-                } else {
-                    certificate_sha256(unsafe { (*certificate).pCert })
-                }
+pub fn load_update_state(data_root: &Path) -> UpdateState {
+    let path = data_root.join(UPDATE_STATE_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<UpdateState>(&bytes) {
+            Ok(state) if state.schema_version == 1 => state,
+            Ok(_) => {
+                operations::log("WARN", "更新状态 schema 不受支持，已重置为默认值");
+                UpdateState::default()
             }
+            Err(error) => {
+                operations::log("WARN", &format!("更新状态文件已损坏，已重置：{error}"));
+                UpdateState::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UpdateState::default(),
+        Err(error) => {
+            operations::log("WARN", &format!("读取更新状态失败，按默认值处理：{error}"));
+            UpdateState::default()
         }
-    } else {
-        Err(anyhow::anyhow!(
-            "Windows Authenticode 验证失败：status=0x{:08x}",
-            status as u32
-        ))
-    };
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    unsafe {
-        let _ = WinVerifyTrust(
-            HWND::default(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        );
     }
-    if signer? != normalize_sha256(expected_signer)? {
-        bail!("安装包 Authenticode 证书与签名更新清单不一致");
-    }
-    Ok(())
 }
 
-#[cfg(not(windows))]
-fn verify_authenticode(_path: &Path, _expected_signer: &str) -> Result<()> {
-    bail!("当前平台不支持 Authenticode 验证")
+/// 进程内互斥地读取-修改-写回更新状态，避免并发读改写丢失字段。
+pub fn mutate_update_state<T>(
+    data_root: &Path,
+    mutate: impl FnOnce(&mut UpdateState) -> T,
+) -> Result<T> {
+    let _guard = UPDATE_STATE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_update_state(data_root);
+    let result = mutate(&mut state);
+    let path = data_root.join(UPDATE_STATE_FILE);
+    let temporary = data_root.join(format!(
+        ".{}.{}.tmp",
+        UPDATE_STATE_FILE,
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(data_root)?;
+    fs::write(&temporary, serde_json::to_vec_pretty(&state)?)?;
+    if let Err(error) = operations::atomic_replace_file(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("无法提交更新状态文件");
+    }
+    Ok(result)
 }
 
-#[cfg(not(windows))]
-fn verify_authenticode_with_policy(
-    _path: &Path,
-    _expected_signer: &str,
-    _allow_untrusted_test_root: bool,
-) -> Result<()> {
-    bail!("当前平台不支持 Authenticode 验证")
+/// 自动检查开始时记录本次尝试时间（无论随后成败）。
+pub fn record_automatic_check(data_root: &Path) {
+    let _ = mutate_update_state(data_root, |state| {
+        state.last_automatic_check_at_utc = Some(Utc::now().to_rfc3339());
+    });
+}
+
+pub fn automatic_check_due(last_check_utc: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_check_utc {
+        None => true,
+        Some(last) => {
+            now.signed_duration_since(last)
+                >= chrono::Duration::hours(AUTOMATIC_CHECK_INTERVAL_HOURS)
+        }
+    }
+}
+
+pub fn automatic_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> bool {
+    let last = load_update_state(data_root)
+        .last_automatic_check_at_utc
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    automatic_check_due(last, now)
+}
+
+/// 同一版本是否尚未主动提醒过。
+pub fn should_notify_version(data_root: &Path, version: &str) -> bool {
+    load_update_state(data_root)
+        .last_notified_version
+        .as_deref()
+        != Some(version)
+}
+
+pub fn mark_version_notified(data_root: &Path, version: &str) {
+    let _ = mutate_update_state(data_root, |state| {
+        state.last_notified_version = Some(version.to_owned());
+    });
 }
 
 #[cfg(windows)]
@@ -802,6 +1021,26 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    const TEST_PUBLIC_KEY: &str = include_str!("../tests/fixtures/minisign/test-only.pub");
+    const TEST_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/minisign/update-manifest.json");
+    const TEST_SIGNATURE: &[u8] =
+        include_bytes!("../tests/fixtures/minisign/update-manifest.json.minisig");
+    const TEST_LEGACY_SIGNATURE: &[u8] =
+        include_bytes!("../tests/fixtures/minisign/update-manifest.json.legacy.minisig");
+
+    fn test_public_key() -> minisign_verify::PublicKey {
+        minisign_verify::PublicKey::decode(TEST_PUBLIC_KEY).expect("test public key must parse")
+    }
+
+    fn temp_data_root() -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "stock-ipo-updater-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("create temp data root");
+        root
+    }
+
     #[test]
     fn validated_https_url_rejects_password_only_and_fragment() {
         assert!(
@@ -824,22 +1063,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trusted_public_key_parses_embedded_root() {
+        assert!(trusted_public_key().is_ok());
+    }
+
+    #[test]
+    fn valid_minisign_signature_accepted() {
+        let key = test_public_key();
+        assert!(verify_minisign_signature(TEST_MANIFEST, TEST_SIGNATURE, &key).is_ok());
+    }
+
+    #[test]
+    fn production_key_rejects_test_signature() {
+        let key = trusted_public_key().expect("embedded public key");
+        assert!(verify_minisign_signature(TEST_MANIFEST, TEST_SIGNATURE, &key).is_err());
+    }
+
+    #[test]
+    fn tampered_manifest_rejected() {
+        let key = test_public_key();
+        let mut tampered = TEST_MANIFEST.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = tampered[last].wrapping_add(1);
+        assert!(verify_minisign_signature(&tampered, TEST_SIGNATURE, &key).is_err());
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        let key = test_public_key();
+        let mut tampered = TEST_SIGNATURE.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = tampered[last].wrapping_add(1);
+        assert!(verify_minisign_signature(TEST_MANIFEST, &tampered, &key).is_err());
+    }
+
+    #[test]
+    fn legacy_signature_rejected() {
+        let key = test_public_key();
+        assert!(verify_minisign_signature(TEST_MANIFEST, TEST_LEGACY_SIGNATURE, &key).is_err());
+    }
+
     fn manifest() -> UpdateManifest {
-        UpdateManifest {
-            schema_version: 1,
-            product: "StockIpoReminder".into(),
-            channel: "stable".into(),
-            version: "9.8.7".into(),
-            published_at_utc: "2026-08-26T00:00:00Z".into(),
-            minimum_windows_build: 19041,
-            release_notes_url: Some("RELEASE_NOTES.md".into()),
-            installer: UpdateInstaller {
-                url: "StockIpoReminder-9.8.7-win-x64.msi".into(),
-                sha256: "11".repeat(32),
-                size_bytes: 1024,
-                signer_sha256: "22".repeat(32),
-            },
-        }
+        serde_json::from_slice(TEST_MANIFEST).expect("fixture manifest must parse")
     }
 
     #[test]
@@ -853,55 +1119,221 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_signer_mismatch_and_insecure_url() {
+    fn update_feed_is_fixed_github_stable_https() {
+        let url = validated_https_url(UPDATE_FEED_URL, "更新清单").expect("feed must be valid");
+        assert_eq!(
+            url.as_str(),
+            "https://github.com/melody0709/StockIpoReminder/releases/latest/download/update-manifest.json"
+        );
+    }
+
+    #[test]
+    fn manifest_fixture_passes_validation() {
         let value = manifest();
         let base = Url::parse("https://updates.example.invalid/update-manifest.json").unwrap();
-        assert!(validate_manifest(&value, &base, &"22".repeat(32)).is_ok());
-        assert!(validate_manifest(&value, &base, &"33".repeat(32)).is_err());
+        assert!(validate_manifest(&value, &base).is_ok());
         let insecure = Url::parse("http://updates.example.invalid/update-manifest.json").unwrap();
-        assert!(validate_manifest(&value, &insecure, &"22".repeat(32)).is_err());
+        assert!(validate_manifest(&value, &insecure).is_err());
     }
 
     #[test]
-    fn installer_path_is_scoped_to_update_directory() {
-        let root = PathBuf::from(r"C:\Users\example\AppData\Local\StockIpoReminder");
-        assert!(
-            validate_installer_path(
-                &root,
-                &root
-                    .join("temp")
-                    .join("updates")
-                    .join("StockIpoReminder-0.2.8-win-x64.msi")
-            )
-            .is_ok()
+    fn manifest_rejects_wrong_schema_product_channel_and_fields() {
+        let base = Url::parse("https://updates.example.invalid/update-manifest.json").unwrap();
+        let mut value = manifest();
+        value.schema_version = 1;
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.product = "Other".into();
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.channel = "beta".into();
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.published_at_utc = "2026-09-09 00:00:00".into();
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.installer.url = "StockIpoReminder-0.0.1-win-x64.msi".into();
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.installer.url = "../escape/StockIpoReminder-9.9.9-win-x64.msi".into();
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.installer.sha256 = "zz".repeat(32);
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.installer.size_bytes = 0;
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.installer.size_bytes = INSTALLER_LIMIT + 1;
+        assert!(validate_manifest(&value, &base).is_err());
+        let mut value = manifest();
+        value.minimum_windows_build = u32::MAX;
+        assert!(validate_manifest(&value, &base).is_err());
+    }
+
+    #[test]
+    fn pending_verification_requires_complete_and_matching_installer() {
+        let root = temp_data_root();
+        let pending = pending_directory(&root);
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join(PENDING_MANIFEST_FILE), TEST_MANIFEST).unwrap();
+        fs::write(pending.join(PENDING_SIGNATURE_FILE), TEST_SIGNATURE).unwrap();
+        // 清单版本 9.9.9 高于当前版本；缺少安装包时必须失败。
+        assert!(verify_pending(&root).is_err());
+        let value = manifest();
+        let msi = pending.join(&value.installer.url);
+        // 大小与清单不一致：必须失败。
+        fs::write(&msi, vec![0u8; 16]).unwrap();
+        assert!(verify_pending(&root).is_err());
+        // 大小一致但 SHA-256 与清单不一致：必须失败。
+        fs::write(&msi, vec![0u8; value.installer.size_bytes as usize]).unwrap();
+        assert!(verify_pending(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_directory_is_scoped_under_updates() {
+        let root = PathBuf::from(r"C:\Data\StockIpoReminder");
+        assert_eq!(
+            pending_directory(&root),
+            root.join("updates").join("pending")
         );
-        assert!(
-            validate_installer_path(&root, &root.join("temp").join("..").join("malicious.msi"))
-                .is_err()
+        assert_eq!(
+            pending_installer_file_name("0.3.8"),
+            "StockIpoReminder-0.3.8-win-x64.msi"
         );
     }
 
     #[test]
-    fn each_update_operation_uses_distinct_partial_and_committed_paths() {
+    fn each_update_operation_uses_distinct_partial_path() {
         let directory = PathBuf::from(r"C:\Data\temp\updates");
-        let first = update_download_paths(
+        let first = partial_download_path(
             &directory,
-            "0.3.1",
+            "0.3.8",
             Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
         );
-        let second = update_download_paths(
+        let second = partial_download_path(
             &directory,
-            "0.3.1",
+            "0.3.8",
             Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
         );
         assert_ne!(first, second);
         assert_eq!(
-            first.0.extension().and_then(|value| value.to_str()),
+            first.extension().and_then(|value| value.to_str()),
             Some("part")
         );
+    }
+
+    #[test]
+    fn update_state_roundtrip_and_mutation() {
+        let root = temp_data_root();
+        assert_eq!(load_update_state(&root).pending_version, None);
+        mutate_update_state(&root, |state| {
+            state.pending_version = Some("0.3.8".into());
+            state.last_notified_version = Some("0.3.8".into());
+            state.last_automatic_check_at_utc = Some("2026-09-09T00:00:00Z".into());
+        })
+        .unwrap();
+        let state = load_update_state(&root);
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.pending_version.as_deref(), Some("0.3.8"));
+        assert_eq!(state.last_notified_version.as_deref(), Some("0.3.8"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn automatic_check_throttles_to_24_hours() {
+        let now = Utc::now();
+        assert!(automatic_check_due(None, now));
+        assert!(!automatic_check_due(
+            Some(now - chrono::Duration::hours(23)),
+            now
+        ));
+        assert!(automatic_check_due(
+            Some(now - chrono::Duration::hours(24)),
+            now
+        ));
+        assert!(automatic_check_due(
+            Some(now - chrono::Duration::hours(72)),
+            now
+        ));
+    }
+
+    #[test]
+    fn update_activation_values_are_typed() {
+        assert!(is_update_activation(ACTIVATION_UPDATE_AVAILABLE));
+        assert!(is_update_activation(ACTIVATION_UPDATE_READY));
+        assert!(!is_update_activation("event:abc"));
+        assert!(!is_update_activation(""));
+        assert!(!is_update_activation("update:"));
+    }
+
+    #[test]
+    fn release_notes_url_only_accepts_relative_release_asset() {
+        let mut value = manifest();
+        value.release_notes_url = Some("RELEASE_NOTES.md".into());
         assert_eq!(
-            first.1.extension().and_then(|value| value.to_str()),
-            Some("msi")
+            release_notes_url(&value).as_deref(),
+            Some(
+                "https://github.com/melody0709/StockIpoReminder/releases/latest/download/RELEASE_NOTES.md"
+            )
         );
+        let mut value = manifest();
+        value.release_notes_url = Some("https://evil.example.invalid/notes.md".into());
+        assert!(release_notes_url(&value).is_none());
+        let mut value = manifest();
+        value.release_notes_url = Some("../escape.md".into());
+        assert!(release_notes_url(&value).is_none());
+        let mut value = manifest();
+        value.release_notes_url = Some("".into());
+        assert!(release_notes_url(&value).is_none());
+        let mut value = manifest();
+        value.release_notes_url = None;
+        assert!(release_notes_url(&value).is_none());
+    }
+
+    #[test]
+    fn update_state_tolerates_missing_optional_fields_but_requires_schema() {
+        // Option 字段缺失时 serde 回填 None（未来新增可选字段不破坏旧文件）。
+        let partial: UpdateState = serde_json::from_str(r#"{"schemaVersion":1}"#).unwrap();
+        assert_eq!(partial.schema_version, 1);
+        assert_eq!(partial.last_automatic_check_at_utc, None);
+        assert_eq!(partial.last_notified_version, None);
+        assert_eq!(partial.pending_version, None);
+        // schemaVersion 缺失视为损坏文件，解析必须失败。
+        assert!(serde_json::from_str::<UpdateState>(r#"{"pendingVersion":"0.3.8"}"#).is_err());
+        // 未知 schema 版本可被 serde 解析，但 load_update_state 必须回退默认值。
+        let root = temp_data_root();
+        fs::write(
+            root.join(UPDATE_STATE_FILE),
+            r#"{"schemaVersion":2,"pendingVersion":"9.9.9"}"#,
+        )
+        .unwrap();
+        let state = load_update_state(&root);
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.pending_version, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_pending_files_including_tmp_residue_are_removed() {
+        let root = temp_data_root();
+        let pending = pending_directory(&root);
+        fs::create_dir_all(&pending).unwrap();
+        let keep = pending_installer_file_name("9.9.9");
+        fs::write(pending.join(&keep), b"keep").unwrap();
+        fs::write(pending.join(PENDING_MANIFEST_FILE), b"manifest").unwrap();
+        fs::write(pending.join(PENDING_SIGNATURE_FILE), b"signature").unwrap();
+        let stale_msi = pending.join(pending_installer_file_name("9.8.7"));
+        fs::write(&stale_msi, b"stale").unwrap();
+        let stale_tmp = pending.join(".update-manifest.json.abc123.tmp");
+        fs::write(&stale_tmp, b"residue").unwrap();
+        remove_stale_pending_files(&pending, &keep).unwrap();
+        assert!(pending.join(&keep).is_file());
+        assert!(pending.join(PENDING_MANIFEST_FILE).is_file());
+        assert!(pending.join(PENDING_SIGNATURE_FILE).is_file());
+        assert!(!stale_msi.exists());
+        assert!(!stale_tmp.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

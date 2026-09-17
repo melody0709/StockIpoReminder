@@ -17,13 +17,10 @@ pub(crate) fn install_runtime_ui_bridge(
     reminder_window: slint::Weak<ReminderWindow>,
     runtime: RuntimeHandle,
     data_root: PathBuf,
-    available_update: Arc<Mutex<Option<updater::AvailableUpdate>>>,
-    update_check_busy: Arc<AtomicBool>,
+    update_controller: Arc<UpdateController>,
     crash_upload_busy: Arc<AtomicBool>,
-    update_configured: bool,
     crash_upload_configured: bool,
     skip_auto_start_registration: bool,
-    skip_update_check: bool,
     skip_crash_upload: bool,
     #[cfg(windows)] tray: Arc<native_tray::NativeTray>,
 ) {
@@ -40,8 +37,7 @@ pub(crate) fn install_runtime_ui_bridge(
         let reminder_window = reminder_window.clone();
         let runtime = notifier_runtime.clone();
         let data_root = data_root.clone();
-        let available_update = Arc::clone(&available_update);
-        let update_check_busy = Arc::clone(&update_check_busy);
+        let update_controller = Arc::clone(&update_controller);
         let crash_upload_busy = Arc::clone(&crash_upload_busy);
         let bridge_state = Arc::clone(&bridge_state);
         #[cfg(windows)]
@@ -53,13 +49,10 @@ pub(crate) fn install_runtime_ui_bridge(
                 &reminder_window,
                 &runtime,
                 &data_root,
-                &available_update,
-                &update_check_busy,
+                &update_controller,
                 &crash_upload_busy,
-                update_configured,
                 crash_upload_configured,
                 skip_auto_start_registration,
-                skip_update_check,
                 skip_crash_upload,
                 &bridge_state,
                 #[cfg(windows)]
@@ -100,13 +93,10 @@ pub(crate) fn drain_runtime_ui(
     reminder_window: &slint::Weak<ReminderWindow>,
     runtime: &RuntimeHandle,
     data_root: &PathBuf,
-    available_update: &Arc<Mutex<Option<updater::AvailableUpdate>>>,
-    update_check_busy: &Arc<AtomicBool>,
+    update_controller: &Arc<UpdateController>,
     crash_upload_busy: &Arc<AtomicBool>,
-    update_configured: bool,
     crash_upload_configured: bool,
     skip_auto_start_registration: bool,
-    skip_update_check: bool,
     skip_crash_upload: bool,
     bridge_state: &Arc<Mutex<RuntimeUiBridgeState>>,
     #[cfg(windows)] tray: &Arc<native_tray::NativeTray>,
@@ -166,17 +156,21 @@ pub(crate) fn drain_runtime_ui(
         if !onboarding_completed {
             ui.set_active_page(3);
         }
-        if settings.automatic_updates_enabled && update_configured && !skip_update_check {
-            let update_window = ui.as_weak();
-            let update_state = Arc::clone(available_update);
-            let update_busy = Arc::clone(update_check_busy);
+        // 恢复已验证的待安装更新（ready 状态），损坏的 pending 会被安全清理。
+        update_controller.restore_pending();
+        {
+            // 启动 3 秒后按设置与 24 小时节流执行自动检查。
+            // 定时器闭包只持 Weak：应用快速退出时该定时器可能永不触发，
+            // 其闭包会在主线程 TLS 析构中被 Slint TimerList 释放，届时
+            // 不能让 Arc<UpdateController>（内含托盘句柄）成为最后引用，
+            // 否则托盘线程 join 会发生在 TLS 析构中导致进程崩溃。
+            let controller = Arc::downgrade(update_controller);
+            let startup_settings = settings.clone();
             Timer::single_shot(Duration::from_secs(3), move || {
-                start_update_check(
-                    update_window.clone(),
-                    Arc::clone(&update_state),
-                    Arc::clone(&update_busy),
-                    true,
-                );
+                let Some(controller) = controller.upgrade() else {
+                    return;
+                };
+                controller.auto_check_if_due(&startup_settings);
             });
         }
         if settings.crash_report_upload_enabled && crash_upload_configured && !skip_crash_upload {

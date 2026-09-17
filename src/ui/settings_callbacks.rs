@@ -71,6 +71,7 @@ pub(crate) fn wire_settings_callbacks(
             settings.post_apply_reminders_enabled = ui.get_post_apply_reminders_enabled();
             settings.listing_reminders_enabled = ui.get_listing_reminders_enabled();
             settings.automatic_updates_enabled = ui.get_automatic_updates_enabled();
+            settings.automatic_update_download_enabled = ui.get_automatic_update_download_enabled();
             settings.crash_report_upload_enabled = ui.get_crash_upload_enabled();
             let secondary_provider =
                 secondary_provider_from_index(ui.get_secondary_notification_provider_index());

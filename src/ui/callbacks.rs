@@ -53,9 +53,7 @@ pub(crate) fn wire_callbacks(
     reminder_window: &ReminderWindow,
     runtime: RuntimeHandle,
     data_root: PathBuf,
-    available_update: Arc<Mutex<Option<updater::AvailableUpdate>>>,
-    update_check_busy: Arc<AtomicBool>,
-    update_install_busy: Arc<AtomicBool>,
+    update_controller: Arc<UpdateController>,
     crash_upload_busy: Arc<AtomicBool>,
     secondary_notification_busy: Arc<AtomicBool>,
     #[cfg(windows)] tray: Arc<native_tray::NativeTray>,
@@ -75,13 +73,7 @@ pub(crate) fn wire_callbacks(
     wire_notification_callbacks(ui, reminder_window, runtime.clone(), Arc::clone(&tray));
     #[cfg(not(windows))]
     wire_notification_callbacks(ui, reminder_window, runtime.clone());
-    wire_update_callbacks(
-        ui,
-        data_root.clone(),
-        available_update,
-        update_check_busy,
-        update_install_busy,
-    );
+    wire_update_callbacks(ui, update_controller);
     wire_crash_callbacks(ui, data_root.clone(), crash_upload_busy);
     wire_secondary_callbacks(ui, data_root.clone(), runtime, secondary_notification_busy);
     wire_application_callbacks(ui, data_root);

@@ -122,30 +122,51 @@ try {
     if ([bool]$manifest.signed) {
         Assert-Condition ([string]$manifest.signerSha256 -match '^[0-9a-fA-F]{64}$') 'Signed release manifest has no valid signer SHA-256.'
         Assert-Condition (Test-CredentialFreeHttpsUrl ([string]$manifest.timestampUrl)) 'Signed release manifest has no credential-free HTTPS timestamp URL.'
-        Assert-Condition (Test-CredentialFreeHttpsUrl ([string]$manifest.updateFeedUrl)) 'Signed release manifest has no credential-free HTTPS update feed URL.'
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$manifest.updateManifest)) 'Signed release has no update manifest.'
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$manifest.updateManifestSignature)) 'Signed release has no detached update-manifest signature.'
-        $updateManifestPath = Join-Path $releaseDirectory ([string]$manifest.updateManifest)
-        $updateSignaturePath = Join-Path $releaseDirectory ([string]$manifest.updateManifestSignature)
+        Add-Check 'release.authenticode-explicit' 'Optional Authenticode signing is declared with a signer fingerprint and timestamp URL.'
+    }
+    else {
+        Assert-Condition ([string]::IsNullOrWhiteSpace([string]$manifest.signerSha256)) 'Unsigned release unexpectedly declares a signer fingerprint.'
+        Add-Check 'release.authenticode-absent' 'Release explicitly declares signed=false (no Authenticode certificate).'
+    }
+
+    # Minisign 更新清单与可选 Authenticode 相互独立：signed=false 与
+    # “Minisign 更新签名有效”可以同时成立。清单由本地 sign-update-manifest.ps1
+    # 用仓库外私钥生成，因此这里允许缺席，但只要存在就必须通过全部验证。
+    $updateManifestName = [string]$manifest.updateManifest
+    $updateSignatureName = [string]$manifest.updateManifestSignature
+    $updateSignatureAlgorithm = [string]$manifest.updateSignatureAlgorithm
+    $updatePublicKeyId = [string]$manifest.updatePublicKeyId
+    if (-not [string]::IsNullOrWhiteSpace($updateManifestName)) {
+        Assert-Condition ($updateSignatureAlgorithm -eq 'minisign') 'Update signature algorithm must be minisign.'
+        Assert-Condition ($updateManifestName -eq 'update-manifest.json') 'Unexpected update manifest name.'
+        Assert-Condition ($updateSignatureName -eq 'update-manifest.json.minisig') 'Unexpected update signature name.'
+        Assert-Condition ($updatePublicKeyId -match '^[0-9a-f]{16}$') 'Update public key id must be 16 hex characters.'
+        $updateManifestPath = Join-Path $releaseDirectory $updateManifestName
+        $updateSignaturePath = Join-Path $releaseDirectory $updateSignatureName
         Assert-Condition (Test-Path -LiteralPath $updateManifestPath -PathType Leaf) 'Signed update manifest is missing.'
         Assert-Condition (Test-Path -LiteralPath $updateSignaturePath -PathType Leaf) 'Signed update manifest signature is missing.'
+        $repositoryPublicKey = Join-Path $workspace 'assets\update-signing\stock-ipo-update.pub'
+        Assert-Condition (Test-Path -LiteralPath $repositoryPublicKey -PathType Leaf) 'Repository Minisign public key is missing.'
+        # 用与客户端编译内置相同的信任根复核签名。
+        & minisign -V -q -m $updateManifestPath -x $updateSignaturePath -p $repositoryPublicKey
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Update manifest Minisign signature failed verification against the repository public key.'
+        # 再让发布 EXE 用自身验证管线复核清单、安装包名称、大小和哈希。
         $signedUpdateReport = Join-Path $auditRoot 'signed-update-bundle.json'
         $verifyProcess = Start-Process -FilePath $appPath -ArgumentList @(
             '--update-bundle-self-test',
             '--manifest', $updateManifestPath,
             '--signature', $updateSignaturePath,
             '--installer', $msiPath,
-            '--signer', ([string]$manifest.signerSha256),
+            '--public-key', $repositoryPublicKey,
             '--report', $signedUpdateReport) -PassThru -Wait -WindowStyle Hidden
         Assert-Condition ($verifyProcess.ExitCode -eq 0) 'Signed release update bundle failed application verification.'
         $signedUpdateResult = Get-Content -Raw -Encoding UTF8 -LiteralPath $signedUpdateReport | ConvertFrom-Json
         Assert-Condition ([bool]$signedUpdateResult.success) 'Signed release update bundle report failed.'
-        Add-Check 'release.signed-update-bundle' 'EXE/MSI signature metadata and detached-CMS update bundle were verified by the application.'
+        Add-Check 'release.minisign-update-bundle' 'Detached Minisign update manifest was verified by minisign and by the release executable against the repository trust root.'
     }
     else {
-        Assert-Condition ([string]::IsNullOrWhiteSpace([string]$manifest.signerSha256)) 'Unsigned release unexpectedly declares a signer fingerprint.'
-        Assert-Condition ([string]::IsNullOrWhiteSpace([string]$manifest.updateManifest)) 'Unsigned release unexpectedly declares a signed update manifest.'
-        Add-Check 'release.unsigned-explicit' 'Release explicitly declares signed=false and does not publish a trusted update manifest.'
+        Assert-Condition ([string]::IsNullOrWhiteSpace($updateSignatureName)) 'Update signature is declared without an update manifest.'
+        Add-Check 'release.update-manifest-absent' 'Release directory has no signed update manifest yet; run scripts/sign-update-manifest.ps1 before publishing a stable release.'
     }
 
     $crashReportUrl = [string]$manifest.crashReportUrl
@@ -215,11 +236,13 @@ try {
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($SigningUpdateReportPath)) 'Signing/update integration report was not found.'
     $signingUpdate = Get-Content -Raw -Encoding UTF8 -LiteralPath $SigningUpdateReportPath | ConvertFrom-Json
     Assert-Condition ([bool]$signingUpdate.success) 'Signing/update integration test failed.'
-    Assert-Condition ([bool]$signingUpdate.checks.authenticodeSignatureValidatedWithEphemeralRoot) 'Authenticode signature integration check failed.'
-    Assert-Condition ([bool]$signingUpdate.checks.productionSystemTrustStillRequired) 'Signing integration must not claim that the ephemeral test root is production-trusted.'
-    Assert-Condition ([bool]$signingUpdate.checks.detachedCmsAccepted) 'Detached-CMS integration check failed.'
+    Assert-Condition ([bool]$signingUpdate.checks.minisignPrehashedAccepted) 'Minisign pre-hashed signature integration check failed.'
     Assert-Condition ([bool]$signingUpdate.checks.tamperedManifestRejected) 'Tampered update manifest was not rejected.'
-    Add-Check 'evidence.signing-update' 'Ephemeral code-signing integration verified the Authenticode signature, detached CMS, signer pinning, installer hash, and tamper rejection; production still requires a system-trusted CA certificate.'
+    Assert-Condition ([bool]$signingUpdate.checks.wrongKeyRejected) 'Wrong-key signature was not rejected.'
+    Assert-Condition ([bool]$signingUpdate.checks.productionRootRejectsTestKey) 'Production trust root must never accept test-key signatures.'
+    Assert-Condition ([bool]$signingUpdate.checks.legacySignatureRejected) 'Legacy (non pre-hashed) signature was not rejected.'
+    Assert-Condition ([bool]$signingUpdate.checks.tamperedInstallerRejected) 'Tampered installer was not rejected.'
+    Add-Check 'evidence.signing-update' 'Ephemeral Minisign integration verified pre-hashed signature acceptance plus tamper, wrong-key, legacy, and installer-hash rejection; the production trust root stays pinned to the repository public key.'
     Add-Check 'evidence.windows-smoke' 'Rust UI, SQLite, dedicated no-focus reminder window, second-launch activation, Explorer tray re-registration, debounced Windows recovery messages, Windows Time and Toast diagnostics, DPAPI-protected persistent secondary notifications, MSI AUMID, safe-uninstall and signed-update authoring, MSI administrative extraction, selectable directory authoring, and sub-100MB idle memory smoke passed.'
 
     $report = [ordered]@{

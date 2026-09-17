@@ -189,7 +189,13 @@ impl NativeTray {
                         super::refresh_ui(&window, &runtime);
                         super::show_and_repaint(&window);
                         if let Some(event_id) = event_id.filter(|value| !value.is_empty()) {
-                            super::show_event_details(&window, &runtime, &event_id);
+                            if crate::updater::is_update_activation(&event_id) {
+                                // 更新通知只打开设置页的更新区域，不进入股票详情。
+                                window.set_active_page(3);
+                                window.set_settings_section(3);
+                            } else {
+                                super::show_event_details(&window, &runtime, &event_id);
+                            }
                         }
                     }
                 });

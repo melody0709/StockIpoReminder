@@ -15,6 +15,7 @@
 - Format Rust changes with `rtk cargo fmt`.
 - Run `rtk cargo test` for changes that affect Rust, Slint, settings, storage, synchronization, or packaging behavior.
 - Keep user-facing documentation and `RELEASE_NOTES.md` consistent with behavior changes.
+- Record every notable change in `CHANGELOG.md`: add it to the `[未发布]` section, then promote that section to `## <version> — <date>` when the release is cut.
 - Do not manually duplicate the version in the UI; read it from `CARGO_PKG_VERSION`.
 
 ## Required release outputs

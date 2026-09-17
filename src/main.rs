@@ -178,9 +178,6 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
             .into(),
     );
     refresh_ui(&ui, &runtime);
-    let available_update = Arc::new(Mutex::new(None::<updater::AvailableUpdate>));
-    let update_check_busy = Arc::new(AtomicBool::new(false));
-    let update_install_busy = Arc::new(AtomicBool::new(false));
     let crash_upload_busy = Arc::new(AtomicBool::new(false));
     let secondary_notification_busy = Arc::new(AtomicBool::new(false));
 
@@ -195,15 +192,23 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         .context("无法创建 windows-rs 系统托盘")?,
     );
 
+    let update_controller = Arc::new(UpdateController::new(
+        ui.as_weak(),
+        options.data_root.clone(),
+        runtime.clone(),
+        update_configured,
+        options.skip_update_check,
+        #[cfg(windows)]
+        Arc::clone(&tray),
+    ));
+
     #[cfg(windows)]
     wire_callbacks(
         &ui,
         &reminder_window,
         runtime.clone(),
         options.data_root.clone(),
-        Arc::clone(&available_update),
-        Arc::clone(&update_check_busy),
-        Arc::clone(&update_install_busy),
+        Arc::clone(&update_controller),
         Arc::clone(&crash_upload_busy),
         Arc::clone(&secondary_notification_busy),
         Arc::clone(&tray),
@@ -214,9 +219,7 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         &reminder_window,
         runtime.clone(),
         options.data_root.clone(),
-        Arc::clone(&available_update),
-        Arc::clone(&update_check_busy),
-        Arc::clone(&update_install_busy),
+        Arc::clone(&update_controller),
         Arc::clone(&crash_upload_busy),
         Arc::clone(&secondary_notification_busy),
     );
@@ -227,17 +230,16 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         reminder_window.as_weak(),
         runtime.clone(),
         options.data_root.clone(),
-        Arc::clone(&available_update),
-        Arc::clone(&update_check_busy),
+        Arc::clone(&update_controller),
         Arc::clone(&crash_upload_busy),
-        update_configured,
         crash_upload_configured,
         options.skip_auto_start_registration,
-        options.skip_update_check,
         options.skip_crash_upload,
         #[cfg(windows)]
         Arc::clone(&tray),
     );
+    // 长驻期间每小时的周期性自动检查入口；绑定必须保持存活（下划线前缀不丢弃）。
+    let update_recheck_timer = update_controller.start_recheck_timer();
     let window_size_timer = start_main_window_size_persistence(
         ui.as_weak(),
         options.data_root.clone(),
@@ -281,6 +283,7 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     // terminate Slint's event loop. Only an explicit quit action should exit.
     let run_result = slint::run_event_loop_until_quit().context("Slint 事件循环异常");
     window_size_timer.stop();
+    update_recheck_timer.stop();
     persist_main_window_size(&ui, &options.data_root);
     let _ = ui.hide();
     let _ = reminder_window.hide();

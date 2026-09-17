@@ -1,6 +1,7 @@
 # 零费用 GitHub MSI + SignPath 一键发布与安全更新方案
 
-- 状态：已选定路线，尚未开始实施
+- 状态：已废弃；SignPath Foundation 申请未通过，后续改用无需 CA 证书的自建 Minisign/Ed25519 更新签名
+- 替代方案：`.plan/feat/certificate-free-minisign-auto-update.md`
 - 记录日期：2026-09-02
 - 产品版本事实来源：`Cargo.toml`（当前工作区为 `0.3.7`）
 - 已确认路线：零费用 + GitHub Release + MSI + SignPath
@@ -295,4 +296,3 @@ rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/validate-build-layout.
 | 每次正式签名批准 | 在 SignPath 的项目批准流程中确认 | 项目维护者 |
 
 其余工作——源码改造、密钥生成辅助工具、GitHub Actions、SignPath 接入模板、测试、Release 草稿与文档——均可由项目内实施完成。
-
