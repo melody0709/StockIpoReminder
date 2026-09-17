@@ -297,7 +297,9 @@ try {
     $checks.secondLaunchActivatesExistingInstance = $true
 
     $restoreConfirmed = $false
-    $restoreDeadline = [DateTimeOffset]::UtcNow.AddSeconds(3)
+    # 8 秒而非 3 秒：紧跟 release 构建或机器负载高时，窗口尺寸恢复的日志
+    # 可能晚于 3 秒才出现，之前的 3 秒窗口会在这种情况下误报失败。
+    $restoreDeadline = [DateTimeOffset]::UtcNow.AddSeconds(8)
     do {
         if ($null -ne $logPath) {
             try {
