@@ -222,7 +222,7 @@ impl Default for AppSettings {
             daily_health_summary_enabled: true,
             post_apply_reminders_enabled: true,
             listing_reminders_enabled: true,
-            automatic_updates_enabled: false,
+            automatic_updates_enabled: true,
             automatic_update_download_enabled: false,
             crash_report_upload_enabled: false,
             secondary_notification_enabled: false,

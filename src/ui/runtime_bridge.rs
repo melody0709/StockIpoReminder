@@ -170,7 +170,7 @@ pub(crate) fn drain_runtime_ui(
                 let Some(controller) = controller.upgrade() else {
                     return;
                 };
-                controller.auto_check_if_due(&startup_settings);
+                controller.auto_check_if_due(&startup_settings, true);
             });
         }
         if settings.crash_report_upload_enabled && crash_upload_configured && !skip_crash_upload {

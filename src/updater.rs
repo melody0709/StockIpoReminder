@@ -41,9 +41,13 @@ const INSTALLER_LIMIT: u64 = 200 * 1024 * 1024;
 const UPDATE_STATE_FILE: &str = "update-state.json";
 const PENDING_MANIFEST_FILE: &str = "update-manifest.json";
 const PENDING_SIGNATURE_FILE: &str = "update-manifest.json.minisig";
-/// 自动检查的最小间隔（小时）；手动检查不受此限制。
+/// 周期性自动检查的最小间隔（小时）；手动检查不受此限制。
 /// 与进程内成功缓存同周期：每天最多 4 次真实网络检查。
 const AUTOMATIC_CHECK_INTERVAL_HOURS: i64 = 6;
+/// 启动时自动检查的最小间隔（分钟）。
+/// 周期阈值仍是 6 小时，但**每次启动都重新检查**；唯一例外是距上次检查不足
+/// 10 分钟，用来兜住 Watchdog 崩溃重启循环造成的连续请求。
+const STARTUP_CHECK_INTERVAL_MINUTES: i64 = 10;
 /// 清单校验成功结果的进程内缓存时长；命中缓存不发网络请求。
 const CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// 等待 Watchdog 释放 supervisor 锁的上限；超时取消安装而不是依赖固定睡眠。
@@ -1020,22 +1024,43 @@ pub fn record_automatic_check(data_root: &Path) {
 }
 
 pub fn automatic_check_due(last_check_utc: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    due_within(last_check_utc, now, AUTOMATIC_CHECK_INTERVAL_HOURS)
+}
+
+/// 启动路径使用的到期判断：阈值更短，避免「刚检查完就发布新版本」让用户
+/// 一直等满整个周期（这也让反复重启最多每小时一次真实网络检查）。
+pub fn startup_check_due(last_check_utc: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     match last_check_utc {
         None => true,
         Some(last) => {
             now.signed_duration_since(last)
-                >= chrono::Duration::hours(AUTOMATIC_CHECK_INTERVAL_HOURS)
+                >= chrono::Duration::minutes(STARTUP_CHECK_INTERVAL_MINUTES)
         }
     }
 }
 
-pub fn automatic_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> bool {
-    let last = load_update_state(data_root)
+fn due_within(last_check_utc: Option<DateTime<Utc>>, now: DateTime<Utc>, hours: i64) -> bool {
+    match last_check_utc {
+        None => true,
+        Some(last) => now.signed_duration_since(last) >= chrono::Duration::hours(hours),
+    }
+}
+
+fn last_automatic_check(data_root: &Path) -> Option<DateTime<Utc>> {
+    load_update_state(data_root)
         .last_automatic_check_at_utc
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc));
-    automatic_check_due(last, now)
+        .map(|value| value.with_timezone(&Utc))
+}
+
+pub fn automatic_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> bool {
+    automatic_check_due(last_automatic_check(data_root), now)
+}
+
+/// 启动时的自动检查到期判断（1 小时阈值）。
+pub fn startup_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> bool {
+    startup_check_due(last_automatic_check(data_root), now)
 }
 
 /// 该版本是否已被用户「稍后」隐藏；更高版本出现时应重新展示。
@@ -1393,6 +1418,30 @@ mod tests {
         ));
         assert!(automatic_check_due(
             Some(now - chrono::Duration::hours(72)),
+            now
+        ));
+    }
+
+    #[test]
+    fn startup_check_rechecks_after_restart_but_throttles_crash_loops() {
+        let now = Utc::now();
+        assert!(startup_check_due(None, now));
+        // 周期阈值（6 小时）会拦住的场景，重启必须放行。
+        assert!(!automatic_check_due(
+            Some(now - chrono::Duration::minutes(30)),
+            now
+        ));
+        assert!(startup_check_due(
+            Some(now - chrono::Duration::minutes(30)),
+            now
+        ));
+        // Watchdog 崩溃重启循环仍被 10 分钟地板挡住。
+        assert!(!startup_check_due(
+            Some(now - chrono::Duration::minutes(9)),
+            now
+        ));
+        assert!(startup_check_due(
+            Some(now - chrono::Duration::minutes(10)),
             now
         ));
     }

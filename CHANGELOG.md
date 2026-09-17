@@ -16,10 +16,20 @@
 
 （暂无）
 
+## 0.4.2 — 2026-09-17
+
+### 变更
+
+- 仅提升版本号，代码与 0.4.1 相同；用于在 0.4.1 上验证「一次点击完成下载、安装并重启到托盘」的完整闭环。
+- 发布流程备忘：0.4.1 的首次发布缺少启动即检查的修复，已删除并用重新构建、重新签名的产物替换（旧 0.4.1 从未被安装），再发布 0.4.2 作为升级目标。
+
 ## 0.4.1 — 2026-09-17
 
 ### 修复
 
+- **启动检查不再被 6 小时节流吞掉**：新增 `STARTUP_CHECK_INTERVAL_MINUTES = 10` 与 `updater::startup_check_due`，启动路径改用 10 分钟地板（正常重启必定检查，崩溃重启循环仍被限制），周期路径继续用 `AUTOMATIC_CHECK_INTERVAL_HOURS = 6`；`UpdateController::auto_check_if_due` 增加 `startup` 参数，`runtime_bridge` 启动路径传 `true`、周期定时器传 `false`。问题背景：0.4.0 上唯一一次自动检查发生在 18:05，而 0.4.1 于 18:13 发布，用户重启多次也因持久化节流不再检查。
+- `AppSettings::automatic_updates_enabled` 默认值 `false` → `true`（检查已静默，新装即可发现更新；仍可在设置页关闭）。
+- 版本徽标增加悬停高亮（`hover-touch.has-hover`），提示它是可点击的手动检查入口。
 - 「后续提醒与启动」卡片高度由 132px（正好等于内容高度）调整为宽窗口 152px / 窄窗口 216px，修掉窄窗口下 4 个开关被裁切的问题；「启用市场」卡片窄窗口 176px → 184px，两张卡片在宽窗口下保持等高。
 - 缩短三处过长开关文案（交易时段健康摘要 / 中签与缴款提醒 / 开机自动启动），避免 `Toggle` 内 `overflow: elide` 截断。
 - 托盘右键菜单新增「打开发布页 (GitHub Release)」：`updater::release_page_url()` 改为公开，托盘回调通过 `windows_integration::open_external` 打开固定发布页（失败只写脱敏日志）。

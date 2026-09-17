@@ -116,13 +116,20 @@ impl UpdateController {
         }
     }
 
-    /// 自动检查（含启动与驻留周期）：读取设置与节流后才发起；手动检查不受节流限制。
-    pub(crate) fn auto_check_if_due(self: &Arc<Self>, settings: &AppSettings) {
+    /// 自动检查（启动或驻留周期）：读取设置与节流后才发起；手动检查不受节流限制。
+    /// 启动路径使用更短的阈值，避免「刚检查完就发布新版本」让用户干等一个周期。
+    pub(crate) fn auto_check_if_due(self: &Arc<Self>, settings: &AppSettings, startup: bool) {
         if !settings.automatic_updates_enabled || !self.update_configured || self.skip_update_check
         {
             return;
         }
-        if !updater::automatic_check_due_from_state(&self.data_root, chrono::Utc::now()) {
+        let now = chrono::Utc::now();
+        let due = if startup {
+            updater::startup_check_due_from_state(&self.data_root, now)
+        } else {
+            updater::automatic_check_due_from_state(&self.data_root, now)
+        };
+        if !due {
             return;
         }
         // 自动检查开始时即记录本次尝试时间；失败也等待下一个周期。
@@ -434,7 +441,7 @@ impl UpdateController {
                     return;
                 };
                 std::thread::spawn(move || match controller.runtime.settings() {
-                    Ok(settings) => controller.auto_check_if_due(&settings),
+                    Ok(settings) => controller.auto_check_if_due(&settings, false),
                     Err(error) => {
                         operations::log("WARN", &format!("更新周期检查读取设置失败：{error:#}"))
                     }
