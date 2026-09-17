@@ -1093,8 +1093,8 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 Rectangle {
-                                    min-height: 240px;
-                                    max-height: 240px;
+                                    min-height: root.compact-width ? 330px : 276px;
+                                    max-height: root.compact-width ? 330px : 276px;
                                     border-radius: 9px;
                                     border-width: 1px;
                                     border-color: #26334a;
@@ -1106,7 +1106,6 @@ export component MainWindow inherits Window {
                                         Text { text: "当前版本 " + root.app-version + (root.update-version == "" ? "" : "　可用版本 " + root.update-version); color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                                         Text { text: root.update-status; color: root.update-ready || root.update-available ? #86efac : root.update-configured ? #cbd5e1 : #94a3b8; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
                                         HorizontalBox {
-                                            height: 34px;
                                             spacing: 10px;
                                             Toggle { label: "启动时及每日自动检查稳定版更新"; checked <=> root.automatic-updates-enabled; enabled: root.update-configured; }
                                             Rectangle { horizontal-stretch: 1; }
@@ -1115,7 +1114,6 @@ export component MainWindow inherits Window {
                                             ActionButton { label: root.update-version == "" ? "重启并更新" : "重启并更新至 " + root.update-version; compact: root.compact-width; primary: true; enabled: root.update-ready; clicked => { root.install-update(); } }
                                         }
                                         HorizontalBox {
-                                            height: 34px;
                                             spacing: 10px;
                                             Toggle { label: "发现更新后自动下载（默认关闭）"; checked <=> root.automatic-update-download-enabled; enabled: root.update-configured; }
                                             Rectangle { horizontal-stretch: 1; }
