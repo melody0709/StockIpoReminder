@@ -926,8 +926,8 @@ export component MainWindow inherits Window {
                                 if !root.compact-width : HorizontalBox {
                                     spacing: 10px;
                                     Rectangle {
-                                        min-height: 132px;
-                                        max-height: 132px;
+                                        min-height: 152px;
+                                        max-height: 152px;
                                         horizontal-stretch: 1;
                                         border-radius: 9px;
                                         border-width: 1px;
@@ -946,8 +946,8 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     Rectangle {
-                                        min-height: 132px;
-                                        max-height: 132px;
+                                        min-height: 152px;
+                                        max-height: 152px;
                                         horizontal-stretch: 1;
                                         border-radius: 9px;
                                         border-width: 1px;
@@ -959,20 +959,20 @@ export component MainWindow inherits Window {
                                             Text { text: "后续提醒与启动"; color: #f8fafc; font-size: 18px; font-weight: 600; }
                                             HorizontalBox {
                                                 spacing: 8px;
-                                                Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; horizontal-stretch: 1; }
-                                                Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "交易时段健康摘要"; checked <=> root.health-summary-enabled; horizontal-stretch: 1; }
+                                                Toggle { label: "中签与缴款提醒"; checked <=> root.post-apply-reminders-enabled; horizontal-stretch: 1; }
                                             }
                                             HorizontalBox {
                                                 spacing: 8px;
                                                 Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; horizontal-stretch: 1; }
-                                                Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; horizontal-stretch: 1; }
+                                                Toggle { label: "开机自动启动"; checked <=> root.auto-start; horizontal-stretch: 1; }
                                             }
                                         }
                                     }
                                 }
                                 if root.compact-width : Rectangle {
-                                    min-height: 176px;
-                                    max-height: 176px;
+                                    min-height: 184px;
+                                    max-height: 184px;
                                     border-radius: 9px;
                                     border-width: 1px;
                                     border-color: #26334a;
@@ -987,8 +987,8 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 if root.compact-width : Rectangle {
-                                    min-height: 176px;
-                                    max-height: 176px;
+                                    min-height: 216px;
+                                    max-height: 216px;
                                     border-radius: 9px;
                                     border-width: 1px;
                                     border-color: #26334a;
@@ -997,10 +997,10 @@ export component MainWindow inherits Window {
                                         padding: 12px;
                                         spacing: 8px;
                                         Text { text: "后续提醒与启动"; color: #f8fafc; font-size: 18px; font-weight: 600; }
-                                        Toggle { label: "今日有申购任务时交易时段健康摘要"; checked <=> root.health-summary-enabled; }
-                                        Toggle { label: "中签查询与缴款资金提醒"; checked <=> root.post-apply-reminders-enabled; }
+                                        Toggle { label: "交易时段健康摘要"; checked <=> root.health-summary-enabled; }
+                                        Toggle { label: "中签与缴款提醒"; checked <=> root.post-apply-reminders-enabled; }
                                         Toggle { label: "上市日提醒"; checked <=> root.listing-reminders-enabled; }
-                                        Toggle { label: "登录 Windows 后自动启动"; checked <=> root.auto-start; }
+                                        Toggle { label: "开机自动启动"; checked <=> root.auto-start; }
                                     }
                                 }
                                 Rectangle {

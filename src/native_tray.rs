@@ -53,6 +53,7 @@ const TODAY_COMMAND: usize = 1005;
 const FUTURE_COMMAND: usize = 1006;
 const LOGS_COMMAND: usize = 1007;
 const UPDATE_COMMAND: usize = 1008;
+const RELEASE_COMMAND: usize = 1009;
 const ICON_ID: u32 = 1;
 
 struct Callbacks {
@@ -64,6 +65,7 @@ struct Callbacks {
     notification: Box<dyn Fn(Option<String>) + Send + Sync>,
     sync: Box<dyn Fn() + Send + Sync>,
     update: Box<dyn Fn() + Send + Sync>,
+    release: Box<dyn Fn() + Send + Sync>,
     settings: Box<dyn Fn() + Send + Sync>,
     exit: Box<dyn Fn() + Send + Sync>,
     recovery: Box<dyn Fn() + Send + Sync>,
@@ -216,6 +218,20 @@ impl NativeTray {
                         super::show_and_repaint(&window);
                     }
                 });
+            }),
+            release: Box::new(|| match crate::updater::release_page_url() {
+                Ok(url) => {
+                    if let Err(error) = windows_integration::open_external(url.as_str()) {
+                        crate::operations::log(
+                            "WARN",
+                            &format!("从托盘打开发布页失败：{error:#}"),
+                        );
+                    }
+                }
+                Err(error) => crate::operations::log(
+                    "WARN",
+                    &format!("发布页地址不可用：{error:#}"),
+                ),
             }),
             sync: Box::new(move || sync_runtime.request_sync("托盘手动同步")),
             settings: Box::new(move || {
@@ -674,6 +690,11 @@ unsafe extern "system" fn window_proc(
                         (callbacks.update)();
                     }
                 }
+                RELEASE_COMMAND => {
+                    if let Some(callbacks) = CALLBACKS.get() {
+                        (callbacks.release)();
+                    }
+                }
                 EXIT_COMMAND => {
                     if let Some(callbacks) = CALLBACKS.get() {
                         (callbacks.exit)();
@@ -739,6 +760,12 @@ unsafe fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, TODAY_COMMAND, w!("今日任务"));
         let _ = AppendMenuW(menu, MF_STRING, FUTURE_COMMAND, w!("未来 60 天"));
         let _ = AppendMenuW(menu, MF_STRING, LOGS_COMMAND, w!("打开日志目录"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            RELEASE_COMMAND,
+            w!("打开发布页 (GitHub Release)"),
+        );
         // 有可执行更新时插入一项被动入口：不弹任何通知，只在菜单里提示。
         let badge = UPDATE_BADGE
             .get_or_init(|| Mutex::new(None))

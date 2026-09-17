@@ -1095,7 +1095,8 @@ pub fn higher_release_version(tag: &str) -> Option<String> {
     (ordering == std::cmp::Ordering::Greater).then(|| version.to_owned())
 }
 
-fn release_page_url() -> Result<Url> {
+/// 固定发布页地址（托盘菜单与手动下载入口共用）。
+pub fn release_page_url() -> Result<Url> {
     let feed = validated_https_url(UPDATE_FEED_URL, "更新清单")?;
     let mut segments = feed
         .path_segments()
