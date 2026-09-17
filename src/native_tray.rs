@@ -52,6 +52,7 @@ const EXIT_COMMAND: usize = 1004;
 const TODAY_COMMAND: usize = 1005;
 const FUTURE_COMMAND: usize = 1006;
 const LOGS_COMMAND: usize = 1007;
+const UPDATE_COMMAND: usize = 1008;
 const ICON_ID: u32 = 1;
 
 struct Callbacks {
@@ -62,6 +63,7 @@ struct Callbacks {
     logs: Box<dyn Fn() + Send + Sync>,
     notification: Box<dyn Fn(Option<String>) + Send + Sync>,
     sync: Box<dyn Fn() + Send + Sync>,
+    update: Box<dyn Fn() + Send + Sync>,
     settings: Box<dyn Fn() + Send + Sync>,
     exit: Box<dyn Fn() + Send + Sync>,
     recovery: Box<dyn Fn() + Send + Sync>,
@@ -70,6 +72,8 @@ struct Callbacks {
 static CALLBACKS: OnceLock<Callbacks> = OnceLock::new();
 static LAST_NOTIFICATION_EVENT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LAST_RECOVERY: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// 有可执行更新时的托盘菜单徽标文本；由 UpdateController 推送。
+static UPDATE_BADGE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static TOAST_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 static ACTIVATE_INSTANCE_MESSAGE: AtomicU32 = AtomicU32::new(0);
@@ -101,11 +105,13 @@ impl NativeTray {
         let future_window = window.clone();
         let notification_window = window.clone();
         let settings_window = window.clone();
+        let update_window = window.clone();
         let exit_window = window;
         let show_runtime = runtime.clone();
         let activation_runtime = runtime.clone();
         let today_runtime = runtime.clone();
         let future_runtime = runtime.clone();
+        let update_runtime = runtime.clone();
         let settings_runtime = runtime.clone();
         let sync_runtime = runtime.clone();
         let notification_runtime = runtime.clone();
@@ -197,6 +203,17 @@ impl NativeTray {
                                 super::show_event_details(&window, &runtime, &event_id);
                             }
                         }
+                    }
+                });
+            }),
+            update: Box::new(move || {
+                let weak = update_window.clone();
+                let runtime = update_runtime.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak.upgrade() {
+                        super::refresh_ui(&window, &runtime);
+                        window.set_active_page(0);
+                        super::show_and_repaint(&window);
                     }
                 });
             }),
@@ -297,6 +314,14 @@ impl NativeTray {
         copy_wide(body, &mut data.szInfo);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
+
+    /// 推送托盘右键菜单里的更新徽标；`None` 清除该项。
+    /// 只改菜单文本，不弹 Toast 或气泡，符合「更新不打扰」的策略。
+    pub fn set_update_badge(&self, version: Option<&str>) {
+        if let Ok(mut badge) = UPDATE_BADGE.get_or_init(|| Mutex::new(None)).lock() {
+            *badge = version.map(str::to_owned);
         }
     }
 
@@ -541,6 +566,10 @@ fn create_icon_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
     Ok(data)
 }
 
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
 fn copy_wide(value: &str, target: &mut [u16]) {
     let source: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
     let count = source.len().min(target.len());
@@ -640,6 +669,11 @@ unsafe extern "system" fn window_proc(
                         (callbacks.settings)();
                     }
                 }
+                UPDATE_COMMAND => {
+                    if let Some(callbacks) = CALLBACKS.get() {
+                        (callbacks.update)();
+                    }
+                }
                 EXIT_COMMAND => {
                     if let Some(callbacks) = CALLBACKS.get() {
                         (callbacks.exit)();
@@ -705,6 +739,21 @@ unsafe fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, TODAY_COMMAND, w!("今日任务"));
         let _ = AppendMenuW(menu, MF_STRING, FUTURE_COMMAND, w!("未来 60 天"));
         let _ = AppendMenuW(menu, MF_STRING, LOGS_COMMAND, w!("打开日志目录"));
+        // 有可执行更新时插入一项被动入口：不弹任何通知，只在菜单里提示。
+        let badge = UPDATE_BADGE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        if let Some(version) = badge {
+            let label = wide_null(&format!("发现新版本 {version}，点击查看"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                UPDATE_COMMAND,
+                windows::core::PCWSTR(label.as_ptr()),
+            );
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
         let _ = AppendMenuW(menu, MF_STRING, SYNC_COMMAND, w!("立即同步"));
         let _ = AppendMenuW(menu, MF_STRING, SETTINGS_COMMAND, w!("提醒设置"));

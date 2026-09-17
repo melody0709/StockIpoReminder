@@ -355,6 +355,7 @@ try {
             ForEach-Object { Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName }
     ) -join "`n"
     $buildSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-release.ps1')
+    $updateControllerSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'src\ui\background_operations.rs')
     $mainUiSource = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'ui\main.slint')
     Assert-Condition ($packageSource -match 'ProgramFiles64Folder') 'MSI does not default to 64-bit Program Files.'
     Assert-Condition ($packageSource -match 'RegistrySearch') 'MSI does not remember the selected install directory.'
@@ -380,9 +381,21 @@ try {
         $mainUiSource.Contains('automatic-updates-enabled') -and
         $mainUiSource.Contains('automatic-update-download-enabled') -and
         $mainUiSource.Contains('check-for-updates') -and
-        $mainUiSource.Contains('download-update') -and
-        $mainUiSource.Contains('install-update')) `
-        'Settings UI does not expose the signed update workflow with the separate auto-download consent.'
+        $mainUiSource.Contains('request-update') -and
+        $mainUiSource.Contains('dismiss-update') -and
+        $mainUiSource.Contains('update-pill-visible')) `
+        'UI does not expose the one-click signed update workflow with the separate auto-download consent.'
+    Assert-Condition (
+        $updateControllerSource.Contains('DownloadTrigger::OneClick') -and
+        $updateControllerSource.Contains('consume_upgrade_receipt') -and
+        $updateControllerSource.Contains('probe_latest_release_tag')) `
+        'Update controller does not implement one-click install, the upgrade receipt, or the read-only release fallback.'
+    Assert-Condition (-not ($updateControllerSource -match '\.notify\(|notify_balloon')) 'Update flow must not raise Toast or balloon notifications.'
+    Assert-Condition (
+        $updaterSource.Contains('CHECK_CACHE_TTL') -and
+        $updaterSource.Contains('check_for_update_with_cache')) `
+        'Updater does not implement the successful-check cache.'
+    Assert-Condition ($updaterSource.Contains('banner_dismissed_version')) 'Updater does not persist the per-version dismissal.'
     Assert-Condition (
         $crashUploadSource.Contains('STOCK_IPO_CRASH_REPORT_PRIVACY_URL') -and
         $crashUploadSource.Contains('Policy::none()') -and

@@ -238,8 +238,10 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
         #[cfg(windows)]
         Arc::clone(&tray),
     );
-    // 长驻期间每小时的周期性自动检查入口；绑定必须保持存活（下划线前缀不丢弃）。
+    // 长驻期间的周期性自动检查入口；绑定必须保持存活（下划线前缀不丢弃）。
     let update_recheck_timer = update_controller.start_recheck_timer();
+    // 上一次由 helper 完成的升级在新版首次启动时做一次性回执。
+    update_controller.show_startup_receipt();
     let window_size_timer = start_main_window_size_persistence(
         ui.as_weak(),
         options.data_root.clone(),

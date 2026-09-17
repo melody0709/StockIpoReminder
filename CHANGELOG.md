@@ -16,6 +16,24 @@
 
 （暂无）
 
+## 0.4.0 — 2026-09-17
+
+### 新增 / 变更
+
+- **更新通知全部去掉**：`UpdateController` 不再调用 `tray.notify`，更新流程不再读取 `toast_enabled`；提示只剩标题行绿色胶囊与按需细行。打新提醒、健康摘要、崩溃报告通知不变。
+- **标题行一键更新**：新增 `UpdatePill` 组件（绿色胶囊，紧贴版本徽标右侧）；一次点击 = 下载 + 验证 + 退出 + 安装，helper 以 `--background` 托盘启动新版，删除第二次「重启并更新」确认。`ActionButton` 语义不变，蓝色/红色仍归操作与危险类。
+- **无更新时不渲染任何更新元素**：`update-pill-visible` / `update-note` 为空即整块隐藏；版本徽标改为可点击（`open-update-settings`）作为手动检查入口。
+- **控制器重构**（`src/ui/background_operations.rs`）：状态收敛为 idle/available/downloading/installing/failed，新增 `DownloadTrigger::{OneClick, Prefetch}`、`request_update`、`dismiss`、`open_manual_download`、`show_startup_receipt`，以及 `publish_*` / `flash_note` 统一下发按钮与细行文案。
+- **协议层**（`src/updater.rs`）：新增成功结果 6 小时进程内缓存（`check_for_update_with_cache`，手动检查 `force`）、自动检查节流 24h → 6h、`banner_dismissed_version` 每版本隐藏状态、`probe_latest_release_tag` 只读 302 兜底、`consume_upgrade_receipt` 一次性升级回执；安装结果新增 `version` 与 `consumed` 字段；移除已被替代的 `check_for_update` / `should_notify_version` / `mark_version_notified` 与 `lastNotifiedVersion` 字段。
+- **托盘**：新增 `set_update_badge` 与动态菜单项「发现新版本 x.y.z，点击查看」（被动入口，不弹气泡）。
+- **UI 文案**：设置页开关改为「自动检查稳定版更新（启动时及每 6 小时）」「发现更新后提前下载（默认关闭）」；更新卡片按钮合并为单个绿色「更新到 x.y.z」。
+- **门禁**：`smoke-release.ps1` 的更新 UI 断言改为一次性点击契约，并新增「更新流程不得调用 Toast/气泡」「必须实现缓存、每版本隐藏与只读兜底」三条断言。
+
+### 验证
+
+- `rtk cargo fmt` / `rtk cargo test`：173 项通过（新增缓存节流、每版本隐藏、发布页解析、更高版本判定与升级回执 5 项）。
+- `build-release.ps1 -PackageMode All`、`sign-update-manifest.ps1`、`validate-build-layout.ps1`、`smoke-release.ps1`、`test-signing-update.ps1`、`audit-release.ps1` 全部通过（0.4.0 报告时间戳 `20260917-040319`）。
+
 ## 0.3.9 — 2026-09-17
 
 ### 修复

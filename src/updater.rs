@@ -42,7 +42,10 @@ const UPDATE_STATE_FILE: &str = "update-state.json";
 const PENDING_MANIFEST_FILE: &str = "update-manifest.json";
 const PENDING_SIGNATURE_FILE: &str = "update-manifest.json.minisig";
 /// 自动检查的最小间隔（小时）；手动检查不受此限制。
-const AUTOMATIC_CHECK_INTERVAL_HOURS: i64 = 24;
+/// 与进程内成功缓存同周期：每天最多 4 次真实网络检查。
+const AUTOMATIC_CHECK_INTERVAL_HOURS: i64 = 6;
+/// 清单校验成功结果的进程内缓存时长；命中缓存不发网络请求。
+const CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// 等待 Watchdog 释放 supervisor 锁的上限；超时取消安装而不是依赖固定睡眠。
 const SUPERVISOR_WAIT_LIMIT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
@@ -133,8 +136,9 @@ pub enum UpdateCheck {
 pub struct UpdateState {
     pub schema_version: u32,
     pub last_automatic_check_at_utc: Option<String>,
-    pub last_notified_version: Option<String>,
     pub pending_version: Option<String>,
+    /// 用户点过「稍后」的版本；该版本不再占用界面，出现更高版本时重新展示。
+    pub banner_dismissed_version: Option<String>,
 }
 
 impl Default for UpdateState {
@@ -142,13 +146,21 @@ impl Default for UpdateState {
         Self {
             schema_version: 1,
             last_automatic_check_at_utc: None,
-            last_notified_version: None,
             pending_version: None,
+            banner_dismissed_version: None,
         }
     }
 }
 
 static UPDATE_STATE_MUTEX: Mutex<()> = Mutex::new(());
+
+/// 只缓存成功结果（含「已是最新」）；失败不写缓存，因此下一次自动检查仍会重试。
+struct CachedCheck {
+    checked_at: Instant,
+    check: UpdateCheck,
+}
+
+static CHECK_CACHE: Mutex<Option<CachedCheck>> = Mutex::new(None);
 
 pub fn configured() -> bool {
     trusted_public_key().is_ok()
@@ -181,7 +193,31 @@ pub fn verify_minisign_signature(
         .map_err(|error| anyhow::anyhow!("更新清单 Minisign 签名验证失败：{error}"))
 }
 
-pub fn check_for_update() -> Result<UpdateCheck> {
+/// 检查更新；`force=false` 时命中 6 小时内的成功缓存直接返回，不发网络请求。
+pub fn check_for_update_with_cache(force: bool) -> Result<UpdateCheck> {
+    if !force
+        && let Some(cached) = CHECK_CACHE
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|entry| (entry.checked_at, entry.check.clone()))
+            })
+            .filter(|(checked_at, _)| checked_at.elapsed() < CHECK_CACHE_TTL)
+    {
+        return Ok(cached.1);
+    }
+    let result = fetch_update_check()?;
+    if let Ok(mut slot) = CHECK_CACHE.lock() {
+        *slot = Some(CachedCheck {
+            checked_at: Instant::now(),
+            check: result.clone(),
+        });
+    }
+    Ok(result)
+}
+
+fn fetch_update_check() -> Result<UpdateCheck> {
     let manifest_url = validated_https_url(UPDATE_FEED_URL, "更新清单")?;
     let signature_url = minisign_signature_url(&manifest_url)?;
     let client = update_client()?;
@@ -421,7 +457,7 @@ pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
     {
         return Ok(None);
     }
-    let result = (|| -> Result<String> {
+    let result = (|| -> Result<InstallOutcome> {
         let data_root = argument_path(arguments, "--data-root").context("缺少数据目录")?;
         let parent_pid = argument_value(arguments, "--parent-pid")
             .context("缺少父进程编号")?
@@ -435,6 +471,12 @@ pub fn try_handle(arguments: &[String]) -> Result<Option<i32>> {
     Ok(Some(if result.is_ok() { 0 } else { 2 }))
 }
 
+/// helper 写入的安装结果；`version` 只在成功路径上存在，用于新版启动后的一次性回执。
+struct InstallOutcome {
+    detail: String,
+    version: String,
+}
+
 pub fn last_result(data_root: &Path) -> Option<String> {
     let path = data_root
         .join("diagnostics")
@@ -445,6 +487,32 @@ pub fn last_result(data_root: &Path) -> Option<String> {
         .or_else(|| value.get("error"))
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
+}
+
+/// 新版首次启动时读取一次安装成功回执：只在成功、版本与当前运行版本一致
+/// 且尚未消费时返回版本号，并立即把该回执标记为已消费，避免每次启动重复提示。
+pub fn consume_upgrade_receipt(data_root: &Path) -> Option<String> {
+    let path = data_root
+        .join("diagnostics")
+        .join("update-last-result.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if value.get("consumed").and_then(|flag| flag.as_bool()) == Some(true)
+        || value.get("success").and_then(|flag| flag.as_bool()) != Some(true)
+    {
+        return None;
+    }
+    let version = value
+        .get("version")
+        .and_then(|item| item.as_str())?
+        .to_owned();
+    if version != env!("CARGO_PKG_VERSION") {
+        return None;
+    }
+    value["consumed"] = serde_json::Value::Bool(true);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
+        let _ = fs::write(&path, bytes);
+    }
+    Some(version)
 }
 
 fn update_client() -> Result<Client> {
@@ -609,9 +677,10 @@ fn dispatch_install_helper(data_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_install_helper(data_root: &Path, parent_pid: u32) -> Result<String> {
+fn run_install_helper(data_root: &Path, parent_pid: u32) -> Result<InstallOutcome> {
     // 只信任受控 pending 目录中的材料；命令行不携带哈希或安装包路径。
     let pending = verify_pending(data_root)?;
+    let version = pending.manifest.version.clone();
     let installer = pending.installer_path;
     // 以禁止写入和删除共享的方式持有安装包句柄直到 msiexec 结束。
     let installer_lock = open_installer_read_locked(&installer)?;
@@ -637,11 +706,17 @@ fn run_install_helper(data_root: &Path, parent_pid: u32) -> Result<String> {
     cleanup_pending(data_root);
     if exit_code == 3010 {
         drop(supervisor);
-        return Ok("更新安装成功，需要重新启动 Windows 后完成".into());
+        return Ok(InstallOutcome {
+            detail: "更新安装成功，需要重新启动 Windows 后完成".into(),
+            version,
+        });
     }
     drop(supervisor);
     relaunch_installed_app().context("更新安装成功，但自动启动新版本失败")?;
-    Ok("更新安装成功，已启动新版本".into())
+    Ok(InstallOutcome {
+        detail: "更新安装成功，已启动新版本".into(),
+        version,
+    })
 }
 
 #[cfg(windows)]
@@ -775,12 +850,17 @@ fn installed_folder_from_registry() -> Result<PathBuf> {
     bail!("当前平台不支持读取 Windows 安装目录")
 }
 
-fn write_update_result(data_root: &Path, result: &Result<String>) -> Result<()> {
+fn write_update_result(data_root: &Path, result: &Result<InstallOutcome>) -> Result<()> {
     let directory = data_root.join("diagnostics");
     fs::create_dir_all(&directory)?;
     let value = match result {
-        Ok(detail) => json!({"success": true, "detail": detail}),
-        Err(error) => json!({"success": false, "error": format!("{error:#}")}),
+        Ok(outcome) => json!({
+            "success": true,
+            "detail": outcome.detail,
+            "version": outcome.version,
+            "consumed": false,
+        }),
+        Err(error) => json!({"success": false, "error": format!("{error:#}"), "consumed": false}),
     };
     fs::write(
         directory.join("update-last-result.json"),
@@ -958,18 +1038,75 @@ pub fn automatic_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> b
     automatic_check_due(last, now)
 }
 
-/// 同一版本是否尚未主动提醒过。
-pub fn should_notify_version(data_root: &Path, version: &str) -> bool {
+/// 该版本是否已被用户「稍后」隐藏；更高版本出现时应重新展示。
+pub fn banner_dismissed_for(data_root: &Path, version: &str) -> bool {
     load_update_state(data_root)
-        .last_notified_version
+        .banner_dismissed_version
         .as_deref()
-        != Some(version)
+        == Some(version)
 }
 
-pub fn mark_version_notified(data_root: &Path, version: &str) {
+pub fn dismiss_banner_for(data_root: &Path, version: &str) {
     let _ = mutate_update_state(data_root, |state| {
-        state.last_notified_version = Some(version.to_owned());
+        state.banner_dismissed_version = Some(version.to_owned());
     });
+}
+
+/// 只读兜底：清单不可用时解析 `releases/latest` 的 302 `Location` 取 tag。
+/// 结果**只用于界面提示**，永远不参与下载或安装判断。
+pub fn probe_latest_release_tag() -> Result<String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(Policy::none())
+        .user_agent(format!(
+            "StockIpoReminder/{}/Windows",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .context("无法创建发布页探测客户端")?;
+    let response = client
+        .get(release_page_url()?)
+        .send()
+        .context("无法访问发布页")?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .context("发布页没有返回跳转地址")?;
+    if !location.contains("/releases/tag/") {
+        bail!("发布页跳转地址不是版本标签");
+    }
+    let tag = location
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if tag.is_empty() {
+        bail!("无法解析发布版本标签");
+    }
+    Ok(tag)
+}
+
+/// 把 `v0.4.0` 之类的 tag 转成高于当前版本的版本号；不高于当前版本返回 `None`。
+pub fn higher_release_version(tag: &str) -> Option<String> {
+    let version = tag.trim().trim_start_matches('v');
+    let ordering = compare_versions(version, env!("CARGO_PKG_VERSION")).ok()?;
+    (ordering == std::cmp::Ordering::Greater).then(|| version.to_owned())
+}
+
+fn release_page_url() -> Result<Url> {
+    let feed = validated_https_url(UPDATE_FEED_URL, "更新清单")?;
+    let mut segments = feed
+        .path_segments()
+        .context("更新源地址缺少仓库信息")?
+        .filter(|segment| !segment.is_empty());
+    let owner = segments.next().context("更新源地址缺少仓库所有者")?;
+    let repository = segments.next().context("更新源地址缺少仓库名称")?;
+    Url::parse(&format!(
+        "https://github.com/{owner}/{repository}/releases/latest"
+    ))
+    .context("发布页地址无效")
 }
 
 #[cfg(windows)]
@@ -1230,33 +1367,120 @@ mod tests {
         assert_eq!(load_update_state(&root).pending_version, None);
         mutate_update_state(&root, |state| {
             state.pending_version = Some("0.3.8".into());
-            state.last_notified_version = Some("0.3.8".into());
+            state.banner_dismissed_version = Some("0.3.7".into());
             state.last_automatic_check_at_utc = Some("2026-09-09T00:00:00Z".into());
         })
         .unwrap();
         let state = load_update_state(&root);
         assert_eq!(state.schema_version, 1);
         assert_eq!(state.pending_version.as_deref(), Some("0.3.8"));
-        assert_eq!(state.last_notified_version.as_deref(), Some("0.3.8"));
+        assert_eq!(state.banner_dismissed_version.as_deref(), Some("0.3.7"));
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn automatic_check_throttles_to_24_hours() {
+    fn automatic_check_throttles_to_the_configured_interval() {
         let now = Utc::now();
         assert!(automatic_check_due(None, now));
         assert!(!automatic_check_due(
-            Some(now - chrono::Duration::hours(23)),
+            Some(now - chrono::Duration::hours(5)),
             now
         ));
         assert!(automatic_check_due(
-            Some(now - chrono::Duration::hours(24)),
+            Some(now - chrono::Duration::hours(6)),
             now
         ));
         assert!(automatic_check_due(
             Some(now - chrono::Duration::hours(72)),
             now
         ));
+    }
+
+    #[test]
+    fn banner_dismissal_only_hides_the_dismissed_version() {
+        let root = temp_data_root();
+        assert!(!banner_dismissed_for(&root, "0.4.0"));
+        dismiss_banner_for(&root, "0.4.0");
+        assert!(banner_dismissed_for(&root, "0.4.0"));
+        // 更高版本必须重新展示。
+        assert!(!banner_dismissed_for(&root, "0.4.1"));
+        // 隐藏状态必须持久化，重启后仍然生效。
+        assert_eq!(
+            load_update_state(&root).banner_dismissed_version.as_deref(),
+            Some("0.4.0")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_page_url_is_derived_from_the_fixed_feed() {
+        assert_eq!(
+            release_page_url().expect("release page").as_str(),
+            "https://github.com/melody0709/StockIpoReminder/releases/latest"
+        );
+    }
+
+    #[test]
+    fn higher_release_version_only_accepts_newer_tags() {
+        assert_eq!(higher_release_version("v9.9.9").as_deref(), Some("9.9.9"));
+        assert_eq!(higher_release_version("9.9.9").as_deref(), Some("9.9.9"));
+        assert!(higher_release_version("v0.0.1").is_none());
+        assert!(higher_release_version(env!("CARGO_PKG_VERSION")).is_none());
+        assert!(higher_release_version("not-a-version").is_none());
+    }
+
+    #[test]
+    fn upgrade_receipt_is_consumed_once_for_the_running_version() {
+        let root = temp_data_root();
+        let diagnostics = root.join("diagnostics");
+        fs::create_dir_all(&diagnostics).unwrap();
+        let path = diagnostics.join("update-last-result.json");
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "success": true,
+                "detail": "更新安装成功，已启动新版本",
+                "version": env!("CARGO_PKG_VERSION"),
+                "consumed": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            consume_upgrade_receipt(&root).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // 第二次启动不再重复提示。
+        assert!(consume_upgrade_receipt(&root).is_none());
+
+        // 成功但版本不匹配（例如回滚到旧版）不提示。
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "success": true,
+                "detail": "更新安装成功，已启动新版本",
+                "version": "9.9.9",
+                "consumed": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(consume_upgrade_receipt(&root).is_none());
+
+        // 失败回执不提示。
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "success": false,
+                "error": "Windows Installer 更新失败：exit=1620",
+                "consumed": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(consume_upgrade_receipt(&root).is_none());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1298,8 +1522,8 @@ mod tests {
         let partial: UpdateState = serde_json::from_str(r#"{"schemaVersion":1}"#).unwrap();
         assert_eq!(partial.schema_version, 1);
         assert_eq!(partial.last_automatic_check_at_utc, None);
-        assert_eq!(partial.last_notified_version, None);
         assert_eq!(partial.pending_version, None);
+        assert_eq!(partial.banner_dismissed_version, None);
         // schemaVersion 缺失视为损坏文件，解析必须失败。
         assert!(serde_json::from_str::<UpdateState>(r#"{"pendingVersion":"0.3.8"}"#).is_err());
         // 未知 schema 版本可被 serde 解析，但 load_update_state 必须回退默认值。
