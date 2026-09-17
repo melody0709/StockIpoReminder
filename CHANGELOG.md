@@ -14,8 +14,8 @@
 
 ## [未发布] — 0.3.8（草稿）
 
-> 状态：源码、UI、脚本、文档与打包产物均已生成（`build\packages\0.3.8`），但**尚未提交到 Git**（当前 HEAD 仍是 `71b706f chore: release version 0.3.7`），也没有 `v0.3.8` 标签。
-> 未完成的定义：`.plan/feat/certificate-free-minisign-auto-update.md` 第 12 节要求「安装引导版 → 发布更高版本 → 真实 MSI 升级闭环」两版验证通过后才算功能完成。
+> 状态：源码、UI、脚本、文档与打包产物已提交（`9da808d`）并推送到 `main`；**GitHub Release `v0.3.8` 已发布为 stable/latest**，公开 feed 的 `update-manifest.json` 与 `.minisig` 已复核可用。
+> 未完成的定义：`.plan/feat/certificate-free-minisign-auto-update.md` 第 12 节要求最后再走一次「两版真实 MSI 升级闭环」——从已安装的 0.3.8 升级到更高版本（含 UAC 取消与 `3010` 路径）。
 
 ### 变更
 
@@ -47,8 +47,12 @@
 
 ### 验证
 
-- `rtk cargo test`：168 项通过（README 同步更新依赖项描述与测试数）。
-- 已完成打包：`StockIpoReminder-0.3.8-win-x64.msi`、便携 ZIP、`update-manifest.json` 与其 `.minisig`、`release-manifest.json`、`SHA256SUMS.txt`；发布清单仍为 `signed: false`（无 Authenticode，属预期）。
+- `rtk cargo fmt` / `rtk cargo test`：169 项通过。
+- `scripts/test-update-helper-recovery.ps1`：通过（`msiexec` 对无效包返回 1620 → helper 退出码 2、pending 与清单保留、结果文件写入）。
+- `validate-build-layout.ps1`、`smoke-release.ps1`、`test-signing-update.ps1`、`audit-release.ps1`：全部通过（0.3.8 最新一轮报告时间戳 `20260917-030603`）。
+- 已创建对象：`StockIpoReminder-0.3.8-win-x64.msi`、便携 ZIP、`update-manifest.json` 与其 `.minisig`、`release-manifest.json`、`SHA256SUMS.txt`、`README.md`、`RELEASE_NOTES.md`；发布清单为 `signed: false`（无 Authenticode，属预期）。
+- GitHub Release `v0.3.8` 已发布为 stable/latest：上传上述八项资产 → 以重新下载的副本复核（`SHA256SUMS.txt` 全项 OK、`minisign -V` 通过、EXE `--update-bundle-self-test` 返回 `success`）→ 发布后从公开 `releases/latest/download/` 再取一次清单与签名，字节与本地签名副本一致且验签通过。
+- 已知未修：`SHA256SUMS.txt` 使用 CRLF 换行，`sha256sum -c` 需先 `tr -d '\r'`；这是历史格式，本版未变更。
 
 ---
 
