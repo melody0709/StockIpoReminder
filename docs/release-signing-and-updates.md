@@ -10,7 +10,7 @@
 - 客户端验证顺序固定：先验证清单原始字节签名（成功前不解析任何字段），再校验产品、stable 通道、严格 `x.y.z` 递增版本、RFC 3339 发布时间、最低 Windows Build、安装包文件名与版本一致、无凭据无 fragment 的 HTTPS URL、大小范围和 SHA-256 格式。
 - 下载时同时执行响应大小上限、声明长度和增量 SHA-256 校验；下载完成提交到受控 pending 目录（`数据目录\updates\pending`），应用关闭或重启后可恢复为就绪状态，恢复时全部材料重新验证。
 - 安装 helper 只接收数据目录和父进程 PID；它从受控 pending 目录重新验证清单签名、版本、大小和 MSI SHA-256，并以禁止写入和删除共享的只读句柄锁定 MSI 直到 `msiexec` 结束。
-- 只有用户明确点击“重启并更新”后才退出主程序；helper 等待父进程退出、轮询取得 Watchdog supervisor 互斥量后执行 `msiexec /i ... /passive /norestart`。成功后从 `HKLM\Software\StockIpoReminder\InstallFolder` 启动新版本；返回 `3010` 提示重启 Windows；失败或取消 UAC 时保留可重试 pending 并恢复启动当前版本。
+- 只有用户明确点击标题行的绿色「更新到 x.y.z」胶囊后才退出主程序；**这一次点击即授权「下载 + 安装 + 重启」，不再有第二次确认**（0.4.0 起的一键契约，取代 0.3.8 的两步「下载 → 重启并更新」）。如果用户在设置页开启「发现更新后提前下载」，安装包会在点击前就下载并验证好，但安装仍然只由这次点击触发。helper 等待父进程退出、轮询取得 Watchdog supervisor 互斥量后执行 `msiexec /i ... /passive /norestart`。成功后从 `HKLM\Software\StockIpoReminder\InstallFolder` 启动新版本（`--background`，即常驻托盘不弹主窗口）；返回 `3010` 提示重启 Windows；失败或取消 UAC 时保留可重试 pending 并恢复启动当前版本。
 - 更新只允许升级到更高的 `x.y.z` 版本；WiX Major Upgrade 继续负责程序文件事务回滚。数据迁移前仍由应用创建并校验 SQLite 备份。
 - 便携版不会静默转换为安装版，应用内自动更新入口只对已由本产品 MSI 注册的安装版开放。
 - 私钥丢失或泄露时，旧客户端不能安全接受未经旧私钥授权的新钥匙；必须停止自动更新并发布需要人工安装的新引导版。
@@ -33,7 +33,12 @@ Minisign 解决的是“应用确认更新确实由项目维护者发布”，�
 
 ## 本地发版顺序
 
-1. 修改 `Cargo.toml` 版本并更新 `RELEASE_NOTES.md`。
+1. 修改 `Cargo.toml` 版本，并同步所有「重复声明版本」的文档。缺任何一项都会造成「基线已经升到新版本、文档仍写旧版本」的不一致：
+
+   - `CHANGELOG.md`：把 `[未发布]` 小节提升为 `## <版本> — <日期>`，并另起一个空的 `[未发布]`。
+   - `RELEASE_NOTES.md`：新增本版本小节，只写用户能感知到的变化。
+   - `README.md`：「当前版本」行，以及「安装版」「便携版」两节中的 `StockIpoReminder-<版本>-win-x64.msi` / `StockIpoReminder-<版本>-win-x64-portable.zip` 文件名。
+   - 顺序要求：`RELEASE_NOTES.md` 与 `README.md` 会被复制进 `build/packages/<版本>/`，因此必须在 `build.bat --package` **之前**改完，否则包里带的是旧文案。
 2. 运行测试和 `rtk cmd /c build.bat --package`，得到最终 MSI 和便携 ZIP。
 3. 根据最终 MSI 生成并签名 `update-manifest.json`：
 
@@ -46,6 +51,7 @@ rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-update-manifest.p
 4. 运行验证（见下节），全部通过后创建 GitHub Draft Release 并一次上传全部资产：MSI、便携 ZIP、`README.md`、`RELEASE_NOTES.md`、`release-manifest.json`、`SHA256SUMS.txt`、`update-manifest.json`、`update-manifest.json.minisig`。
 5. 通过经过身份验证的 Draft 下载重新验证全部资产的名称、大小、哈希和 Minisign 签名；验证通过后一次性把 Draft 发布为 stable/latest。不得发布后再补传或覆盖更新清单和 MSI——Draft 中资产的上传先后顺序不构成安全边界，真正的发布边界是“完整 Draft 一次性公开”。
 6. 发布后从公开的 `releases/latest/download/update-manifest.json` 和 `.minisig` 再做一次只读验证。
+7. 收尾核对文档版本一致性（见下节「文档版本一致性自检」），避免出现「基线已升到新版本、README 仍写旧版本」的不一致。
 
 ## 可选 Authenticode
 
@@ -70,3 +76,17 @@ rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-update-helper-rec
 ```
 
 `test-signing-update.ps1` 在沙盒生成一次性无密码 Minisign 测试密钥（绝不进入生产信任根），验证预哈希签名接受、篡改清单拒绝、错误密钥拒绝、正式信任根拒绝测试密钥、legacy 签名拒绝和安装包哈希拒绝。`audit-release.ps1` 会在发布目录存在更新清单时，用仓库公钥和发布 EXE 各自复核一遍。`test-update-helper-recovery.ps1` 用生产密钥签名的 pending 加无效 MSI 验证安装助手的验签、锁定、等待与失败恢复路径（不触发 UAC）。真实 MSI 闭环（引导版升级到更高测试版本、UAC 取消、安装失败、`3010` 与正常成功路径）需在本机用独立 `--data-root` 人工执行并记录。
+
+## 文档版本一致性自检
+
+`Cargo.toml` 是唯一版本来源，但仍有几处必须人工同步的版本声明。发版收尾时逐个核对：
+
+```text
+rtk rg -n "StockIpoReminder-0\.[0-9]+\.[0-9]+-win-x64" README.md
+rtk rg -n "当前版本" README.md
+```
+
+- `README.md` 的「当前版本」行与两处安装包 / 便携包文件名必须等于 `Cargo.toml` 的版本，且不得残留指向旧版本的文件名。
+- `RELEASE_NOTES.md` 首个小节必须是本次版本；`CHANGELOG.md` 的 `[未发布]` 必须为空且上一节是本次版本。
+- 行为发生变化时，同时核对受影响的专题文档：`docs/release-signing-and-updates.md`（更新链路，含一键点击契约）、`docs/secondary-notifications.md`、`docs/crash-reporting.md`，以及 `README.md` 中描述该行为的段落。
+- `.plan/feat/*.md`、`plan/*.md` 属历史设计/审查记录，其中的旧版本号和旧决策**按原样保留**，只在文首「当前版本」这类现在时声明上更新，并在需要时追加一节说明后续版本的取代关系。

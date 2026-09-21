@@ -14,7 +14,18 @@
 
 ## [未发布]
 
-（暂无）
+### 变更
+
+- **文档版本基线同步到 0.4.2**：`README.md` 的「当前版本」行、MSI 文件名与便携包文件名此前仍停留在 `0.3.7`，现改为 `0.4.2`，并显式声明版本号以 `Cargo.toml` 为唯一来源。
+- **README 补齐 0.4.x 的更新入口行为**：标题行绿色胶囊一次点击即完成下载/校验/退出/安装并以托盘启动新版、版本徽标可点击（悬停高亮）进入设置页手动检查、无可用更新时整块不渲染、显式检查已是最新时提示「当前已是最新版本」、升级完成后一次性回执「已更新到 x.y.z」；回归测试总数由 173 更正为 174。
+- **发版清单补上文档同步步骤**（`docs/release-signing-and-updates.md`）：把「修改 `Cargo.toml` 版本」扩展为同时提升 `CHANGELOG.md` 的 `[未发布]`、新增 `RELEASE_NOTES.md` 小节、同步 `README.md` 的版本行与包名，并新增「文档版本一致性自检」一节，明确 `.plan/`、`plan/` 的历史记录按原样保留。
+- **历史方案文档登记取代关系**：`.plan/feat/certificate-free-minisign-auto-update.md` 标明被 0.4.x 取代的三处——两步交互改为一次点击、检查节流由 24 小时改为启动 10 分钟地板加周期 6 小时、更新流程取消 Toast 与托盘气泡；`.plan/feat/home-update-banner-and-silent-notifications.md` 与 `.plan/feat/windows-ipo-reminder.md` 更新文首版本基线与状态；`plan/fix.md`、`plan/remediation-plan.md`、`.plan/fix/stock-new-deep-audit.md` 标注为 `0.3.1` 历史基线。
+- **代码注释修正**（`src/updater.rs`，仅注释、无行为变化）：`startup_check_due` 的注释误写「最多每小时一次真实网络检查」和「1 小时阈值」，改为与 `STARTUP_CHECK_INTERVAL_MINUTES = 10` 一致。
+
+### 验证
+
+- `rtk cargo fmt` 无残留改动；`rtk cargo test`：174 项通过。
+- 本次为文档与注释修正，无可观察行为变化，因此未重新生成发布产物。
 
 ## 0.4.2 — 2026-09-17
 

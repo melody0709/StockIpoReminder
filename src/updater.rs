@@ -1028,7 +1028,8 @@ pub fn automatic_check_due(last_check_utc: Option<DateTime<Utc>>, now: DateTime<
 }
 
 /// 启动路径使用的到期判断：阈值更短，避免「刚检查完就发布新版本」让用户
-/// 一直等满整个周期（这也让反复重启最多每小时一次真实网络检查）。
+/// 一直等满整个周期（反复重启最多每 `STARTUP_CHECK_INTERVAL_MINUTES` 分钟
+/// 一次真实网络检查，即每小时最多 6 次）。
 pub fn startup_check_due(last_check_utc: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     match last_check_utc {
         None => true,
@@ -1058,7 +1059,7 @@ pub fn automatic_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> b
     automatic_check_due(last_automatic_check(data_root), now)
 }
 
-/// 启动时的自动检查到期判断（1 小时阈值）。
+/// 启动时的自动检查到期判断（阈值为 `STARTUP_CHECK_INTERVAL_MINUTES`，当前 10 分钟）。
 pub fn startup_check_due_from_state(data_root: &Path, now: DateTime<Utc>) -> bool {
     startup_check_due(last_automatic_check(data_root), now)
 }

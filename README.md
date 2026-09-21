@@ -2,7 +2,9 @@
 
 一个常驻 Windows 系统托盘的 A 股新股申购提醒程序。它从公开渠道发现沪市、深市和北交所申购任务，并持续提醒，直到你对每只股票分别完成“确认已申购”的二次确认。
 
-当前版本：`0.3.7`
+当前版本：`0.4.2`
+
+> 版本号只有一个事实来源：`Cargo.toml`。发版时必须同步本行，以及下文出现的安装包 / 便携包文件名；否则会出现「基线已升到 `0.4.x`、文档仍写 `0.3.x`」的不一致。完整历史见 `CHANGELOG.md` 与 `RELEASE_NOTES.md`。
 
 正式运行版本已经完全迁移到 Rust：界面使用 Slint，Windows 托盘、原生 Toast、单实例、声音和当前用户开机自启动注册使用 `windows-rs`，数据层使用内嵌 SQLite。MSI 安装包和便携包都不依赖 .NET Runtime，仓库也已移除旧 C#/.NET 工程。
 
@@ -81,7 +83,7 @@
 运行：
 
 ```text
-StockIpoReminder-0.3.7-win-x64.msi
+StockIpoReminder-0.4.2-win-x64.msi
 ```
 
 默认目录：
@@ -97,7 +99,7 @@ MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供程序文
 
 ## 便携版
 
-解压 `StockIpoReminder-0.3.7-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。便携版没有 Windows Installer 注册，因此设置页不会启用 MSI 卸载和自动更新入口；退出程序后直接删除便携文件即可，用户数据仍按下述规则独立保留。
+解压 `StockIpoReminder-0.4.2-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。便携版没有 Windows Installer 注册，因此设置页不会启用 MSI 卸载和自动更新入口；退出程序后直接删除便携文件即可，用户数据仍按下述规则独立保留。
 
 便携版如果启用“登录 Windows 后自动启动”，会按当前可执行文件位置写入当前用户 Run 注册项。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序后，应先关闭自启动或重新保存设置以更新路径。便携运行通常没有 MSI 创建的开始菜单 AUMID 注册；设置页会明确显示 Toast 诊断结果，Toast 无法提交时仍使用托盘气泡回退。
 
@@ -159,6 +161,8 @@ StockIpoReminder.exe --data-root "D:\Temp\StockIpoReminder-Test"
 
 自动检查稳定版更新默认开启：**每次启动都会重新检查一次**（除非距上次检查不足 10 分钟，用于兜住崩溃重启循环），长期驻留期间最多每 6 小时做一次真实网络请求，成功结果进程内缓存 6 小时命中不发请求；独立的“发现更新后提前下载”开关也默认关闭，开启后只是提前把包下载好，安装仍需用户点击。应用关闭或 Windows 重启后，已验证的待安装更新会恢复为可点击的「更新」状态。托盘右键菜单提供「打开发布页 (GitHub Release)」作为随时可用的手动入口。更新过程不发送 Toast 或气泡；用户点过「稍后」的版本不再占用界面，出现更高版本时重新显示。
 
+主窗口的更新入口只有两处，都以「不打扰」为前提：有可用更新时，标题行出现绿色「更新到 x.y.z」胶囊（一次点击即完成下载、校验、退出、安装，并以托盘方式启动新版本），版本徽标本身也可点击（鼠标悬停高亮）进入设置页「安全自动更新」区域手动检查。没有可用更新时整个更新区域不渲染，不做常驻提示；显式检查且已是最新时，说明行短暂提示「当前已是最新版本」。升级完成后，新版本首次启动会在同一处一次性提示「已更新到 x.y.z」。
+
 没有 Authenticode 证书时，UAC、SmartScreen 和“未知发布者”提示属正常现象，程序不会绕过这些系统安全交互；请通过 `SHA256SUMS.txt` 与 Minisign 签名核对发布包。密钥保管、发版步骤与信任边界见 `docs/release-signing-and-updates.md`。
 
 ## 可选崩溃报告共享
@@ -196,7 +200,7 @@ rtk pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/audit-release.ps1
 
 设置页更新区域显示当前版本与可用版本，并在签名清单提供相对发布说明文件时给出“发布说明”入口；清单中的该字段只解析为与更新源同目录的安全 HTTPS 地址，不接受绝对 URL、其他主机或路径穿越。
 
-当前 Rust 固定 fixture、SQLite 迁移、字段来源、公告链接关联、确认与 Outbox 恢复、同步调度、来源覆盖结论、退避/探测、备份、诊断、版本升级保护、安全卸载、Minisign 更新签名、pending 恢复、发布说明地址解析、崩溃报告隐私约束、第二通知通道安全边界和有界采集查询回归测试共 173 项。
+当前 Rust 固定 fixture、SQLite 迁移、字段来源、公告链接关联、确认与 Outbox 恢复、同步调度、来源覆盖结论、退避/探测、备份、诊断、版本升级保护、安全卸载、Minisign 更新签名、pending 恢复、启动检查节流、发布说明地址解析、崩溃报告隐私约束、第二通知通道安全边界和有界采集查询回归测试共 174 项（`rtk cargo test`：174 passed）。
 
 ## 仓库结构
 
@@ -207,7 +211,9 @@ build.bat                 构建、清理和 MSI/便携包统一入口
 build/                    全部本地生成输出；仅 README.txt 纳入版本控制
 src/                      应用、同步、存储、公告元数据、部署和 Windows 集成
 ui/                       Slint 界面
-assets/                   Windows 应用图标
+assets/                   Windows 应用图标、更新签名公钥（assets/update-signing/）
+docs/                     更新链路、第二通知通道和崩溃报告的专题说明
+.plan/                    产品设计基线与历史方案记录（含当前设计基线 windows-ipo-reminder.md）
 tests/fixtures/           四来源与正式公告的离线固定响应样本
 scripts/                  构建、smoke、发布审计和内存测量
 packaging/windows/        WiX MSI 项目、可选目录界面和稳定升级标识
