@@ -43,7 +43,11 @@
 - `scripts/smoke-release.ps1` 全部 20 项断言通过（报告：`build/artifacts/tests/smoke/windows-rust-0.4.3-20260921-092011.json`），其中 `secondLaunchActivatesExistingInstance`、`mainWindowSizePersistence` 覆盖本次改动的窗口路径。
 - `scripts/test-signing-update.ps1` 6/6 项通过（报告：`build/artifacts/tests/signing-update/signing-update-0.4.3-20260921-092053.json`）：预哈希签名接受、篡改清单/安装包拒绝、错误密钥拒绝、正式信任根拒绝测试密钥、legacy 签名拒绝。
 - 用重建后的发布版 EXE 复验：窗口 2259x1726 落在 (790,181)，底边不越界，整行未绘制区域 0 行；日志为 `event=main_window_size_preapplied` + `event=main_window_size_restored`。
-- 待人工完成（需要仓库外的 Minisign 私钥）：`scripts/sign-update-manifest.ps1` 签名更新清单 → 复核 `scripts/audit-release.ps1` → 建 Draft Release 并一次性发布。
+- 更新清单签名（本地、仓库外私钥）：`scripts/sign-update-manifest.ps1 -PasswordFile <vault 密码文件>`，public key id `92c9c7f5823339d5`（与 0.4.2 同一信任根），生成 `update-manifest.json` 与 `update-manifest.json.minisig`，回填 `release-manifest.json` 的 `updateManifest` / `updateManifestSignature` / `updatePublicKeyId`，并重新生成 `SHA256SUMS.txt`；签名脚本内部已用仓库公钥复核，且校验清单版本、安装包名、大小与 SHA-256 与最终 MSI 一致。
+- `scripts/audit-release.ps1` 11 项全部通过（报告：`build/artifacts/tests/audit/release-rust-0.4.3-20260921-092616.json`），含 `release.minisign-update-bundle`：更新清单被 minisign 与发布 EXE 各自针对仓库信任根验证通过。
+- `scripts/test-update-helper-recovery.ps1` 通过：安装助手对无效 MSI 正确失败（`exit=1620`）并按预期恢复，未触发 UAC。
+- 发布资产（8 个，一次性公开）：MSI、便携 ZIP、`README.md`、`RELEASE_NOTES.md`、`release-manifest.json`、`SHA256SUMS.txt`、`update-manifest.json`、`update-manifest.json.minisig`。
+- 待人工完成：创建 GitHub Draft Release 并一次性上传全部资产后发布为 stable/latest。
 
 ## 0.4.2 — 2026-09-17
 
