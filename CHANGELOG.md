@@ -47,7 +47,9 @@
 - `scripts/audit-release.ps1` 11 项全部通过（报告：`build/artifacts/tests/audit/release-rust-0.4.3-20260921-092616.json`），含 `release.minisign-update-bundle`：更新清单被 minisign 与发布 EXE 各自针对仓库信任根验证通过。
 - `scripts/test-update-helper-recovery.ps1` 通过：安装助手对无效 MSI 正确失败（`exit=1620`）并按预期恢复，未触发 UAC。
 - 发布资产（8 个，一次性公开）：MSI、便携 ZIP、`README.md`、`RELEASE_NOTES.md`、`release-manifest.json`、`SHA256SUMS.txt`、`update-manifest.json`、`update-manifest.json.minisig`。
-- 待人工完成：创建 GitHub Draft Release 并一次性上传全部资产后发布为 stable/latest。
+- 已发布：GitHub Release `StockIpoReminder v0.4.3`（tag `v0.4.3` → `374108c`，https://github.com/melody0709/StockIpoReminder/releases/tag/v0.4.3），先建 Draft 一次性上传 8 个资产，再从 Draft 下载复核：7/7 资产哈希与 `SHA256SUMS.txt` 一致（该文件本身按设计不含自身）、`update-manifest.json.minisig` 用仓库公钥验签通过（预哈希），随后发布为 stable/latest。
+- 发布后只读复核：从公开的 `releases/latest/download/update-manifest.json` 与 `.minisig` 验签通过；用发布 EXE 的 `--update-bundle-self-test` 对公开清单与公开 MSI 跑完客户端验签管线，`success=true, version=0.4.3`（exit 0），说明 0.4.2 及更早版本可正常发现并校验 0.4.3。
+- 真实安装闭环（UAC 取消、安装失败、`3010` 与成功路径）仍按文档由人工在独立 `--data-root` 下执行，本次未覆盖。
 
 ## 0.4.2 — 2026-09-17
 
