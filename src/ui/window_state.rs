@@ -4,7 +4,10 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -19,14 +22,19 @@ const WINDOW_STATE_SCHEMA_VERSION: u32 = 1;
 const MIN_LOGICAL_WIDTH: u32 = 800;
 const MIN_LOGICAL_HEIGHT: u32 = 500;
 const MAX_LOGICAL_DIMENSION: u32 = 10_000;
+// 与 ui/main.slint 的 preferred-width/preferred-height 保持一致：没有保存过尺寸时按首选尺寸开窗，
+// 而不是停在 min-width/min-height 的最小尺寸。
+const PREFERRED_LOGICAL_WIDTH: u32 = 1180;
+const PREFERRED_LOGICAL_HEIGHT: u32 = 780;
 const OBSERVATION_INTERVAL: Duration = Duration::from_millis(500);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 static PENDING_MAIN_WINDOW_SIZE: Mutex<Option<MainWindowSize>> = Mutex::new(None);
+static INITIAL_MAIN_WINDOW_SIZE_APPLIED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MainWindowSize {
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl MainWindowSize {
@@ -62,33 +70,75 @@ pub(crate) fn prepare_main_window_size_restore(data_root: &Path) -> Result<Optio
     Ok(size)
 }
 
+/// 首次显示前下发窗口尺寸，进程内只生效一次。
+///
+/// 原生窗口尚未创建时 winit 会把尺寸写入窗口属性，窗口"一出生"就是目标尺寸；
+/// 这样就不存在"先按最小尺寸显示、再被程序改大"的过程——改大后落在屏幕外的那一段
+/// 永远不会被软件渲染器绘制，表现为窗口底部透出桌面。
+pub(crate) fn apply_initial_main_window_size(window: &MainWindow) -> Option<MainWindowSize> {
+    if INITIAL_MAIN_WINDOW_SIZE_APPLIED.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let pending = PENDING_MAIN_WINDOW_SIZE
+        .lock()
+        .ok()
+        .and_then(|pending| *pending);
+    let size = match pending {
+        Some(size) => size,
+        // 没有保存过尺寸（首次运行或状态文件不可用）时用首选尺寸，而不是最小尺寸。
+        None => MainWindowSize::new(PREFERRED_LOGICAL_WIDTH, PREFERRED_LOGICAL_HEIGHT).ok()?,
+    };
+    window
+        .window()
+        .set_size(LogicalSize::new(size.width as f32, size.height as f32));
+    Some(size)
+}
+
 pub(crate) fn apply_restored_main_window_size(window: &MainWindow) {
     let size = PENDING_MAIN_WINDOW_SIZE
         .lock()
         .ok()
         .and_then(|mut pending| pending.take());
-    if let Some(size) = size {
-        window
-            .window()
-            .set_size(LogicalSize::new(size.width as f32, size.height as f32));
-        let weak = window.as_weak();
-        Timer::single_shot(Duration::from_millis(150), move || {
-            let Some(window) = weak.upgrade() else {
-                return;
-            };
-            match logical_size_from_physical(window.window().size(), window.window().scale_factor())
-            {
-                Some(actual) => operations::log(
-                    "INFO",
-                    &format!(
-                        "主窗口尺寸已恢复：logicalWidth={} logicalHeight={} requestedWidth={} requestedHeight={} event=main_window_size_restored",
-                        actual.width, actual.height, size.width, size.height
-                    ),
-                ),
-                None => operations::log("WARN", "主窗口尺寸恢复后无法读取有效逻辑尺寸"),
-            }
-        });
+    let Some(size) = size else {
+        return;
+    };
+    // 尺寸通常在 show() 之前就已下发（见 apply_initial_main_window_size）；
+    // 只有窗口实际尺寸与目标不一致时才补一次改尺寸，避免多余的重绘。
+    if current_main_window_size(window) == Some(size) {
+        log_main_window_size_restored(size, size);
+        return;
     }
+    window
+        .window()
+        .set_size(LogicalSize::new(size.width as f32, size.height as f32));
+    let weak = window.as_weak();
+    Timer::single_shot(Duration::from_millis(150), move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        match current_main_window_size(&window) {
+            Some(actual) => log_main_window_size_restored(actual, size),
+            None => operations::log("WARN", "主窗口尺寸恢复后无法读取有效逻辑尺寸"),
+        }
+    });
+}
+
+fn log_main_window_size_restored(actual: MainWindowSize, requested: MainWindowSize) {
+    operations::log(
+        "INFO",
+        &format!(
+            "主窗口尺寸已恢复：logicalWidth={} logicalHeight={} requestedWidth={} requestedHeight={} event=main_window_size_restored",
+            actual.width, actual.height, requested.width, requested.height
+        ),
+    );
+}
+
+fn current_main_window_size(window: &MainWindow) -> Option<MainWindowSize> {
+    let slint_window = window.window();
+    let scale_factor = slint_window.scale_factor();
+    let physical = crate::windows_integration::window_client_size(slint_window)
+        .unwrap_or_else(|| slint_window.size());
+    logical_size_from_physical(physical, scale_factor)
 }
 
 pub(crate) fn persist_main_window_size(window: &MainWindow, data_root: &Path) {
@@ -217,6 +267,15 @@ mod tests {
                 height: 780,
             })
         );
+    }
+
+    #[test]
+    fn preferred_window_size_is_accepted_as_fallback() {
+        let preferred = MainWindowSize::new(PREFERRED_LOGICAL_WIDTH, PREFERRED_LOGICAL_HEIGHT)
+            .expect("首选窗口尺寸必须能被 MainWindowSize 接受，否则兜底会被静默跳过");
+        assert_eq!(preferred.width, 1180);
+        assert_eq!(preferred.height, 780);
+        assert!(preferred.width >= MIN_LOGICAL_WIDTH && preferred.height >= MIN_LOGICAL_HEIGHT);
     }
 
     #[test]

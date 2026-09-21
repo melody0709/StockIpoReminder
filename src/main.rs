@@ -258,6 +258,7 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     );
     #[cfg(not(windows))]
     {
+        apply_initial_main_window_size(&ui);
         ui.show().context("无法显示主窗口")?;
         apply_restored_main_window_size(&ui);
         operations::log(

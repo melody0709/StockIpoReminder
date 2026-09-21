@@ -3,6 +3,10 @@ use super::*;
 #[cfg(windows)]
 static MAIN_WINDOW_NATIVE_PREPARED: AtomicBool = AtomicBool::new(false);
 
+/// 等待原生窗口尺寸与 Slint 缓存对齐的轮询节奏：间隔与最大次数。
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(120);
+const SETTLE_POLL_ATTEMPTS: usize = 8;
+
 #[derive(Default)]
 pub(crate) struct RuntimeUiBridgeState {
     startup_applied: bool,
@@ -423,6 +427,17 @@ pub(crate) fn force_full_repaint(window: &MainWindow) {
 }
 
 pub(crate) fn show_and_repaint(window: &MainWindow) {
+    // 首帧尺寸必须在 show() 之前定下来：此时原生窗口尚未创建，winit 会把尺寸写进窗口属性，
+    // 窗口"一出生"就是目标尺寸，不再有"先按最小尺寸显示、再被程序改大"的过程。
+    if let Some(size) = apply_initial_main_window_size(window) {
+        operations::log(
+            "INFO",
+            &format!(
+                "主窗口首次显示前已设定尺寸：logicalWidth={} logicalHeight={} event=main_window_size_preapplied",
+                size.width, size.height
+            ),
+        );
+    }
     if let Err(error) = window.show() {
         operations::log("ERROR", &format!("无法显示主窗口：{error}"));
         return;
@@ -457,21 +472,46 @@ pub(crate) fn show_and_repaint(window: &MainWindow) {
                 },
                 |()| true,
             );
+            // 常驻托盘期间显示缩放变化时，窗口缓存的 DPI 不会刷新；此时界面会按旧缩放渲染，
+            // 只能重启程序恢复。这里只记录一次，便于用户与支持人员定位。
+            if let Some((window_dpi, monitor_dpi)) =
+                windows_integration::window_dpi_mismatch(window.window())
+            {
+                operations::log(
+                    "WARN",
+                    &format!(
+                        "主窗口缩放已过期：windowDpi={window_dpi} monitorDpi={monitor_dpi}，界面按旧缩放渲染，重启程序可恢复 event=main_window_dpi_stale"
+                    ),
+                );
+            }
             if !(work_area_ready && icon_ready) {
                 MAIN_WINDOW_NATIVE_PREPARED.store(false, Ordering::Release);
             }
         });
     }
     force_full_repaint(window);
+    schedule_settled_repaint(window);
+}
 
-    // The native window and the software renderer finish restoring on
-    // different Windows messages. Re-mark the complete root dirty after that
-    // transition so a recycled backing buffer cannot leak through the UI.
-    let weak = window.as_weak();
-    Timer::single_shot(Duration::from_millis(50), move || {
-        if let Some(window) = weak.upgrade() {
+/// 等原生窗口尺寸与 Slint 缓存对齐后，再整窗重绘一次。
+///
+/// 原生窗口与软件渲染器要经过几次 Windows 消息才对齐；对齐之前提交的重绘覆盖不到新暴露的
+/// 区域，那块区域会一直空着（透出桌面），只有下一次真正的尺寸变化才会把它画上。
+fn schedule_settled_repaint(window: &MainWindow) {
+    poll_settled_repaint(window.as_weak(), 0);
+}
+
+fn poll_settled_repaint(window: slint::Weak<MainWindow>, attempt: usize) {
+    Timer::single_shot(SETTLE_POLL_INTERVAL, move || {
+        let Some(window) = window.upgrade() else {
+            return;
+        };
+        let settled = windows_integration::window_size_settled(window.window());
+        if settled || attempt + 1 >= SETTLE_POLL_ATTEMPTS {
             force_full_repaint(&window);
+            return;
         }
+        poll_settled_repaint(window.as_weak(), attempt + 1);
     });
 }
 

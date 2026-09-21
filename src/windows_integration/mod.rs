@@ -52,6 +52,7 @@ use windows::{
             WinRT::{RO_INIT_SINGLETHREADED, RoInitialize},
         },
         UI::{
+            HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
             Shell::{
                 FOLDERID_CommonPrograms, KF_FLAG_DEFAULT,
                 PropertiesSystem::{

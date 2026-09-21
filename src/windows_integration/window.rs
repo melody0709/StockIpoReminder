@@ -71,7 +71,9 @@ pub fn fit_window_to_work_area(window: &slint::Window) -> Result<()> {
         let margin = (8.0 * window.scale_factor()).round().max(1.0) as i32;
         let available_width = (work_width - frame_width - margin * 2).max(1) as u32;
         let available_height = (work_height - frame_height - margin * 2).max(1) as u32;
-        let current_size = window.size();
+        // 以原生客户区为准：程序化改尺寸后 Slint 的 window.size() 可能仍是一帧之前的旧值，
+        // 用它做钳制/居中会让窗口底边落到工作区之外，而屏幕外那一段永远不会被绘制。
+        let current_size = slint::PhysicalSize::new(client_width as u32, client_height as u32);
         let scale_factor = window.scale_factor();
         let minimum_width = (800.0 * scale_factor).round().max(1.0) as u32;
         let minimum_height = (500.0 * scale_factor).round().max(1.0) as u32;
@@ -95,6 +97,91 @@ pub fn fit_window_to_work_area(window: &slint::Window) -> Result<()> {
     {
         let _ = window;
         Ok(())
+    }
+}
+
+/// Slint 缓存的窗口尺寸是否已经追上原生客户区。
+///
+/// 程序化改尺寸后，原生窗口和 Slint 会分几步才对齐；在对齐之前提交的重绘只覆盖旧区域，
+/// 屏幕外或新增的那一段会停在未绘制状态，表现为窗口底部直接透出桌面，只有再次改尺寸才会恢复。
+pub fn window_size_settled(window: &slint::Window) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(client) = window_client_size(window) else {
+            return false;
+        };
+        let cached = window.size();
+        client.width.abs_diff(cached.width) <= 1 && client.height.abs_diff(cached.height) <= 1
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        true
+    }
+}
+
+/// 原生客户区尺寸（物理像素），读取失败时返回 `None`。
+pub fn window_client_size(window: &slint::Window) -> Option<slint::PhysicalSize> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = handle.window_handle().ok()?;
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            return None;
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        let mut client_rect = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut client_rect) }.is_err() {
+            return None;
+        }
+        Some(slint::PhysicalSize::new(
+            (client_rect.right - client_rect.left).max(0) as u32,
+            (client_rect.bottom - client_rect.top).max(0) as u32,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+/// 窗口自身 DPI 与所在显示器 DPI 不一致时返回 `(窗口 DPI, 显示器 DPI)`。
+///
+/// 常驻托盘的应用在隐藏期间遇到显示缩放变化时，窗口缓存的 DPI 不会刷新，
+/// 于是 UI 会一直按旧缩放渲染，直到窗口被系统重新计算 DPI 为止。
+pub fn window_dpi_mismatch(window: &slint::Window) -> Option<(u32, u32)> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window.window_handle();
+        let raw = handle.window_handle().ok()?;
+        let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+            return None;
+        };
+        let hwnd = HWND(raw.hwnd.get() as *mut _);
+        let window_dpi = unsafe { GetDpiForWindow(hwnd) };
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut monitor_dpi_x = 0u32;
+        let mut monitor_dpi_y = 0u32;
+        unsafe {
+            GetDpiForMonitor(
+                monitor,
+                MDT_EFFECTIVE_DPI,
+                &mut monitor_dpi_x,
+                &mut monitor_dpi_y,
+            )
+        }
+        .ok()?;
+        (window_dpi.abs_diff(monitor_dpi_x) >= 2).then_some((window_dpi, monitor_dpi_x))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
     }
 }
 

@@ -14,6 +14,15 @@
 
 ## [未发布]
 
+## 0.4.3 — 2026-09-21
+
+### 修复
+
+- **主窗口首次显示后下方出现整条未绘制（透明）区域**：从托盘或二次启动唤出主窗口时会“先按最小尺寸显示、再被程序改成保存的尺寸”，而工作区钳制与居中用到的是 Slint 缓存的旧尺寸，窗口下沿因此落到工作区（屏幕）之外；软件渲染器只提交脏矩形，屏幕外那一段永远画不上，桌面直接透出来，只有再次改尺寸才恢复。现在改为：显示前就下发窗口尺寸（`window_state::apply_initial_main_window_size`，原生窗口创建即目标尺寸）、工作区钳制与居中改用原生客户区几何（`windows_integration::window_client_size`）、原生尺寸与 Slint 缓存对齐后再补一次整窗重绘（`runtime_bridge::schedule_settled_repaint`，轮询间隔 120ms、最多 8 次）。
+- 顺带行为变化：没有保存过窗口尺寸时（首次运行或状态文件不可用）按 `ui/main.slint` 的首选尺寸 1180x780 开窗，不再停在最小尺寸 800x500。
+- **窗口缩放（DPI）过期检测**：常驻托盘期间显示缩放变化时，Windows 不会把变化通知到隐藏窗口，窗口缓存的 DPI 停留在旧值（实测：显示器 144 DPI、主窗口仍是 96 DPI），界面会一直按旧缩放渲染。现在首次显示时比对 `GetDpiForWindow` 与显示器 DPI，不一致就写一条 WARN（`event=main_window_dpi_stale`），提示重启程序恢复；不在程序内擅自换算尺寸，避免出现窗口变大而界面仍按旧缩放渲染的错配。
+- 依赖：`windows` crate 增加 `Win32_UI_HiDpi` 特性（`GetDpiForWindow` / `GetDpiForMonitor`）。
+
 ### 变更
 
 - **文档版本基线同步到 0.4.2**：`README.md` 的「当前版本」行、MSI 文件名与便携包文件名此前仍停留在 `0.3.7`，现改为 `0.4.2`，并显式声明版本号以 `Cargo.toml` 为唯一来源。
@@ -24,8 +33,17 @@
 
 ### 验证
 
-- `rtk cargo fmt` 无残留改动；`rtk cargo test`：174 项通过。
-- 本次为文档与注释修正，无可观察行为变化，因此未重新生成发布产物。
+- `rtk cargo fmt` 无残留改动；`rtk cargo test`：175 项通过（新增 1 项「首选窗口尺寸兜底可被接受」用例）。
+- 复现与回归（本机 3840x2160 @150%，工作区 3840x2088，用临时数据目录 + 历史保存尺寸驱动托盘/二次启动唤出路径）：
+  - 修复前：保存尺寸 1499x1128（逻辑）时窗口外框 2262x1728 落在 y=652，底边 2380 超出屏幕 2160；逐像素比对“窗口显示中”与“应用自身隐藏后”，窗口第 1436～1667 行（232 行）与桌面完全一致，即整条未绘制透明区。
+  - 修复后：同一场景窗口完全落在工作区内（底部越界行数 0），整行未绘制区域 0 行；另测「保存尺寸大于工作区（2600x1500）」被正确钳制到 3816x2064 并居中于 (12,12)、「全新数据目录」按 1180x780 打开，均为 0 行未绘制。
+  - 日志新增事件 `event=main_window_size_preapplied`（显示前下发尺寸）；`event=main_window_size_restored` 语义不变（尺寸已等于保存值时立即记录，需要补改尺寸时仍在 150ms 后记录），`window-state.json` 读写不受影响，`scripts/smoke-release.ps1` 的既有断言继续有效。
+- 未覆盖：多显示器与 100%/150% 缩放切换、任务栏贴靠/还原需要人工走查；`event=main_window_dpi_stale` 只在“显示器缩放变更后窗口仍为旧 DPI”这一本机既有状态下才能触发，本次仅确认检测逻辑与日志输出。
+- 发布产物（`rtk cmd /c build.bat --package`）：`build/packages/0.4.3/` 下的 `StockIpoReminder-0.4.3-win-x64.msi`（6,590,464 字节，sha256 `05b4fdd9…f47d3787`）与 `StockIpoReminder-0.4.3-win-x64-portable.zip`（8,162,869 字节，sha256 `f4197078…138d786f9`），以及 `release-manifest.json`、`SHA256SUMS.txt`；`scripts/validate-build-layout.ps1` 通过。
+- `scripts/smoke-release.ps1` 全部 20 项断言通过（报告：`build/artifacts/tests/smoke/windows-rust-0.4.3-20260921-092011.json`），其中 `secondLaunchActivatesExistingInstance`、`mainWindowSizePersistence` 覆盖本次改动的窗口路径。
+- `scripts/test-signing-update.ps1` 6/6 项通过（报告：`build/artifacts/tests/signing-update/signing-update-0.4.3-20260921-092053.json`）：预哈希签名接受、篡改清单/安装包拒绝、错误密钥拒绝、正式信任根拒绝测试密钥、legacy 签名拒绝。
+- 用重建后的发布版 EXE 复验：窗口 2259x1726 落在 (790,181)，底边不越界，整行未绘制区域 0 行；日志为 `event=main_window_size_preapplied` + `event=main_window_size_restored`。
+- 待人工完成（需要仓库外的 Minisign 私钥）：`scripts/sign-update-manifest.ps1` 签名更新清单 → 复核 `scripts/audit-release.ps1` → 建 Draft Release 并一次性发布。
 
 ## 0.4.2 — 2026-09-17
 
