@@ -36,7 +36,7 @@ const RUNTIME_HEARTBEAT_WARNING_MINUTES: i64 = 3;
 const RUNTIME_HEARTBEAT_FAILED_MINUTES: i64 = 15;
 const BACKUP_PAGES_PER_STEP: i32 = 1024;
 const BACKUP_STEP_PAUSE: StdDuration = StdDuration::from_millis(1);
-pub const LATEST_SCHEMA_VERSION: i64 = 11;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Clone)]
 pub struct Database {
@@ -47,6 +47,7 @@ mod acknowledgements;
 mod backup;
 mod events;
 mod evidence;
+mod finance;
 mod health;
 mod maintenance;
 mod mapping;
@@ -59,8 +60,8 @@ mod sync;
 
 #[allow(unused_imports)]
 use {
-    backup::*, events::*, health::*, maintenance::*, mapping::*, overrides::*, reminders::*,
-    schema::*, secondary::*, settings::*,
+    backup::*, events::*, finance::*, health::*, maintenance::*, mapping::*, overrides::*,
+    reminders::*, schema::*, secondary::*, settings::*,
 };
 
 #[cfg(test)]

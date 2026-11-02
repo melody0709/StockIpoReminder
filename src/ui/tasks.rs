@@ -142,6 +142,7 @@ pub(crate) fn refresh_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bool {
         })
         .collect::<Vec<_>>();
     ui.set_source_health(ModelRc::from(Rc::new(VecModel::from(sources))));
+    let _ = refresh_finance_ui(ui, runtime);
     true
 }
 

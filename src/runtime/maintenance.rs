@@ -3,6 +3,9 @@ use super::*;
 pub(crate) fn run_daily_maintenance(database: &Database, data_root: &Path) {
     let backup_directory = data_root.join("backups");
     let today = now_china().date_naive();
+    if let Err(error) = database.cleanup_finance_shown(today - chrono::Duration::days(90)) {
+        operations::log("WARN", &format!("金融提醒去重台账清理失败：{error:#}"));
+    }
     let fingerprint = database.business_state_fingerprint();
     match fingerprint {
         Ok(Some(fingerprint)) if fs_needs_daily_backup(&backup_directory, today) => {

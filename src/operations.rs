@@ -380,6 +380,13 @@ pub fn create_diagnostic_bundle(data_root: &Path, database: &Database) -> Result
         "pendingCount": database.pending_count().unwrap_or_default(),
         "settings": settings,
         "settingsError": settings_error,
+        "financeReminder": database.finance_counts().ok().map(|(enabled_cards, shown_today)| {
+            json!({
+                "enabledCards": enabled_cards,
+                "shownToday": shown_today,
+                "note": "仅计数，不包含信用卡别名、银行、还款日期或逆回购配置"
+            })
+        }),
         "windowsToast": toast_diagnostics,
         "note": "诊断包不包含 SQLite 数据库、公告原文、Cookie、Authorization、第二通知通道凭据或绝对路径"
     });

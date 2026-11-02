@@ -2,6 +2,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/StockIpoReminder.ico");
+    // 显式声明 UI 源文件：Slint 编译产物在 OUT_DIR，缺这条时改 main.slint 不一定会
+    // 触发 build script 重跑，会出现「源码已改、产物仍是旧界面」的静默不同步。
+    println!("cargo:rerun-if-changed=ui/main.slint");
     println!("cargo:rerun-if-env-changed=STOCK_IPO_UPDATE_FEED_URL");
     println!("cargo:rerun-if-env-changed=STOCK_IPO_UPDATE_SIGNER_SHA256");
     println!("cargo:rerun-if-env-changed=STOCK_IPO_CRASH_REPORT_URL");

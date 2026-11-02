@@ -40,14 +40,86 @@ impl Default for RuntimeSnapshot {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Reminder(ReminderDelivery),
+    Finance(Vec<crate::finance::FinanceReminder>),
     Health { state: HealthState, text: String },
 }
 
 pub(crate) enum RuntimeCommand {
     Sync(SyncRequest),
+    SyncFinished {
+        reason: String,
+        result: std::result::Result<(), String>,
+    },
     Wake,
     Recovery,
     Stop,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FinanceRuntimeState {
+    in_flight: HashSet<String>,
+    retry_pending: BTreeMap<String, crate::model::ChinaDateTime>,
+    shown_this_session: HashSet<String>,
+}
+
+impl FinanceRuntimeState {
+    pub(crate) fn is_blocked(&self, key: &str, now: crate::model::ChinaDateTime) -> bool {
+        self.in_flight.contains(key)
+            || self.shown_this_session.contains(key)
+            || self
+                .retry_pending
+                .get(key)
+                .is_some_and(|retry_at| *retry_at > now)
+    }
+
+    pub(crate) fn begin(&mut self, keys: impl IntoIterator<Item = String>) {
+        for key in keys {
+            self.in_flight.insert(key);
+        }
+    }
+
+    pub(crate) fn retry_pending(&self) -> &BTreeMap<String, crate::model::ChinaDateTime> {
+        &self.retry_pending
+    }
+
+    pub(crate) fn presented(&mut self, keys: &[String]) -> Result<()> {
+        self.ensure_keys(keys)?;
+        for key in keys {
+            self.in_flight.remove(key);
+            self.retry_pending.remove(key);
+            self.shown_this_session.insert(key.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn failed(
+        &mut self,
+        keys: &[String],
+        now: crate::model::ChinaDateTime,
+        valid_until: crate::model::ChinaDateTime,
+    ) {
+        for key in keys {
+            self.in_flight.remove(key);
+            let retry_at = (now + chrono::Duration::seconds(30)).min(valid_until);
+            if retry_at > now {
+                self.retry_pending.insert(key.clone(), retry_at);
+            }
+        }
+    }
+
+    pub(crate) fn discard(&mut self, keys: &[String]) {
+        for key in keys {
+            self.in_flight.remove(key);
+            self.retry_pending.remove(key);
+        }
+    }
+
+    fn ensure_keys(&self, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            anyhow::bail!("提醒 key 不能为空");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +133,7 @@ type UiNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
 #[derive(Clone)]
 pub(crate) struct RuntimeUiState {
     pub(crate) snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    pub(crate) finance: Arc<Mutex<FinanceRuntimeState>>,
     pub(crate) notifier: Arc<Mutex<Option<UiNotifier>>>,
 }
 
@@ -68,6 +141,7 @@ impl RuntimeUiState {
     pub(crate) fn new() -> Self {
         Self {
             snapshot: Arc::new(RwLock::new(RuntimeSnapshot::default())),
+            finance: Arc::new(Mutex::new(FinanceRuntimeState::default())),
             notifier: Arc::new(Mutex::new(None)),
         }
     }
@@ -103,6 +177,9 @@ impl RuntimeHandle {
     }
     pub fn wake(&self) {
         let _ = self.command_sender.send(RuntimeCommand::Wake);
+    }
+    pub fn notify_ui(&self) {
+        self.ui_state.notify();
     }
     pub fn recovery(&self) {
         let _ = self.command_sender.send(RuntimeCommand::Recovery);
@@ -241,6 +318,122 @@ impl RuntimeHandle {
         self.wake();
         Ok(())
     }
+    pub fn repo_settings(&self) -> Result<crate::finance::RepoSettings> {
+        self.ensure_ready()?;
+        self.database.repo_settings()
+    }
+    pub fn save_repo_settings(&self, settings: &crate::finance::RepoSettings) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.save_repo_settings(settings)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn repo_day_acked(&self, date: chrono::NaiveDate) -> Result<bool> {
+        self.ensure_ready()?;
+        self.database.repo_day_acked(date)
+    }
+    pub fn set_repo_day_acked(&self, date: chrono::NaiveDate, acked: bool) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.set_repo_day_acked(date, acked)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn credit_cards(&self) -> Result<Vec<crate::finance::CreditCard>> {
+        self.ensure_ready()?;
+        self.database.credit_cards()
+    }
+    pub fn save_credit_card(&self, card: &crate::finance::CreditCard) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.save_credit_card(card)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn delete_credit_card(&self, id: &str) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.delete_credit_card(id)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn credit_card_settled(&self, id: &str) -> Result<Option<String>> {
+        self.ensure_ready()?;
+        self.database.credit_card_settled(id)
+    }
+    pub fn mark_credit_card_paid(&self, id: &str, cycle: &str) -> Result<()> {
+        self.ensure_ready()?;
+        let card = self
+            .database
+            .credit_card(id)?
+            .ok_or_else(|| anyhow::anyhow!("信用卡不存在"))?;
+        let due = crate::finance::due_on_for_cycle(cycle, card.due_day)?;
+        self.database.mark_credit_card_paid(id, cycle, due)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn undo_credit_card_action(&self, id: &str) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.undo_credit_card_action(id)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn finance_presented(&self, reminders: &[crate::finance::FinanceReminder]) -> Result<()> {
+        self.ensure_ready()?;
+        for reminder in reminders {
+            self.database.mark_finance_shown(
+                reminder.kind.as_str(),
+                &reminder.source_id,
+                &reminder.occurrence_key,
+                reminder.event_date,
+            )?;
+        }
+        let keys = reminders
+            .iter()
+            .map(|reminder| reminder.occurrence_key.clone())
+            .collect::<Vec<_>>();
+        if let Ok(mut state) = self.ui_state.finance.lock() {
+            state.presented(&keys)?;
+        }
+        self.wake();
+        Ok(())
+    }
+    pub fn finance_present_failed(
+        &self,
+        reminders: &[crate::finance::FinanceReminder],
+        category: &str,
+    ) {
+        let _ = category;
+        let now = crate::core::now_china();
+        if let Ok(mut state) = self.ui_state.finance.lock() {
+            for reminder in reminders {
+                state.failed(
+                    std::slice::from_ref(&reminder.occurrence_key),
+                    now,
+                    reminder.valid_until,
+                );
+            }
+        }
+        self.wake();
+    }
+    pub fn finance_discard(&self, keys: &[String]) {
+        if let Ok(mut state) = self.ui_state.finance.lock() {
+            state.discard(keys);
+        }
+        self.wake();
+    }
+    pub fn finance_reminder_is_current(
+        &self,
+        reminder: &crate::finance::FinanceReminder,
+    ) -> Result<bool> {
+        self.ensure_ready()?;
+        Ok(
+            crate::finance::due_finance_reminders(
+                &self.database,
+                crate::core::now_china(),
+                |_| false,
+            )?
+            .iter()
+            .any(|item| item.occurrence_key == reminder.occurrence_key),
+        )
+    }
     pub fn database(&self) -> Result<&Database> {
         self.ensure_ready()?;
         Ok(&self.database)
@@ -285,6 +478,7 @@ where
     let ui_state = RuntimeUiState::new();
     let ready = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::new(AtomicBool::new(false));
+    let command_sender_for_run = command_sender.clone();
     let handle = RuntimeHandle {
         database: database.clone(),
         command_sender,
@@ -334,9 +528,10 @@ where
                     initial_reason.take(),
                     suppress_overdue_initial_sync,
                     &command_receiver,
+                    &command_sender_for_run,
                     &event_sender,
                     &ui_state,
-                    &stop_requested,
+                    Arc::clone(&stop_requested),
                 ) {
                     Ok(()) => return,
                     Err(error) => {
@@ -381,6 +576,7 @@ where
                         });
                         match command_receiver.recv_timeout(delay) {
                             Ok(RuntimeCommand::Sync(request)) => initial_reason = Some(request),
+                            Ok(RuntimeCommand::SyncFinished { .. }) => {}
                             Ok(RuntimeCommand::Wake) | Ok(RuntimeCommand::Recovery) => {}
                             Ok(RuntimeCommand::Stop)
                             | Err(mpsc::RecvTimeoutError::Disconnected) => return,

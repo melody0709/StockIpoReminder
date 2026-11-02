@@ -1,3 +1,5 @@
+use chrono::NaiveDate;
+
 use super::*;
 
 fn filter_event(exchange: Exchange, status: LifecycleStatus) -> IpoEvent {
@@ -241,4 +243,62 @@ fn operation_gate_allows_only_one_owner_and_releases_on_drop() {
     assert!(OperationGate::acquire(Arc::clone(&flag)).is_none());
     drop(first);
     assert!(OperationGate::acquire(flag).is_some());
+}
+
+#[test]
+fn editor_is_cleared_only_when_the_deleted_card_is_the_edit_target() {
+    // 删的正是编辑中的卡：清空表单，避免残留 id 再保存把卡片复活。
+    assert!(editor_holds_card("card-a", "card-a"));
+    // 删的是别的卡：保留正在填的内容。
+    assert!(!editor_holds_card("card-a", "card-b"));
+    // 新增模式（表单没有 id）任何时候都不该被清空。
+    assert!(!editor_holds_card("", "card-a"));
+    assert!(!editor_holds_card("   ", "card-a"));
+}
+
+#[test]
+fn repo_ack_uses_the_reminder_date_not_the_click_date() {
+    let today = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+    // 周五的弹窗拖到周一才点：写入的必须是周五，不能把周一整天标成已处理。
+    assert_eq!(
+        repo_ack_date("2026-10-30", today).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()
+    );
+    // 当天正常点击。
+    assert_eq!(repo_ack_date("2026-11-02", today).unwrap(), today);
+    // 未来日期与无法识别的日期一律拒绝，宁可不动状态。
+    assert!(repo_ack_date("2026-11-03", today).is_err());
+    assert!(repo_ack_date("", today).is_err());
+    assert!(repo_ack_date("2026/11/02", today).is_err());
+}
+
+#[test]
+fn finance_toast_targets_are_classified_before_ipo_lookup() {
+    assert_eq!(
+        finance_toast_target("finance:repo"),
+        Some(FinanceToastTarget::ReverseRepo)
+    );
+    assert_eq!(
+        finance_toast_target("finance:card:0d1f"),
+        Some(FinanceToastTarget::CreditCard)
+    );
+    assert_eq!(
+        finance_toast_target("finance:card"),
+        Some(FinanceToastTarget::CreditCard)
+    );
+    // IPO 事件 ID 与更新目标不能被误判成理财。
+    assert_eq!(finance_toast_target("sh-601001-2026-11-05"), None);
+    assert_eq!(finance_toast_target("update:0.5.0"), None);
+}
+
+#[test]
+fn slint_source_is_registered_as_a_build_dependency() {
+    // 曾经出现「改了 ui/main.slint，产物仍是旧界面」：Slint 编译产物在 OUT_DIR，
+    // build script 不重跑就不会更新。这条断言保证重跑条件一直在。
+    let build_script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs")).unwrap();
+    assert!(
+        build_script.contains("cargo:rerun-if-changed=ui/main.slint"),
+        "build.rs 必须声明 ui/main.slint 为重跑条件"
+    );
 }

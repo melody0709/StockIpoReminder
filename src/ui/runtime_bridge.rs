@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use super::*;
 
 #[cfg(windows)]
@@ -7,10 +9,20 @@ static MAIN_WINDOW_NATIVE_PREPARED: AtomicBool = AtomicBool::new(false);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const SETTLE_POLL_ATTEMPTS: usize = 8;
 
+#[derive(Debug)]
+pub(crate) struct QueuedFinance {
+    pub(crate) reminders: Vec<crate::finance::FinanceReminder>,
+    pub(crate) alerted: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct RuntimeUiBridgeState {
     startup_applied: bool,
     last_ui_revision: Option<u64>,
+    pending_finance: VecDeque<QueuedFinance>,
+    active_kind: Option<&'static str>,
+    active_finance: Vec<crate::finance::FinanceReminder>,
+    active_finance_confirmed: bool,
     #[cfg(windows)]
     last_tray_status: Option<(i64, bool)>,
 }
@@ -89,6 +101,207 @@ impl ReminderAlerts {
     pub(crate) fn fail_closed() -> Self {
         Self::default()
     }
+}
+
+fn finance_target(reminders: &[crate::finance::FinanceReminder]) -> String {
+    match reminders.first().map(|item| item.kind) {
+        Some(crate::finance::FinanceKind::ReverseRepo) => "finance:repo".into(),
+        Some(crate::finance::FinanceKind::CreditCard) => reminders
+            .first()
+            .map(|item| format!("finance:card:{}", item.source_id))
+            .unwrap_or_else(|| "finance:card".into()),
+        None => "finance:card".into(),
+    }
+}
+
+fn finance_alert_text(reminders: &[crate::finance::FinanceReminder]) -> (String, String) {
+    if reminders.len() == 1 {
+        let item = &reminders[0];
+        let body = if item.kind == crate::finance::FinanceKind::CreditCard {
+            "点击查看详情".to_owned()
+        } else {
+            item.body
+                .lines()
+                .next()
+                .unwrap_or("点击查看详情")
+                .to_owned()
+        };
+        (item.title.clone(), body)
+    } else {
+        (
+            "理财提醒".into(),
+            format!("有 {} 条提醒待查看", reminders.len()),
+        )
+    }
+}
+
+fn queue_finance_batch(
+    bridge_state: &Arc<Mutex<RuntimeUiBridgeState>>,
+    runtime: &RuntimeHandle,
+    reminders: &[crate::finance::FinanceReminder],
+    #[cfg(windows)] tray: &Arc<native_tray::NativeTray>,
+) {
+    let alerts = match runtime.settings() {
+        Ok(settings) => ReminderAlerts::from_settings(&settings),
+        Err(error) => {
+            operations::log(
+                "ERROR",
+                &format!("排队理财提醒时读取设置失败，跳过声音/Toast：{error:#}"),
+            );
+            ReminderAlerts::fail_closed()
+        }
+    };
+    if alerts.sound {
+        windows_integration::play_alert();
+    }
+    let (title, body) = finance_alert_text(reminders);
+    #[cfg(windows)]
+    if alerts.toast {
+        tray.notify(&title, &body, Some(finance_target(reminders).as_str()));
+    }
+    if let Ok(mut state) = bridge_state.lock() {
+        state.pending_finance.push_back(QueuedFinance {
+            reminders: reminders.to_vec(),
+            alerted: true,
+        });
+    }
+}
+
+fn show_finance_batch(
+    reminder_window: &ReminderWindow,
+    runtime: &RuntimeHandle,
+    bridge_state: &Arc<Mutex<RuntimeUiBridgeState>>,
+    reminders: &[crate::finance::FinanceReminder],
+    alerted: bool,
+    #[cfg(windows)] tray: &Arc<native_tray::NativeTray>,
+) -> bool {
+    if reminders.is_empty() {
+        return false;
+    }
+    let single = reminders.len() == 1;
+    let item = &reminders[0];
+    let title = if single {
+        item.title.clone()
+    } else {
+        format!("理财提醒（{} 条）", reminders.len())
+    };
+    let body = reminders
+        .iter()
+        .map(|item| format!("{}\n{}", item.title, item.body))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    reminder_window.set_window_title(title.clone().into());
+    reminder_window.set_reminder_title(title.into());
+    // 多条合并时也沿用第一条的类型：界面只用它决定「打开」按钮跳哪个页面，
+    // 写成 "finance" 会让一批全是信用卡的提醒跳进逆回购页。
+    reminder_window.set_reminder_kind(item.kind.as_str().into());
+    reminder_window.set_reminder_source_id(
+        if single {
+            item.source_id.clone()
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    reminder_window.set_reminder_cycle_key(
+        if single {
+            item.primary_action_cycle.clone().unwrap_or_default()
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    reminder_window.set_reminder_open_label(item.open_label().into());
+    // 由 Rust 明确告诉界面这个窗口该进理财页还是今日任务：界面不该靠 kind 字符串猜分类，
+    // 健康摘要/通知测试的 kind 不是 ipo，按「非 ipo 就进理财」判断会把它们送错页面。
+    reminder_window.set_reminder_opens_finance(true);
+    reminder_window.set_primary_action_label(
+        if single {
+            item.primary_action_label.clone()
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    reminder_window.set_primary_action_enabled(single);
+    reminder_window.set_reminder_event_date(
+        if single {
+            item.event_date.format("%Y-%m-%d").to_string()
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    reminder_window.set_reminder_body(body.into());
+    reminder_window.set_reminder_event_id("".into());
+    reminder_window.set_reminder_event_version(0);
+    reminder_window.set_batch_count(0);
+    reminder_window.set_can_acknowledge(false);
+    let presentation_id = next_presentation_id();
+    let shown = show_dedicated_reminder(reminder_window);
+    if !shown {
+        runtime.finance_present_failed(reminders, "窗口显示失败");
+        return false;
+    }
+    if let Ok(mut state) = bridge_state.lock() {
+        // 队列判定只区分「理财」与「IPO」两类。这里必须写固定值：早前写成了单条提醒的
+        // kind（credit_card / reverse_repo），导致被 IPO 抢占时匹配不上、既不回队列
+        // 也不释放 in-flight，本次运行不再重试。
+        state.active_kind = Some("finance");
+        state.active_finance = reminders.to_vec();
+        state.active_finance_confirmed = false;
+    }
+    if !alerted {
+        let alerts = match runtime.settings() {
+            Ok(settings) => ReminderAlerts::from_settings(&settings),
+            Err(error) => {
+                operations::log(
+                    "ERROR",
+                    &format!("呈现理财提醒时读取设置失败，跳过声音/Toast：{error:#}"),
+                );
+                ReminderAlerts::fail_closed()
+            }
+        };
+        if alerts.sound {
+            windows_integration::play_alert();
+        }
+        let (toast_title, toast_body) = finance_alert_text(reminders);
+        #[cfg(windows)]
+        if alerts.toast {
+            tray.notify(
+                &toast_title,
+                &toast_body,
+                Some(finance_target(reminders).as_str()),
+            );
+        }
+    }
+    let reminders = reminders.to_vec();
+    let runtime = runtime.clone();
+    let visibility_window = reminder_window.as_weak();
+    let timer_state = Arc::clone(bridge_state);
+    Timer::single_shot(Duration::from_millis(150), move || {
+        if current_presentation_id() != presentation_id {
+            return;
+        }
+        let visibility = visibility_window
+            .upgrade()
+            .context("专用提醒窗口已被销毁")
+            .and_then(|window| windows_integration::confirm_window_visible(window.window()));
+        match visibility {
+            Ok(()) => {
+                if let Err(error) = runtime.finance_presented(&reminders) {
+                    operations::log("ERROR", &format!("记录理财提醒已展示状态失败：{error:#}"));
+                } else if let Ok(mut state) = timer_state.lock() {
+                    state.active_finance_confirmed = true;
+                }
+            }
+            Err(error) => {
+                operations::log("ERROR", &format!("理财提醒窗口可见性确认失败：{error:#}"));
+                runtime.finance_present_failed(&reminders, "可见性确认失败");
+            }
+        }
+    });
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,21 +436,81 @@ pub(crate) fn drain_runtime_ui(
         return;
     };
     let mut deliveries = Vec::new();
+    let mut finance_items = Vec::new();
     let mut health_summary = None;
     while let Some(event) = runtime.try_event() {
         match event {
             UiEvent::Reminder(delivery) => deliveries.push(delivery),
+            UiEvent::Finance(items) => finance_items.extend(items),
             UiEvent::Health { state, text } => health_summary = Some((state, text)),
         }
     }
+
+    let window_visible =
+        windows_integration::confirm_window_visible(reminder_window.window()).is_ok();
+    if !finance_items.is_empty() {
+        if deliveries.is_empty() && !window_visible {
+            let _ = show_finance_batch(
+                &reminder_window,
+                runtime,
+                bridge_state,
+                &finance_items,
+                false,
+                #[cfg(windows)]
+                tray,
+            );
+            finance_items.clear();
+        } else {
+            queue_finance_batch(
+                bridge_state,
+                runtime,
+                &finance_items,
+                #[cfg(windows)]
+                tray,
+            );
+            finance_items.clear();
+        }
+    }
     if !deliveries.is_empty() {
+        if let Ok(mut state) = bridge_state.lock() {
+            if state.active_kind == Some("finance") {
+                if !state.active_finance_confirmed && !state.active_finance.is_empty() {
+                    let reminders = std::mem::take(&mut state.active_finance);
+                    state.pending_finance.push_front(QueuedFinance {
+                        reminders,
+                        alerted: true,
+                    });
+                } else {
+                    state.active_finance.clear();
+                }
+            }
+            state.active_kind = Some("ipo");
+            state.active_finance_confirmed = false;
+        }
         let batch = reminder_batch(&deliveries, health_summary.as_ref().map(|value| &value.1));
+        reminder_window.set_window_title(batch.title.clone().into());
         reminder_window.set_reminder_title(batch.title.clone().into());
         reminder_window.set_reminder_body(batch.body.clone().into());
+        reminder_window.set_reminder_kind("ipo".into());
+        reminder_window.set_reminder_opens_finance(false);
+        reminder_window.set_reminder_event_date("".into());
+        reminder_window.set_reminder_source_id("".into());
+        reminder_window.set_reminder_cycle_key("".into());
+        reminder_window.set_reminder_open_label(
+            if batch.event_id.is_empty() {
+                "打开今日任务"
+            } else {
+                "打开详情"
+            }
+            .into(),
+        );
+        reminder_window.set_primary_action_enabled(false);
+        reminder_window.set_primary_action_label("".into());
         reminder_window.set_reminder_event_id(batch.event_id.clone().into());
         reminder_window.set_reminder_event_version(batch.event_version);
         reminder_window.set_batch_count(deliveries.len() as i32);
         reminder_window.set_can_acknowledge(batch.can_acknowledge);
+        let presentation_id = next_presentation_id();
         let shown = show_dedicated_reminder(&reminder_window);
         // 设置读取失败时 fail-closed：不回退默认值，避免在用户明确关闭
         // 声音/Toast 的情况下误触发提醒副作用。
@@ -266,6 +539,9 @@ pub(crate) fn drain_runtime_ui(
             let completion_runtime = runtime.clone();
             let visibility_window = reminder_window.as_weak();
             Timer::single_shot(Duration::from_millis(150), move || {
+                if current_presentation_id() != presentation_id {
+                    return;
+                }
                 let visibility = visibility_window
                     .upgrade()
                     .context("专用提醒窗口已被销毁")
@@ -311,16 +587,47 @@ pub(crate) fn drain_runtime_ui(
             }
         }
     } else if let Some((state, text)) = health_summary {
+        let window_visible =
+            windows_integration::confirm_window_visible(reminder_window.window()).is_ok();
+        if window_visible {
+            // 任何专用提醒窗口可见时，健康摘要只做被动提示，不能覆盖
+            // 正在显示的 IPO/finance 内容，也不能清空确认目标。
+            #[cfg(windows)]
+            if runtime
+                .settings()
+                .map(|settings| settings.toast_enabled)
+                .unwrap_or_else(|error| {
+                    operations::log(
+                        "ERROR",
+                        &format!("健康摘要读取通知设置失败，仍尝试 Toast：{error:#}"),
+                    );
+                    true
+                })
+            {
+                tray.notify("A 股打新提醒 · 健康摘要", &text, None);
+            }
+            return;
+        }
+        reminder_window.set_window_title("每日健康摘要".into());
         reminder_window.set_reminder_title(match state {
             HealthState::Failed => "每日健康摘要 · 需要处理".into(),
             HealthState::Warning => "每日健康摘要 · 存在警告".into(),
             _ => "每日健康摘要".into(),
         });
+        reminder_window.set_reminder_kind("health".into());
+        reminder_window.set_reminder_source_id("".into());
+        reminder_window.set_reminder_cycle_key("".into());
+        reminder_window.set_reminder_open_label("打开今日任务".into());
+        reminder_window.set_reminder_opens_finance(false);
+        reminder_window.set_reminder_event_date("".into());
+        reminder_window.set_primary_action_enabled(false);
+        reminder_window.set_primary_action_label("".into());
         reminder_window.set_reminder_body(text.clone().into());
         reminder_window.set_reminder_event_id("".into());
         reminder_window.set_reminder_event_version(0);
         reminder_window.set_batch_count(0);
         reminder_window.set_can_acknowledge(false);
+        let _presentation_id = next_presentation_id();
         let _ = show_dedicated_reminder(&reminder_window);
         #[cfg(windows)]
         if runtime
@@ -336,6 +643,51 @@ pub(crate) fn drain_runtime_ui(
         {
             tray.notify("A 股打新提醒 · 健康摘要", &text, None);
         }
+    }
+
+    let queue_is_pending = bridge_state
+        .lock()
+        .map(|state| !state.pending_finance.is_empty())
+        .unwrap_or(false);
+    let window_visible =
+        windows_integration::confirm_window_visible(reminder_window.window()).is_ok();
+    if !queue_is_pending || window_visible {
+        return;
+    }
+    let now = crate::core::now_china();
+    let mut next = None;
+    if let Ok(mut state) = bridge_state.lock() {
+        while let Some(front) = state.pending_finance.front() {
+            let expired = front.reminders.iter().all(|item| item.valid_until <= now);
+            let stale = !expired
+                && front
+                    .reminders
+                    .iter()
+                    .any(|item| !runtime.finance_reminder_is_current(item).unwrap_or(false));
+            if expired || stale {
+                let item = state.pending_finance.pop_front().unwrap();
+                let keys = item
+                    .reminders
+                    .iter()
+                    .map(|reminder| reminder.occurrence_key.clone())
+                    .collect::<Vec<_>>();
+                runtime.finance_discard(&keys);
+            } else {
+                break;
+            }
+        }
+        next = state.pending_finance.pop_front();
+    }
+    if let Some(next) = next {
+        let _ = show_finance_batch(
+            &reminder_window,
+            runtime,
+            bridge_state,
+            &next.reminders,
+            next.alerted,
+            #[cfg(windows)]
+            tray,
+        );
     }
 }
 

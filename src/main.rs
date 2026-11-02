@@ -4,6 +4,7 @@ mod announcement;
 mod core;
 mod crash_upload;
 mod deployment;
+mod finance;
 mod model;
 mod network;
 mod operations;
@@ -131,9 +132,14 @@ fn run_application(options: RuntimeOptions, startup_started: Instant) -> Result<
     });
     ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     let reminder_window = ReminderWindow::new().context("无法创建专用提醒窗口")?;
-    reminder_window
-        .window()
-        .on_close_requested(|| CloseRequestResponse::HideWindow);
+    {
+        let close_runtime = runtime.clone();
+        reminder_window.window().on_close_requested(move || {
+            let runtime = close_runtime.clone();
+            Timer::single_shot(Duration::from_millis(80), move || runtime.notify_ui());
+            CloseRequestResponse::HideWindow
+        });
+    }
     ui.set_data_root_text(format!("数据目录：{}", options.data_root.display()).into());
     let msi_installed = match deployment::installed_msi_product_code() {
         Ok(Some(_)) => {

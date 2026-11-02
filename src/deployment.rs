@@ -429,12 +429,18 @@ fn install_application(
     fs::create_dir_all(data_root)?;
     let database = Database::new(data_root);
     if database.path().exists() {
+        // 必须先在旧 schema 上备份，再执行迁移；否则备份文件已经是新结构，
+        // 无法用于回滚。正常启动路径与 MSI 安装路径必须遵循同一顺序。
+        if let Some(backup) =
+            crate::operations::prepare_database_upgrade(data_root, env!("CARGO_PKG_VERSION"))?
+        {
+            crate::operations::log(
+                "INFO",
+                &format!("安装/升级前已备份 SQLite：{}", backup.display()),
+            );
+        }
         database.initialize()?;
-        let backup = database.backup(&data_root.join("backups"))?;
-        crate::operations::log(
-            "INFO",
-            &format!("安装/升级前已备份 SQLite：{}", backup.display()),
-        );
+        crate::operations::mark_database_version(data_root, env!("CARGO_PKG_VERSION"))?;
     }
 
     let parent = install_root.parent().context("安装目录缺少父目录")?;

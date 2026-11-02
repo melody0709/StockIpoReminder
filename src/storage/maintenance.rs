@@ -156,6 +156,34 @@ impl Database {
             "announcements",
             "SELECT quote(id)||','||quote(ipo_event_id)||','||quote(provider)||','||quote(announcement_id)||','||quote(announcement_type)||','||quote(title)||','||quote(published_at)||','||quote(source_url)||','||quote(local_path)||','||quote(file_hash)||','||quote(extraction_status)||','||quote(extracted_text_hash)||','||quote(parser_version)||','||quote(parsed_fields_json) FROM announcement_documents ORDER BY id",
         )?;
+        append_fingerprint_rows(
+            &connection,
+            &mut state,
+            &mut row_count,
+            "repo-settings",
+            "SELECT quote(enabled)||','||quote(primary_time)||','||quote(fallback_time) FROM reverse_repo_settings WHERE id=1",
+        )?;
+        append_fingerprint_rows(
+            &connection,
+            &mut state,
+            &mut row_count,
+            "repo-acks",
+            "SELECT quote(trade_date) FROM reverse_repo_day_acks ORDER BY trade_date",
+        )?;
+        append_fingerprint_rows(
+            &connection,
+            &mut state,
+            &mut row_count,
+            "credit-cards",
+            "SELECT quote(id)||','||quote(alias)||','||quote(bank)||','||quote(due_day)||','||quote(remind_time)||','||quote(lead_days_json)||','||quote(overdue_enabled)||','||quote(enabled)||','||quote(first_tracked_cycle) FROM credit_cards ORDER BY id",
+        )?;
+        append_fingerprint_rows(
+            &connection,
+            &mut state,
+            &mut row_count,
+            "credit-card-actions",
+            "SELECT quote(card_id)||','||quote(cycle_key)||','||quote(due_on)||','||quote(action) FROM credit_card_actions ORDER BY card_id,cycle_key",
+        )?;
         Ok((row_count > 0).then(|| sha256(state)))
     }
 

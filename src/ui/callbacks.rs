@@ -19,10 +19,12 @@ pub(crate) fn wire_reminder_callbacks(
                 show_event_details(&main_window, &details_runtime, event_id.as_str());
             }
         }
+        details_runtime.notify_ui();
     });
 
     let reminder_weak = reminder.as_weak();
     let main_weak = main_window.as_weak();
+    let ack_runtime = runtime.clone();
     reminder.on_request_acknowledgement(move |event_id, event_version| {
         if let Some(reminder) = reminder_weak.upgrade() {
             let _ = reminder.hide();
@@ -38,13 +40,61 @@ pub(crate) fn wire_reminder_callbacks(
             main_window.set_show_confirmation(true);
             show_and_repaint(&main_window);
         }
+        ack_runtime.notify_ui();
     });
 
     let reminder_weak = reminder.as_weak();
+    let main_weak = main_window.as_weak();
+    let finance_runtime = runtime.clone();
+    reminder.on_open_finance(move |kind, _source_id| {
+        if let Some(reminder) = reminder_weak.upgrade() {
+            let _ = reminder.hide();
+        }
+        if let Some(main_window) = main_weak.upgrade() {
+            main_window.set_active_page(if kind.as_str() == "credit_card" { 5 } else { 4 });
+            show_and_repaint(&main_window);
+            let _ = refresh_finance_ui(&main_window, &finance_runtime);
+        }
+        // 和其它提醒出口保持一致：窗口已隐藏，必须唤醒一次让排队的提醒接着显示，
+        // 否则 B 会一直卡在队列里，短时效的逆回购提醒可能直接过期。
+        finance_runtime.notify_ui();
+    });
+
+    let reminder_weak = reminder.as_weak();
+    let action_runtime = runtime.clone();
+    let action_main = main_window.as_weak();
+    reminder.on_request_finance_action(move |kind, source_id, cycle_key, event_date| {
+        if let Some(reminder) = reminder_weak.upgrade() {
+            let _ = reminder.hide();
+        }
+        let result = match kind.as_str() {
+            // 逆回购的「今日已处理」必须写在提醒自己的日期上：弹窗可以跨日保留，
+            // 若用点击当天，周五的弹窗拖到周一才点就会把周一整天标成已处理。
+            "reverse_repo" => {
+                repo_ack_date(event_date.as_str(), crate::core::now_china().date_naive())
+                    .and_then(|date| action_runtime.set_repo_day_acked(date, true))
+            }
+            "credit_card" => action_runtime.mark_credit_card_paid(&source_id, &cycle_key),
+            _ => Ok(()),
+        };
+        if let Some(main_window) = action_main.upgrade() {
+            if let Err(error) = result {
+                main_window.set_status_text(format!("保存提醒处理状态失败：{error:#}").into());
+            }
+            let _ = refresh_finance_ui(&main_window, &action_runtime);
+            main_window.set_active_page(if kind.as_str() == "credit_card" { 5 } else { 4 });
+            show_and_repaint(&main_window);
+        }
+        action_runtime.notify_ui();
+    });
+
+    let reminder_weak = reminder.as_weak();
+    let dismiss_runtime = runtime.clone();
     reminder.on_dismiss(move || {
         if let Some(reminder) = reminder_weak.upgrade() {
             let _ = reminder.hide();
         }
+        dismiss_runtime.notify_ui();
     });
 }
 
@@ -68,6 +118,7 @@ pub(crate) fn wire_callbacks(
         Arc::clone(&ui_write_busy),
     );
     wire_task_callbacks(ui, runtime.clone(), Arc::clone(&ui_write_busy));
+    wire_finance_callbacks(ui, runtime.clone());
     wire_diagnostic_callbacks(ui, runtime.clone(), data_root.clone(), diagnostics_busy);
     #[cfg(windows)]
     wire_notification_callbacks(ui, reminder_window, runtime.clone(), Arc::clone(&tray));

@@ -16,6 +16,22 @@ pub(crate) fn wire_notification_callbacks(
         let (title, question) = match channel {
             0 => {
                 if let Some(reminder) = test_reminder.upgrade() {
+                    if windows_integration::confirm_window_visible(reminder.window()).is_ok() {
+                        ui.set_notification_test_status(
+                            "当前已有提醒窗口显示，请先处理或关闭它再测试".into(),
+                        );
+                        show_and_repaint(&ui);
+                        return;
+                    }
+                    let _presentation_id = next_presentation_id();
+                    reminder.set_window_title("置顶提醒窗口测试".into());
+                    reminder.set_reminder_kind("test".into());
+                    reminder.set_reminder_opens_finance(false);
+                    reminder.set_reminder_source_id("".into());
+                    reminder.set_reminder_cycle_key("".into());
+                    reminder.set_reminder_open_label("打开今日任务".into());
+                    reminder.set_primary_action_enabled(false);
+                    reminder.set_primary_action_label("".into());
                     reminder.set_reminder_title("置顶提醒窗口测试".into());
                     reminder.set_reminder_body(
                         "这是独立于主窗口的置顶提醒。它应显示在工作区右下角，并且不应抢走你当前正在输入内容的窗口焦点。".into(),
