@@ -14,6 +14,24 @@
 
 ## [未发布]
 
+## 0.5.1 — 2026-11-03
+
+### 修复
+
+- **切到「逆回购」页签会把主窗口缩小并锁死尺寸**：逆回购页「提醒时段」的时点行 4 个控件全部用 `width:` 固定宽（Slint 把显式 `width` 同时当作 min 和 max），行 max 经 VerticalBox「max 取最小」聚合把整页 max-width 钉死在约 654px；Slint winit 后端把根布局约束当作窗口 min/max 尺寸，切页触发 `adjust_window_size_to_satisfy_constraints` 强制把窗口钳进约 654–800px 宽，`set_max_inner_size` 又禁止拉宽，停留 1.5 秒后被钳制的尺寸还会覆盖 `window-state.json` 里的用户尺寸。信用卡/设置页的固定宽控件行都有无界 Text 兄弟（行 max 无界）所以不受影响。修复：给 `MainWindow` 显式设置 `max-width/max-height: 10000px`（与 `window_state.rs` 的 `MAX_LOGICAL_DIMENSION` 一致），根元素显式约束覆盖布局汇总的 max 字段，窗口尺寸重新由用户和尺寸记忆决定；逆回购行的固定宽布局保持不变。
+
+### 变更
+
+- **给主窗口尺寸约束加回归断言**：`src/ui/tests.rs` 新增 `main_window_declares_window_level_max_size`，断言 `MainWindow` 仍声明窗口级 `max-width/max-height`。Slint 会把页面布局汇总出的 max 当成窗口上限，这两行一旦被删就会退回「切逆回购页锁窗口」的老问题，`cargo test` 与发布冒烟都覆盖不到。
+- **发版文档对齐 `RELEASE_NOTES.md` 的 `[未发布]` 写法**：`docs/release-signing-and-updates.md` 的发版顺序与一致性自检改为「把 `[未发布]` 改名为本版本小节」，并明确发版后不留空占位、打包进 `build/packages/<版本>/` 的副本不得出现 `[未发布]` 标题（该文件原样发给用户）。
+
+### 验证
+
+- `rtk cargo fmt -- --check` 通过；`rtk cargo test` 205 passed / 1 ignored（新增 `ui::tests::main_window_declares_window_level_max_size`，删掉 `max-width` 那行会失败，已做反向验证）。
+- GUI 复核（隔离数据目录 + 150% DPI + Win32 `SetWindowPos`）：1600×1000 下切「逆回购」「信用卡」窗口尺寸不变；停在逆回购页可继续拉到 1750×1100；截图确认两页内容铺满宽度、无裁切或控件重叠。
+- `scripts/build-release.ps1 -PackageMode All` 与 `scripts/validate-build-layout.ps1` 通过，MSI 编译 0 warning / 0 error。
+- `scripts/smoke-release.ps1 -Version 0.5.1` 通过，20 项检查全部为真（报告：`build/artifacts/tests/smoke/windows-rust-0.5.1-20261103-201024.json`）。
+
 ## 0.5.0 — 2026-10-31
 
 ### 新增

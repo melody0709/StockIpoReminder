@@ -302,3 +302,28 @@ fn slint_source_is_registered_as_a_build_dependency() {
         "build.rs 必须声明 ui/main.slint 为重跑条件"
     );
 }
+
+#[test]
+fn main_window_declares_window_level_max_size() {
+    // 页面布局汇总出的 max 会被 Slint 当成窗口尺寸上限：逆回购页「提醒时段」的时点行
+    // 四个控件全部固定宽（显式 width 同时是 min 和 max），曾把根布局 max-width 钉在
+    // 约 654px，切页时后端直接把窗口钳进 654–800px 并禁止拉宽。根元素显式 max 是
+    // 唯一稳定的覆盖点，删掉这两行就会复发，所以在这里钉住。
+    let ui =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/main.slint")).unwrap();
+    let window_start = ui
+        .find("export component MainWindow inherits Window")
+        .expect("ui/main.slint 必须定义 MainWindow");
+    // 窗口属性都声明在第一个子元素之前，用第一个布局元素作为窗口头部的边界。
+    let header_end = window_start
+        + ui[window_start..]
+            .find("VerticalBox {")
+            .expect("MainWindow 必须包含垂直布局");
+    let header = &ui[window_start..header_end];
+    for property in ["max-width", "max-height"] {
+        assert!(
+            header.contains(&format!("{property}: 10000px;")),
+            "MainWindow 必须声明窗口级 {property}: 10000px（与 window_state.rs 的 MAX_LOGICAL_DIMENSION 一致），否则页面布局的 max 会泄漏成窗口上限"
+        );
+    }
+}

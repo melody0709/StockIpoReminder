@@ -2,7 +2,7 @@
 
 一个常驻 Windows 系统托盘的 A 股新股申购提醒程序，并提供国债逆回购和信用卡还款提醒。它从公开渠道发现沪市、深市和北交所申购任务，并持续提醒，直到你对每只股票分别完成“确认已申购”的二次确认。
 
-当前版本：`0.5.0`
+当前版本：`0.5.1`
 
 > 版本号只有一个事实来源：`Cargo.toml`。发版时必须同步本行，以及下文出现的安装包 / 便携包文件名；否则会出现「基线已升到 `0.4.x`、文档仍写 `0.3.x`」的不一致。完整历史见 `CHANGELOG.md` 与 `RELEASE_NOTES.md`。
 
@@ -87,7 +87,7 @@
 运行：
 
 ```text
-StockIpoReminder-0.5.0-win-x64.msi
+StockIpoReminder-0.5.1-win-x64.msi
 ```
 
 默认目录：
@@ -103,7 +103,7 @@ MSI 使用 Major Upgrade 完成升级，并由 Windows Installer 提供程序文
 
 ## 便携版
 
-解压 `StockIpoReminder-0.5.0-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。便携版没有 Windows Installer 注册，因此设置页不会启用 MSI 卸载和自动更新入口；退出程序后直接删除便携文件即可，用户数据仍按下述规则独立保留。
+解压 `StockIpoReminder-0.5.1-win-x64-portable.zip` 后直接运行 `StockIpoReminder.exe`。便携版没有 Windows Installer 注册，因此设置页不会启用 MSI 卸载和自动更新入口；退出程序后直接删除便携文件即可，用户数据仍按下述规则独立保留。
 
 便携版如果启用“登录 Windows 后自动启动”，会按当前可执行文件位置写入当前用户 Run 注册项。默认数据仍保存在 `%LocalAppData%\StockIpoReminder`，因此移动或删除便携程序后，应先关闭自启动或重新保存设置以更新路径。便携运行通常没有 MSI 创建的开始菜单 AUMID 注册；设置页会明确显示 Toast 诊断结果，Toast 无法提交时仍使用托盘气泡回退。
 

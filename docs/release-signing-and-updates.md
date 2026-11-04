@@ -36,7 +36,7 @@ Minisign 解决的是“应用确认更新确实由项目维护者发布”，�
 1. 修改 `Cargo.toml` 版本，并同步所有「重复声明版本」的文档。缺任何一项都会造成「基线已经升到新版本、文档仍写旧版本」的不一致：
 
    - `CHANGELOG.md`：把 `[未发布]` 小节提升为 `## <版本> — <日期>`，并另起一个空的 `[未发布]`。
-   - `RELEASE_NOTES.md`：新增本版本小节，只写用户能感知到的变化。
+   - `RELEASE_NOTES.md`：把 `[未发布]` 小节（如果有）改名为 `## <版本> — <日期>`，只写用户能感知到的变化；发版后不要留下空的 `[未发布]`。平时可随时往 `[未发布]` 里追加，但打包进 `build/packages/<版本>/` 的副本里不能出现 `[未发布]` 标题——这个文件会原样发给用户。
    - `README.md`：「当前版本」行，以及「安装版」「便携版」两节中的 `StockIpoReminder-<版本>-win-x64.msi` / `StockIpoReminder-<版本>-win-x64-portable.zip` 文件名。
    - 顺序要求：`RELEASE_NOTES.md` 与 `README.md` 会被复制进 `build/packages/<版本>/`，因此必须在 `build.bat --package` **之前**改完，否则包里带的是旧文案。
 2. 运行测试和 `rtk cmd /c build.bat --package`，得到最终 MSI 和便携 ZIP。
@@ -87,6 +87,6 @@ rtk rg -n "当前版本" README.md
 ```
 
 - `README.md` 的「当前版本」行与两处安装包 / 便携包文件名必须等于 `Cargo.toml` 的版本，且不得残留指向旧版本的文件名。
-- `RELEASE_NOTES.md` 首个小节必须是本次版本；`CHANGELOG.md` 的 `[未发布]` 必须为空且上一节是本次版本。
+- `RELEASE_NOTES.md` 首个小节必须是本次版本，不得残留 `[未发布]`；`CHANGELOG.md` 的 `[未发布]` 必须为空且上一节是本次版本。
 - 行为发生变化时，同时核对受影响的专题文档：`docs/release-signing-and-updates.md`（更新链路，含一键点击契约）、`docs/secondary-notifications.md`、`docs/crash-reporting.md`，以及 `README.md` 中描述该行为的段落。
 - `.plan/feat/*.md`、`plan/*.md` 属历史设计/审查记录，其中的旧版本号和旧决策**按原样保留**，只在文首「当前版本」这类现在时声明上更新，并在需要时追加一节说明后续版本的取代关系。

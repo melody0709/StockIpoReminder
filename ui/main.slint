@@ -275,6 +275,13 @@ export component MainWindow inherits Window {
     preferred-height: 780px;
     min-width: 800px;
     min-height: 500px;
+    // 显式给出 max，防止页面布局的 max 约束泄漏到窗口级：
+    // Slint 会把根布局约束当作窗口 min/max 尺寸并在切页时强制钳制，
+    // 逆回购页「提醒时段」整行固定宽（width 同时是 min 和 max）曾把窗口
+    // 锁进约 654–800px 宽且无法拉伸。10000 与 window_state.rs 的
+    // MAX_LOGICAL_DIMENSION 一致，实际等同不设上限。
+    max-width: 10000px;
+    max-height: 10000px;
     // Toggling repaint-token marks the complete window background dirty. This
     // is used when a tray-resident software-rendered window becomes visible
     // again, because a plain request-redraw may otherwise repaint only the
