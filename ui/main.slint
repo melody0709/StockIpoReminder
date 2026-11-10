@@ -430,6 +430,7 @@ export component MainWindow inherits Window {
     in-out property <string> credit-form-id: "";
     in-out property <int> credit-form-kind-index: 0;
     in-out property <string> credit-form-alias: "";
+    in-out property <bool> credit-form-alias-manual: false;
     in-out property <int> credit-form-bank-index: 0;
     in-out property <image> credit-form-bank-icon: @image-url("../assets/banks/kind_credit_card.svg");
     in-out property <string> credit-form-bank-name: "";
@@ -1021,7 +1022,7 @@ export component MainWindow inherits Window {
                             enabled: !root.credit-form-editing;
                             selected => { root.preview-credit-form(); }
                         }
-                        LineEdit { text <=> root.credit-form-alias; placeholder-text: "别名，例如 招行 Visa / 住房贷款"; horizontal-stretch: 1; edited(text) => { root.preview-credit-form(); } }
+                        LineEdit { text <=> root.credit-form-alias; placeholder-text: "别名，例如 招行 Visa / 住房贷款"; horizontal-stretch: 1; edited(text) => { root.credit-form-alias-manual = true; } }
                     }
                     HorizontalBox {
                         spacing: 8px;

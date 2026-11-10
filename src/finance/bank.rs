@@ -19,7 +19,7 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "abc",
         display_name: "农业银行",
-        aliases: &["中国农业银行", "农行", "ABC"],
+        aliases: &["中国农业银行", "农行", "农银", "ABC"],
     },
     BankDefinition {
         id: "boc",
@@ -29,17 +29,24 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "ccb",
         display_name: "建设银行",
-        aliases: &["中国建设银行", "建行", "建融", "CCB"],
+        aliases: &["中国建设银行", "建行", "建融", "建银", "CCB"],
     },
     BankDefinition {
         id: "bankcomm",
         display_name: "交通银行",
-        aliases: &["交行", "交银", "BCM"],
+        aliases: &["交行", "交银", "BCM", "BOCOM"],
     },
     BankDefinition {
         id: "psbc",
         display_name: "邮储银行",
-        aliases: &["中国邮政储蓄银行", "邮政储蓄银行", "邮储", "邮政", "PSBC"],
+        aliases: &[
+            "中国邮政储蓄银行",
+            "邮政储蓄银行",
+            "邮储",
+            "邮储银",
+            "邮政",
+            "PSBC",
+        ],
     },
     BankDefinition {
         id: "cmb",
@@ -54,17 +61,17 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "spdb",
         display_name: "浦发银行",
-        aliases: &["上海浦东发展银行", "浦发", "SPDB"],
+        aliases: &["上海浦东发展银行", "浦发", "浦银", "SPDB"],
     },
     BankDefinition {
         id: "cmbc",
         display_name: "民生银行",
-        aliases: &["中国民生银行", "民生", "CMBC"],
+        aliases: &["中国民生银行", "民生", "民银", "CMBC"],
     },
     BankDefinition {
         id: "cib",
         display_name: "兴业银行",
-        aliases: &["兴业", "CIB"],
+        aliases: &["兴业", "兴银", "CIB"],
     },
     BankDefinition {
         id: "ceb",
@@ -79,12 +86,12 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "pingan",
         display_name: "平安银行",
-        aliases: &["平安", "PINGAN"],
+        aliases: &["平安", "PINGAN", "PAB"],
     },
     BankDefinition {
         id: "cgb",
         display_name: "广发银行",
-        aliases: &["广东发展银行", "广发", "CGB"],
+        aliases: &["广东发展银行", "广发", "CGB", "GDB"],
     },
     BankDefinition {
         id: "bob",
@@ -94,12 +101,12 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "bos",
         display_name: "上海银行",
-        aliases: &["BOS"],
+        aliases: &["BOS", "SHB"],
     },
     BankDefinition {
         id: "jsbank",
         display_name: "江苏银行",
-        aliases: &["JSB"],
+        aliases: &["JSB", "JSBC"],
     },
     BankDefinition {
         id: "njcb",
@@ -114,7 +121,7 @@ pub(crate) const BANK_REGISTRY: &[BankDefinition] = &[
     BankDefinition {
         id: "czbank",
         display_name: "浙商银行",
-        aliases: &["CZB"],
+        aliases: &["CZB", "CZBANK"],
     },
     BankDefinition {
         id: "other",
@@ -127,10 +134,33 @@ pub(crate) fn bank_definition(id: &str) -> Option<&'static BankDefinition> {
     BANK_REGISTRY.iter().find(|bank| bank.id == id)
 }
 
+fn escape_xml_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 /// 针对自定义银行名称，按前两个字符及名称确定性哈希生成专属颜色徽标
 pub(crate) fn generate_monogram_svg(name: &str) -> Vec<u8> {
     let clean = name.trim();
-    let display_text: String = clean.chars().take(2).collect();
+    let mut display_text: String = clean
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(2)
+        .collect();
+    if display_text.is_empty() {
+        display_text = clean.chars().take(2).collect();
+    }
+    let display_text = escape_xml_text(&display_text);
     const PALETTE: &[&str] = &[
         "#2563eb", "#0284c7", "#0d9488", "#059669", "#16a34a", "#7c3aed", "#9333ea", "#c026d3",
         "#e11d48", "#ea580c",
@@ -324,9 +354,74 @@ mod tests {
         let s = String::from_utf8_lossy(&monogram1);
         assert!(s.contains("盛京"));
 
+        let bracketed = account_icon_svg(
+            Some("other"),
+            PaymentAccountKind::CreditCard,
+            Some("（渣打）银行"),
+        );
+        let s_bracketed = String::from_utf8_lossy(&bracketed);
+        assert!(s_bracketed.contains("渣打"));
+
         let empty_custom =
             account_icon_svg(Some("other"), PaymentAccountKind::CreditCard, Some("  "));
         let building = String::from_utf8_lossy(&empty_custom);
         assert!(building.contains("polygon"));
+    }
+
+    #[test]
+    fn no_duplicate_aliases_in_bank_registry() {
+        let mut seen = std::collections::HashMap::new();
+        for bank in BANK_REGISTRY {
+            for alias in bank.aliases {
+                let normalized = normalize_bank_name(alias);
+                if let Some(existing_bank) = seen.insert(normalized.clone(), bank.id) {
+                    panic!(
+                        "Duplicate alias detected: '{}' belongs to both {} and {}",
+                        alias, existing_bank, bank.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_bank_icons_and_fallbacks_produce_valid_renderable_images() {
+        for bank in BANK_REGISTRY {
+            let img = account_icon(Some(bank.id), PaymentAccountKind::CreditCard, None);
+            let size = img.size();
+            assert!(
+                size.width > 0 && size.height > 0,
+                "Bank {} failed to render: {:?}",
+                bank.id,
+                size
+            );
+        }
+
+        for kind in [
+            PaymentAccountKind::CreditCard,
+            PaymentAccountKind::Mortgage,
+            PaymentAccountKind::AutoLoan,
+        ] {
+            let img = account_icon(None, kind, None);
+            let size = img.size();
+            assert!(
+                size.width > 0 && size.height > 0,
+                "Semantic fallback {:?} failed to render: {:?}",
+                kind,
+                size
+            );
+        }
+
+        let custom_img = account_icon(
+            Some("other"),
+            PaymentAccountKind::CreditCard,
+            Some("AT&T <Bank>"),
+        );
+        let size = custom_img.size();
+        assert!(
+            size.width > 0 && size.height > 0,
+            "Custom monogram with XML special chars failed to render: {:?}",
+            size
+        );
     }
 }

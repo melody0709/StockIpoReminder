@@ -343,33 +343,26 @@ fn update_form_bank_icon(ui: &MainWindow) {
 fn update_form_preview(ui: &MainWindow, runtime: &RuntimeHandle) {
     update_form_bank_icon(ui);
     let form_id = ui.get_credit_form_id();
-    if form_id.trim().is_empty() {
+    if form_id.trim().is_empty() && !ui.get_credit_form_alias_manual() {
         let bank_id = selected_bank_id(ui, ui.get_credit_form_bank_index());
-        let bank_name = bank_id
-            .as_deref()
-            .and_then(bank_definition)
-            .map(|b| b.display_name)
-            .unwrap_or("");
         let kind_label = match ui.get_credit_form_kind_index() {
             1 => "房贷",
             2 => "车贷",
             _ => "信用卡",
         };
-        let current_alias = ui.get_credit_form_alias();
-        let current_alias = current_alias.trim();
-        let is_autofillable = current_alias.is_empty()
-            || BANK_REGISTRY.iter().any(|b| {
-                for suffix in &["信用卡", "房贷", "车贷"] {
-                    if current_alias == format!("{}{}", b.display_name, suffix)
-                        || current_alias == format!("{} {}", b.display_name, suffix)
-                    {
-                        return true;
-                    }
-                }
-                false
-            });
-        if is_autofillable && !bank_name.is_empty() {
-            ui.set_credit_form_alias(format!("{bank_name} {kind_label}").into());
+        let bank_label = if bank_id.as_deref() == Some("other") {
+            let name = ui.get_credit_form_bank_name();
+            name.trim().to_owned()
+        } else {
+            bank_id
+                .as_deref()
+                .filter(|id| *id != "other")
+                .and_then(bank_definition)
+                .map(|b| b.display_name.to_owned())
+                .unwrap_or_default()
+        };
+        if !bank_label.is_empty() {
+            ui.set_credit_form_alias(format!("{bank_label} {kind_label}").into());
         }
     }
     let preview = (|| -> Result<String> {
@@ -650,6 +643,7 @@ pub(crate) fn wire_finance_callbacks(ui: &MainWindow, runtime: RuntimeHandle) {
             PaymentAccountKind::AutoLoan => 2,
         });
         ui.set_credit_form_alias(account.alias.clone().into());
+        ui.set_credit_form_alias_manual(true);
         let bank_index = bank_index_for(&ui, Some(account));
         ui.set_credit_form_bank_index(bank_index);
         ui.set_credit_form_bank_name(account.bank_name.clone().unwrap_or_default().into());
@@ -802,6 +796,7 @@ pub(crate) fn clear_credit_editor(ui: &MainWindow) {
     ui.set_credit_form_id("".into());
     ui.set_credit_form_kind_index(0);
     ui.set_credit_form_alias("".into());
+    ui.set_credit_form_alias_manual(false);
     ui.set_credit_form_bank_index(0);
     ui.set_credit_form_bank_icon(bank_icon(None));
     ui.set_credit_form_bank_custom(false);
