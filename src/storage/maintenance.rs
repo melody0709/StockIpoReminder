@@ -175,7 +175,7 @@ impl Database {
             &mut state,
             &mut row_count,
             "credit-cards",
-            "SELECT quote(id)||','||quote(account_type)||','||quote(alias)||','||quote(bank_id)||','||quote(bank)||','||quote(due_day)||','||quote(remind_time)||','||quote(lead_days_json)||','||quote(overdue_enabled)||','||quote(enabled)||','||quote(first_tracked_cycle)||','||quote(final_cycle)||','||quote(closed_at) FROM credit_cards ORDER BY id",
+            "SELECT quote(id)||','||quote(account_type)||','||quote(alias)||','||quote(bank_id)||','||quote(bank)||','||quote(due_day)||','||quote(remind_time)||','||quote(lead_days_json)||','||quote(overdue_enabled)||','||quote(enabled)||','||quote(first_tracked_cycle)||','||quote(final_cycle)||','||quote(closed_at)||','||quote(amount)||','||quote(total_amount) FROM credit_cards ORDER BY id",
         )?;
         append_fingerprint_rows(
             &connection,

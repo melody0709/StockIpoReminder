@@ -142,6 +142,8 @@ mod tests {
             rules_changed_at: now,
             created_at: now,
             updated_at: now,
+            amount: None,
+            total_amount: None,
         }
     }
 
@@ -179,6 +181,7 @@ mod tests {
             ("card", PaymentAccountKind::CreditCard),
             ("mortgage", PaymentAccountKind::Mortgage),
             ("auto", PaymentAccountKind::AutoLoan),
+            ("credit_loan", PaymentAccountKind::CreditLoan),
         ] {
             database.save_payment_account(&account(id, kind)).unwrap();
             database
@@ -209,6 +212,10 @@ mod tests {
         assert!(reminders.iter().any(|item| {
             item.kind == FinanceKind::AutoLoan
                 && item.occurrence_key == "auto_loan:auto:2026-10:3:2026-10-05"
+        }));
+        assert!(reminders.iter().any(|item| {
+            item.kind == FinanceKind::CreditLoan
+                && item.occurrence_key == "credit_loan:credit_loan:2026-10:3:2026-10-05"
         }));
         let _ = std::fs::remove_dir_all(root);
     }

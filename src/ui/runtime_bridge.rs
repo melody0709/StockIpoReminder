@@ -110,7 +110,8 @@ fn finance_target(reminders: &[crate::finance::FinanceReminder]) -> String {
             crate::finance::FinanceKind::ReverseRepo => "finance:repo".into(),
             crate::finance::FinanceKind::CreditCard
             | crate::finance::FinanceKind::Mortgage
-            | crate::finance::FinanceKind::AutoLoan => {
+            | crate::finance::FinanceKind::AutoLoan
+            | crate::finance::FinanceKind::CreditLoan => {
                 format!("finance:payment:{}", item.source_id)
             }
         };
@@ -138,7 +139,8 @@ fn finance_alert_text(reminders: &[crate::finance::FinanceReminder]) -> (String,
                 .to_owned(),
             crate::finance::FinanceKind::CreditCard
             | crate::finance::FinanceKind::Mortgage
-            | crate::finance::FinanceKind::AutoLoan => "点击查看详情".to_owned(),
+            | crate::finance::FinanceKind::AutoLoan
+            | crate::finance::FinanceKind::CreditLoan => "点击查看详情".to_owned(),
         };
         (item.title.clone(), body)
     } else {

@@ -223,6 +223,8 @@ fn business_fingerprint_includes_v13_account_fields_and_actions() {
         rules_changed_at: now,
         created_at: now,
         updated_at: now,
+        amount: None,
+        total_amount: None,
     };
     test.database.save_payment_account(&account).unwrap();
     let mut previous = test.database.business_state_fingerprint().unwrap();
@@ -230,6 +232,8 @@ fn business_fingerprint_includes_v13_account_fields_and_actions() {
         "UPDATE credit_cards SET account_type='auto_loan' WHERE id='fingerprint-loan'",
         "UPDATE credit_cards SET bank_id='ccb' WHERE id='fingerprint-loan'",
         "UPDATE credit_cards SET final_cycle='2027-01' WHERE id='fingerprint-loan'",
+        "UPDATE credit_cards SET amount=5800.0 WHERE id='fingerprint-loan'",
+        "UPDATE credit_cards SET total_amount=100000.0 WHERE id='fingerprint-loan'",
     ] {
         test.database.open().unwrap().execute_batch(sql).unwrap();
         let current = test.database.business_state_fingerprint().unwrap();
@@ -279,6 +283,8 @@ fn backup_preserves_loan_end_close_and_paid_action() {
         rules_changed_at: now,
         created_at: now,
         updated_at: now,
+        amount: None,
+        total_amount: None,
     };
     test.database.save_payment_account(&account).unwrap();
     test.database

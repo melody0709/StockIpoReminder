@@ -126,6 +126,32 @@ pub(super) fn migrate_v13(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn migrate_v14(connection: &Connection) -> Result<()> {
+    let applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=14)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE credit_cards ADD COLUMN amount REAL NULL;
+        ALTER TABLE credit_cards ADD COLUMN total_amount REAL NULL;
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version,applied_at) VALUES(14,?1)",
+        [format_dt(now_china())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn parse_time(value: &str) -> Result<NaiveTime> {
     NaiveTime::parse_from_str(value, "%H:%M")
         .with_context(|| format!("数据库中的时间格式无效：{value}"))
@@ -139,7 +165,7 @@ fn payment_accounts_from_connection(connection: &Connection) -> Result<Vec<Payme
     let mut statement = connection.prepare(
         "SELECT id,account_type,alias,bank_id,bank,due_day,remind_time,lead_days_json,
                 overdue_enabled,enabled,first_tracked_cycle,final_cycle,closed_at,
-                rules_changed_at,created_at,updated_at
+                rules_changed_at,created_at,updated_at,amount,total_amount
          FROM credit_cards ORDER BY alias COLLATE NOCASE",
     )?;
     let rows = statement.query_map([], |row| {
@@ -160,6 +186,8 @@ fn payment_accounts_from_connection(connection: &Connection) -> Result<Vec<Payme
             row.get::<_, String>(13)?,
             row.get::<_, String>(14)?,
             row.get::<_, String>(15)?,
+            row.get::<_, Option<f64>>(16)?,
+            row.get::<_, Option<f64>>(17)?,
         ))
     })?;
     let mut accounts = Vec::new();
@@ -181,6 +209,8 @@ fn payment_accounts_from_connection(connection: &Connection) -> Result<Vec<Payme
             rules_changed_at,
             created_at,
             updated_at,
+            amount,
+            total_amount,
         ) = row?;
         accounts.push(PaymentAccount {
             id,
@@ -199,6 +229,8 @@ fn payment_accounts_from_connection(connection: &Connection) -> Result<Vec<Payme
             rules_changed_at: parse_dt(&rules_changed_at)?,
             created_at: parse_dt(&created_at)?,
             updated_at: parse_dt(&updated_at)?,
+            amount,
+            total_amount,
         });
     }
     Ok(accounts)
@@ -351,6 +383,8 @@ impl Database {
                 || (!previous.enabled && account.enabled)
                 || previous.final_cycle != account.final_cycle
                 || previous.closed_at.is_some() != account.closed_at.is_some()
+                || previous.amount != account.amount
+                || previous.total_amount != account.total_amount
         });
         let rules_changed_at = if rules_changed {
             now
@@ -370,8 +404,8 @@ impl Database {
             "INSERT INTO credit_cards(
                 id,account_type,alias,bank_id,bank,due_day,remind_time,lead_days_json,
                 overdue_enabled,enabled,first_tracked_cycle,final_cycle,closed_at,
-                rules_changed_at,created_at,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                rules_changed_at,created_at,updated_at,amount,total_amount
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(id) DO UPDATE SET
                 account_type=excluded.account_type,
                 alias=excluded.alias,
@@ -386,7 +420,9 @@ impl Database {
                 final_cycle=excluded.final_cycle,
                 closed_at=excluded.closed_at,
                 rules_changed_at=excluded.rules_changed_at,
-                updated_at=excluded.updated_at",
+                updated_at=excluded.updated_at,
+                amount=excluded.amount,
+                total_amount=excluded.total_amount",
             params![
                 account.id,
                 account.kind.as_str(),
@@ -404,6 +440,8 @@ impl Database {
                 format_dt(rules_changed_at),
                 format_dt(created_at),
                 format_dt(now),
+                account.amount,
+                account.total_amount,
             ],
         )?;
         transaction.commit()?;
@@ -416,7 +454,7 @@ impl Database {
         transaction.execute("DELETE FROM credit_card_actions WHERE card_id=?1", [id])?;
         transaction.execute(
             "DELETE FROM finance_shown
-             WHERE source_id=?1 AND kind IN ('credit_card','mortgage','auto_loan')",
+             WHERE source_id=?1 AND kind IN ('credit_card','mortgage','auto_loan','credit_loan')",
             [id],
         )?;
         transaction.execute("DELETE FROM credit_cards WHERE id=?1", [id])?;
@@ -486,7 +524,7 @@ impl Database {
             anyhow::bail!("还款账户不存在");
         };
         if !account.kind.is_loan() {
-            anyhow::bail!("只有房贷或车贷可以标记已结清");
+            anyhow::bail!("只有贷款类账户（房贷、车贷或信用贷）可以标记已结清");
         }
         if account.closed_at.is_none() {
             let now = format_dt(now_china());
@@ -661,6 +699,8 @@ mod tests {
             rules_changed_at: now,
             created_at: now,
             updated_at: now,
+            amount: None,
+            total_amount: None,
         }
     }
 
@@ -744,7 +784,7 @@ mod tests {
     #[test]
     fn v13_creates_default_off_repo_and_payment_account_tables() {
         let (database, root) = database();
-        assert_eq!(database.schema_version().unwrap(), 13);
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
         let repo = database.repo_settings().unwrap();
         assert!(!repo.enabled);
         assert_eq!(repo.primary, Some(time(14, 50)));
@@ -768,7 +808,7 @@ mod tests {
     fn real_v12_upgrade_preserves_accounts_actions_bank_text_and_shown_ledger() {
         let (database, root) = create_real_v12_database();
         database.initialize().unwrap();
-        assert_eq!(database.schema_version().unwrap(), 13);
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
 
         let known = database.payment_account("legacy-card").unwrap().unwrap();
         assert_eq!(known.kind, PaymentAccountKind::CreditCard);
@@ -853,7 +893,39 @@ mod tests {
             .unwrap();
         drop(connection);
         database.initialize().unwrap();
-        assert_eq!(database.schema_version().unwrap(), 13);
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v14_migration_adds_columns_to_existing_v13_database() {
+        let (database, root) = database();
+        let connection = database.open().unwrap();
+        // 模拟 v13 状态：删除 version=14，删除 amount 与 total_amount 列
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version=14", [])
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE credit_cards DROP COLUMN amount;
+                 ALTER TABLE credit_cards DROP COLUMN total_amount;",
+            )
+            .unwrap();
+        drop(connection);
+
+        // 重新初始化，执行 migrate_v14
+        database.initialize().unwrap();
+        assert_eq!(database.schema_version().unwrap(), 14);
+
+        let connection = database.open().unwrap();
+        let amount_col: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('credit_cards') WHERE name IN ('amount','total_amount')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount_col, 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -923,15 +995,17 @@ mod tests {
             ("multi-card", PaymentAccountKind::CreditCard),
             ("multi-mortgage", PaymentAccountKind::Mortgage),
             ("multi-auto", PaymentAccountKind::AutoLoan),
+            ("multi-credit-loan", PaymentAccountKind::CreditLoan),
         ] {
             database.save_payment_account(&account(id, kind)).unwrap();
         }
         let mut accounts = database.payment_accounts().unwrap();
         accounts.sort_by(|left, right| left.id.cmp(&right.id));
-        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts.len(), 4);
         assert_eq!(accounts[0].id, "multi-auto");
         assert_eq!(accounts[1].id, "multi-card");
-        assert_eq!(accounts[2].id, "multi-mortgage");
+        assert_eq!(accounts[2].id, "multi-credit-loan");
+        assert_eq!(accounts[3].id, "multi-mortgage");
 
         let mut edited = database.payment_account("multi-card").unwrap().unwrap();
         edited.alias = "只改这一条".into();
@@ -1131,6 +1205,54 @@ mod tests {
         database.save_payment_account(&card).unwrap();
         assert!(database.close_payment_account(&card.id).is_err());
         assert!(database.resume_payment_account(&card.id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v14_persists_amount_and_total_amount_and_tracks_changes() {
+        let (database, root) = database();
+        let mut loan = account("credit-loan-1", PaymentAccountKind::CreditLoan);
+        loan.amount = Some(4500.5);
+        loan.total_amount = Some(150000.0);
+        database.save_payment_account(&loan).unwrap();
+
+        let loaded = database.payment_account(&loan.id).unwrap().unwrap();
+        assert_eq!(loaded.kind, PaymentAccountKind::CreditLoan);
+        assert_eq!(loaded.amount, Some(4500.5));
+        assert_eq!(loaded.total_amount, Some(150000.0));
+
+        let old = "2026-09-01T00:00:00+08:00";
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE credit_cards SET rules_changed_at=?2,updated_at=?2 WHERE id=?1",
+                params![loan.id, old],
+            )
+            .unwrap();
+
+        let mut updated = loaded.clone();
+        updated.amount = Some(4200.0);
+        database.save_payment_account(&updated).unwrap();
+        let reloaded = database.payment_account(&loan.id).unwrap().unwrap();
+        assert_eq!(reloaded.amount, Some(4200.0));
+        assert!(reloaded.rules_changed_at > parse_dt(old).unwrap());
+
+        // 结清和恢复保持金额不变
+        database.close_payment_account(&loan.id).unwrap();
+        let closed = database.payment_account(&loan.id).unwrap().unwrap();
+        assert!(closed.closed_at.is_some());
+        assert_eq!(closed.amount, Some(4200.0));
+        assert_eq!(closed.total_amount, Some(150000.0));
+
+        database.resume_payment_account(&loan.id).unwrap();
+        let resumed = database.payment_account(&loan.id).unwrap().unwrap();
+        assert!(resumed.closed_at.is_none());
+        assert_eq!(resumed.amount, Some(4200.0));
+        assert_eq!(resumed.total_amount, Some(150000.0));
+
+        database.delete_payment_account(&loan.id).unwrap();
+        assert!(database.payment_account(&loan.id).unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 }

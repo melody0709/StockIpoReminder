@@ -58,6 +58,8 @@ export struct CreditCardRow {
     account-kind: string,
     bank: string,
     bank-icon: image,
+    amount-text: string,
+    amount-tone: int,
     due-text: string,
     status-text: string,
     status-tone: int,
@@ -440,6 +442,8 @@ export component MainWindow inherits Window {
     in-out property <int> credit-form-lead-mode-index: 2;
     in-out property <string> credit-form-lead-days: "3,0";
     in-out property <string> credit-form-final-cycle: "";
+    in-out property <string> credit-form-amount: "";
+    in-out property <string> credit-form-total-amount: "";
     in-out property <bool> credit-form-overdue: true;
     in-out property <bool> credit-form-enabled: true;
     in-out property <bool> credit-form-editing: false;
@@ -521,7 +525,7 @@ export component MainWindow inherits Window {
     callback request-uninstall(bool, string);
     callback save-repo-settings(bool, bool, string, bool, string);
     callback set-repo-acked(bool);
-    callback save-credit-card(string, int, string, int, string, int, string, int, string, string, bool, bool);
+    callback save-credit-card(string, int, string, int, string, int, string, int, string, string, bool, bool, string, string);
     callback delete-credit-card(string);
     callback edit-credit-card(string);
     callback clear-credit-editor();
@@ -1017,7 +1021,7 @@ export component MainWindow inherits Window {
                         Text { text: "类型"; color: #cbd5e1; vertical-alignment: center; }
                         ComboBox {
                             width: 112px;
-                            model: ["信用卡", "房贷", "车贷"];
+                            model: ["信用卡", "房贷", "车贷", "信用贷"];
                             current-index <=> root.credit-form-kind-index;
                             enabled: !root.credit-form-editing;
                             selected => { root.preview-credit-form(); }
@@ -1061,6 +1065,26 @@ export component MainWindow inherits Window {
                         }
                         if root.credit-form-lead-mode-index == 4 : LineEdit { width: 118px; text <=> root.credit-form-lead-days; placeholder-text: "3,0"; edited(text) => { root.preview-credit-form(); } }
                     }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: root.credit-form-kind-index == 0 ? "本期金额" : "每期还款"; color: #cbd5e1; vertical-alignment: center; }
+                        LineEdit {
+                            width: root.compact-width ? 104px : 124px;
+                            text <=> root.credit-form-amount;
+                            placeholder-text: root.credit-form-kind-index == 0 ? "如 3200" : "月供，如 5800";
+                            edited(text) => { root.preview-credit-form(); }
+                        }
+                        Text { text: "元"; color: #94a3b8; vertical-alignment: center; }
+                        if root.credit-form-kind-index > 0 : Text { text: "借款总额"; color: #cbd5e1; vertical-alignment: center; }
+                        if root.credit-form-kind-index > 0 : LineEdit {
+                            width: root.compact-width ? 104px : 124px;
+                            text <=> root.credit-form-total-amount;
+                            placeholder-text: "本金，如 100000";
+                            edited(text) => { root.preview-credit-form(); }
+                        }
+                        if root.credit-form-kind-index > 0 : Text { text: "元"; color: #94a3b8; vertical-alignment: center; }
+                        Text { text: "（选填，用于每月还款统计目测）"; color: #64748b; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
                     if root.credit-form-kind-index > 0 : HorizontalBox {
                         spacing: 8px;
                         Text { text: "结束还款月（可选）"; color: #cbd5e1; vertical-alignment: center; }
@@ -1080,13 +1104,13 @@ export component MainWindow inherits Window {
                             clicked => {
                                 root.credit-confirm-delete = "";
                                 root.credit-confirm-close = "";
-                                root.save-credit-card(root.credit-form-id, root.credit-form-kind-index, root.credit-form-alias, root.credit-form-bank-index, root.credit-form-bank-name, root.credit-form-due-day-index, root.credit-form-remind-time, root.credit-form-lead-mode-index, root.credit-form-lead-days, root.credit-form-final-cycle, root.credit-form-overdue, root.credit-form-enabled);
+                                root.save-credit-card(root.credit-form-id, root.credit-form-kind-index, root.credit-form-alias, root.credit-form-bank-index, root.credit-form-bank-name, root.credit-form-due-day-index, root.credit-form-remind-time, root.credit-form-lead-mode-index, root.credit-form-lead-days, root.credit-form-final-cycle, root.credit-form-overdue, root.credit-form-enabled, root.credit-form-amount, root.credit-form-total-amount);
                             }
                         }
                     }
                     if root.credit-form-preview != "" : Text { text: root.credit-form-preview; color: #93c5fd; font-size: 12px; wrap: word-wrap; }
                     if root.credit-error != "" : Text { text: root.credit-error; color: #fca5a5; font-size: 12px; wrap: word-wrap; }
-                    Text { text: "只保存别名、银行和日期；请勿填写贷款金额、利率、完整卡号、安全码或账单金额。29/30/31 日在短月会自动按月末提醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                    Text { text: "数据仅保存在本机，离线不联网；金额选填，仅用于本地月度汇总目测；请勿填写完整卡号、密码或安全码。29/30/31 日在短月会自动按月末提醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                     }
                 }
             }
@@ -1112,13 +1136,14 @@ export component MainWindow inherits Window {
                             spacing: root.compact-width ? 8px : 10px;
                             Rectangle { width: 32px; height: 32px; Image { source: card.bank-icon; width: 28px; height: 28px; x: 2px; y: 2px; } }
                             VerticalBox {
-                                width: root.compact-width ? 20% : 24%;
+                                width: root.compact-width ? 25% : 28%;
                                 spacing: 3px;
                                 Text { text: card.alias; color: #f8fafc; font-size: 17px; font-weight: 700; overflow: elide; }
                                 Text { text: card.account-kind + " · " + card.bank; color: #94a3b8; font-size: 12px; overflow: elide; }
+                                if card.amount-text != "" : Text { text: card.amount-text; color: card.amount-tone == 1 ? #86efac : card.amount-tone == 2 ? #64748b : #38bdf8; font-size: 12px; overflow: elide; }
                             }
                             VerticalBox {
-                                width: root.compact-width ? 18% : 21%;
+                                width: root.compact-width ? 15% : 18%;
                                 spacing: 3px;
                                 Text { text: "下次还款"; color: #94a3b8; font-size: 12px; }
                                 Text { text: card.due-text; color: #e2e8f0; font-size: 13px; overflow: elide; }
@@ -1175,7 +1200,7 @@ export component MainWindow inherits Window {
                     y: 0;
                     width: parent.width;
                     height: parent.height;
-                    text: "还没有还款提醒。添加信用卡、房贷或车贷后，程序只记录别名、银行和日期。";
+                    text: "还没有还款提醒。添加信用卡、房贷、车贷或信用贷后，支持备注金额并目测月度汇总，数据完全保存在本机。";
                     color: #94a3b8;
                     font-size: 15px;
                     horizontal-alignment: center;

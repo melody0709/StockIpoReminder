@@ -20,6 +20,7 @@ pub(crate) enum FinanceKind {
     CreditCard,
     Mortgage,
     AutoLoan,
+    CreditLoan,
 }
 
 impl FinanceKind {
@@ -29,6 +30,7 @@ impl FinanceKind {
             Self::CreditCard => "credit_card",
             Self::Mortgage => "mortgage",
             Self::AutoLoan => "auto_loan",
+            Self::CreditLoan => "credit_loan",
         }
     }
 }

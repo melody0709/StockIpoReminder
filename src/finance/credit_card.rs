@@ -17,6 +17,7 @@ pub(crate) enum PaymentAccountKind {
     CreditCard,
     Mortgage,
     AutoLoan,
+    CreditLoan,
 }
 
 impl PaymentAccountKind {
@@ -25,6 +26,7 @@ impl PaymentAccountKind {
             Self::CreditCard => "credit_card",
             Self::Mortgage => "mortgage",
             Self::AutoLoan => "auto_loan",
+            Self::CreditLoan => "credit_loan",
         }
     }
 
@@ -33,6 +35,7 @@ impl PaymentAccountKind {
             Self::CreditCard => "信用卡",
             Self::Mortgage => "房贷",
             Self::AutoLoan => "车贷",
+            Self::CreditLoan => "信用贷",
         }
     }
 
@@ -41,11 +44,12 @@ impl PaymentAccountKind {
             Self::CreditCard => FinanceKind::CreditCard,
             Self::Mortgage => FinanceKind::Mortgage,
             Self::AutoLoan => FinanceKind::AutoLoan,
+            Self::CreditLoan => FinanceKind::CreditLoan,
         }
     }
 
     pub(crate) fn is_loan(self) -> bool {
-        matches!(self, Self::Mortgage | Self::AutoLoan)
+        matches!(self, Self::Mortgage | Self::AutoLoan | Self::CreditLoan)
     }
 }
 
@@ -54,15 +58,16 @@ impl std::str::FromStr for PaymentAccountKind {
 
     fn from_str(value: &str) -> Result<Self> {
         match value {
-            "credit_card" => Ok(Self::CreditCard),
-            "mortgage" => Ok(Self::Mortgage),
-            "auto_loan" => Ok(Self::AutoLoan),
+            "credit_card" | "信用卡" => Ok(Self::CreditCard),
+            "mortgage" | "房贷" => Ok(Self::Mortgage),
+            "auto_loan" | "车贷" => Ok(Self::AutoLoan),
+            "credit_loan" | "信用贷" => Ok(Self::CreditLoan),
             _ => bail!("未知还款账户类型：{value}"),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PaymentAccount {
     pub id: String,
     pub kind: PaymentAccountKind,
@@ -80,6 +85,8 @@ pub(crate) struct PaymentAccount {
     pub rules_changed_at: ChinaDateTime,
     pub created_at: ChinaDateTime,
     pub updated_at: ChinaDateTime,
+    pub amount: Option<f64>,
+    pub total_amount: Option<f64>,
 }
 
 impl PaymentAccount {
@@ -231,6 +238,22 @@ pub(crate) fn validate_payment_account(account: &PaymentAccount) -> Result<()> {
     {
         bail!("信用卡不支持结束还款月或已结清状态");
     }
+    if account.kind == PaymentAccountKind::CreditCard && account.total_amount.is_some() {
+        bail!("信用卡不支持填写借款总额");
+    }
+    if let Some(amount) = account.amount {
+        if !amount.is_finite() || amount < 0.0 || amount > 100_000_000.0 {
+            bail!("每期还款金额必须在 0 到 100,000,000 之间");
+        }
+    }
+    if let Some(total_amount) = account.total_amount {
+        if !account.kind.is_loan() {
+            bail!("信用卡不支持填写借款总额");
+        }
+        if !total_amount.is_finite() || total_amount < 0.0 || total_amount > 100_000_000.0 {
+            bail!("借款总额必须在 0 到 100,000,000 之间");
+        }
+    }
     if let Some(final_cycle) = account.final_cycle.as_deref() {
         let final_cycle = parse_cycle(final_cycle).context("结束还款月格式必须是 YYYY-MM")?;
         if final_cycle < first {
@@ -238,6 +261,36 @@ pub(crate) fn validate_payment_account(account: &PaymentAccount) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn format_cny_internal(amount: f64, auto_compact: bool) -> String {
+    let prefix = if amount < 0.0 { "-¥" } else { "¥" };
+    let total_cents = (amount.abs() * 100.0).round() as u64;
+    let int_part = total_cents / 100;
+    let cent_part = total_cents % 100;
+    let int_str = int_part.to_string();
+    let mut with_commas = String::with_capacity(int_str.len() + int_str.len() / 3 + 4);
+    let bytes = int_str.as_bytes();
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            with_commas.push(',');
+        }
+        with_commas.push(b as char);
+    }
+    if auto_compact && cent_part == 0 {
+        format!("{prefix}{with_commas}")
+    } else {
+        format!("{prefix}{with_commas}.{cent_part:02}")
+    }
+}
+
+pub(crate) fn format_cny(amount: f64) -> String {
+    format_cny_internal(amount, false)
+}
+
+pub(crate) fn format_cny_auto(amount: f64) -> String {
+    format_cny_internal(amount, true)
 }
 
 pub(crate) fn validate_payment_account_history(
@@ -628,6 +681,8 @@ mod tests {
             rules_changed_at: dt("2026-10-01T00:00:00+08:00"),
             created_at: dt("2026-10-01T00:00:00+08:00"),
             updated_at: dt("2026-10-01T00:00:00+08:00"),
+            amount: None,
+            total_amount: None,
         }
     }
 
@@ -918,5 +973,85 @@ mod tests {
         assert!(!undo_window_open(Some("2026-13"), january));
         assert!(!undo_window_open(Some(""), january));
         assert!(!undo_window_open(Some("not-a-cycle"), january));
+    }
+
+    #[test]
+    fn credit_loan_kind_properties_and_parsing() {
+        use std::str::FromStr;
+        let kind = PaymentAccountKind::CreditLoan;
+        assert_eq!(kind.as_str(), "credit_loan");
+        assert_eq!(kind.label(), "信用贷");
+        assert!(kind.is_loan());
+        assert_eq!(
+            PaymentAccountKind::from_str("credit_loan").unwrap(),
+            PaymentAccountKind::CreditLoan
+        );
+        assert_eq!(
+            PaymentAccountKind::from_str("信用贷").unwrap(),
+            PaymentAccountKind::CreditLoan
+        );
+    }
+
+    #[test]
+    fn payment_account_amount_validation() {
+        let mut loan = PaymentAccount {
+            id: "loan-1".into(),
+            kind: PaymentAccountKind::CreditLoan,
+            alias: "某消金信用贷".into(),
+            final_cycle: Some("2028-10".into()),
+            amount: Some(3500.0),
+            total_amount: Some(100000.0),
+            ..card()
+        };
+        assert!(validate_payment_account(&loan).is_ok());
+
+        // 负数金额
+        loan.amount = Some(-1.0);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.amount = Some(3500.0);
+
+        // 负数借款总额
+        loan.total_amount = Some(-100.0);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.total_amount = Some(100000.0);
+
+        // 超过1亿上限
+        loan.amount = Some(100_000_001.0);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.amount = Some(3500.0);
+
+        loan.total_amount = Some(100_000_001.0);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.total_amount = Some(100000.0);
+
+        // NaN / Inf
+        loan.amount = Some(f64::NAN);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.amount = Some(f64::INFINITY);
+        assert!(validate_payment_account(&loan).is_err());
+        loan.amount = Some(3500.0);
+
+        // 信用卡不允许设置借款总额
+        let mut card = card();
+        card.amount = Some(5000.0);
+        card.total_amount = None;
+        assert!(validate_payment_account(&card).is_ok());
+        card.total_amount = Some(50000.0);
+        assert!(validate_payment_account(&card).is_err());
+    }
+
+    #[test]
+    fn cny_formatting_helpers() {
+        assert_eq!(format_cny(0.0), "¥0.00");
+        assert_eq!(format_cny(5800.0), "¥5,800.00");
+        assert_eq!(format_cny(1234567.89), "¥1,234,567.89");
+        assert_eq!(format_cny(12500.5), "¥12,500.50");
+        assert_eq!(format_cny(-5800.0), "-¥5,800.00");
+
+        assert_eq!(format_cny_auto(0.0), "¥0");
+        assert_eq!(format_cny_auto(5800.0), "¥5,800");
+        assert_eq!(format_cny_auto(12500.5), "¥12,500.50");
+        assert_eq!(format_cny_auto(1234567.89), "¥1,234,567.89");
+        assert_eq!(format_cny_auto(-12500.0), "-¥12,500");
     }
 }

@@ -368,6 +368,7 @@ fn repayment_account_icons_and_semantic_fallbacks_are_correctly_registered() {
         PaymentAccountKind::CreditCard,
         PaymentAccountKind::Mortgage,
         PaymentAccountKind::AutoLoan,
+        PaymentAccountKind::CreditLoan,
     ] {
         let svg = account_icon_svg(None, kind, None);
         assert!(svg.starts_with(b"<svg"), "语义降级必须生成有效 SVG");
@@ -380,4 +381,127 @@ fn repayment_account_icons_and_semantic_fallbacks_are_correctly_registered() {
         Some("测试银行"),
     );
     assert!(String::from_utf8_lossy(&custom).contains("测试"));
+}
+
+#[test]
+fn test_parse_and_format_amount_in_ui() {
+    use crate::ui::finance::{format_amount_for_input, parse_optional_amount};
+
+    // 空白输入
+    assert_eq!(parse_optional_amount("").unwrap(), None);
+    assert_eq!(parse_optional_amount("   ").unwrap(), None);
+
+    // 纯数字
+    assert_eq!(parse_optional_amount("5800").unwrap(), Some(5800.0));
+    assert_eq!(parse_optional_amount("5800.50").unwrap(), Some(5800.50));
+
+    // 带货币前缀与千分位逗号
+    assert_eq!(parse_optional_amount("¥5,800").unwrap(), Some(5800.0));
+    assert_eq!(
+        parse_optional_amount("￥ 12,345.67").unwrap(),
+        Some(12345.67)
+    );
+    assert_eq!(parse_optional_amount("$1000").unwrap(), Some(1000.0));
+
+    // 带中文「元」单位后缀
+    assert_eq!(parse_optional_amount("5800元").unwrap(), Some(5800.0));
+    assert_eq!(parse_optional_amount("¥ 5,800 元").unwrap(), Some(5800.0));
+    assert_eq!(
+        parse_optional_amount("12,345.50元").unwrap(),
+        Some(12345.50)
+    );
+
+    // 边界值
+    assert_eq!(parse_optional_amount("0").unwrap(), Some(0.0));
+    assert_eq!(
+        parse_optional_amount("100000000").unwrap(),
+        Some(100_000_000.0)
+    );
+
+    // 异常输入
+    assert!(parse_optional_amount("-10").is_err());
+    assert!(parse_optional_amount("100000001").is_err());
+    assert!(parse_optional_amount("abc").is_err());
+
+    // 格式化回填与浮点微漂移容错
+    assert_eq!(format_amount_for_input(5800.0), "5800");
+    assert_eq!(format_amount_for_input(5800.50), "5800.50");
+    assert_eq!(format_amount_for_input(5800.000000000001), "5800");
+    assert_eq!(format_amount_for_input(0.0), "0");
+}
+
+#[test]
+fn test_monthly_summary_formatting() {
+    use crate::ui::finance::format_monthly_summary;
+
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+
+    // 1. 无任何账户
+    assert_eq!(
+        format_monthly_summary(0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None),
+        "暂无还款提醒"
+    );
+
+    // 2. 有账户但无金额，且无逾期、有下次还款日
+    assert_eq!(
+        format_monthly_summary(2, 2, 0, 2, 2, 0, 0, 0.0, 0.0, Some(day)),
+        "2 项启用 · 最近还款 2026-11-20"
+    );
+
+    // 3. 有账户但无金额，且有逾期
+    assert_eq!(
+        format_monthly_summary(3, 3, 0, 3, 3, 0, 1, 0.0, 0.0, Some(day)),
+        "1 项已逾期 · 共 3 项启用"
+    );
+
+    // 4. 有账户但全结清/暂停（无下次还款日）
+    assert_eq!(
+        format_monthly_summary(2, 0, 0, 0, 0, 0, 0, 0.0, 0.0, None),
+        "所有还款提醒已暂停或结束"
+    );
+
+    // 5. 全部已还清（无未填金额）
+    assert_eq!(
+        format_monthly_summary(3, 3, 3, 0, 0, 3, 0, 0.0, 18300.0, None),
+        "本月已全部结清 ¥18,300.00 · 3 项已还"
+    );
+
+    // 6. 全部已还清（含部分未填金额）
+    assert_eq!(
+        format_monthly_summary(3, 3, 2, 1, 0, 3, 0, 0.0, 12500.0, None),
+        "本月已全部结清 ¥12,500.00 (另 1 项未填金额) · 3 项已还"
+    );
+
+    // 7. 有待还，无逾期，全部有金额
+    assert_eq!(
+        format_monthly_summary(2, 2, 2, 0, 1, 1, 0, 5800.0, 12500.0, Some(day)),
+        "本月待还 ¥5,800.00 · 已还 ¥12,500.00 (本月应还 ¥18,300.00 · 2 项启用)"
+    );
+
+    // 8. 有待还，无逾期，含未填金额
+    assert_eq!(
+        format_monthly_summary(3, 3, 2, 1, 1, 1, 0, 5800.0, 12500.0, Some(day)),
+        "本月待还 ¥5,800.00 (另 1 项未填金额) · 已还 ¥12,500.00 · 共 2 项启用"
+    );
+
+    // 9. 有待还且有逾期（全部有金额）
+    assert_eq!(
+        format_monthly_summary(2, 2, 2, 0, 2, 0, 1, 10000.0, 0.0, Some(day)),
+        "1 项已逾期 · 本月待还 ¥10,000.00 · 已还 ¥0.00 (本月应还 ¥10,000.00)"
+    );
+
+    // 10. 有待还且有逾期（含未填金额）
+    assert_eq!(
+        format_monthly_summary(3, 3, 2, 1, 2, 0, 1, 10000.0, 0.0, Some(day)),
+        "1 项已逾期 · 本月待还 ¥10,000.00 (另 1 项未填金额) · 已还 ¥0.00"
+    );
+
+    // 11. 浮点分位累加精度（如 12500.55 + 3499.45 = 16000.00）
+    let p1 = 12500.55;
+    let p2 = 3499.45;
+    let sum = p1 + p2;
+    assert_eq!(
+        format_monthly_summary(2, 2, 2, 0, 2, 0, 0, sum, 0.0, Some(day)),
+        "本月待还 ¥16,000.00 · 已还 ¥0.00 (本月应还 ¥16,000.00 · 2 项启用)"
+    );
 }

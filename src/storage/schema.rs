@@ -19,6 +19,7 @@ impl Database {
         migrate_quiet_reminders_v11(&connection)?;
         migrate_v12(&connection)?;
         migrate_v13(&connection)?;
+        migrate_v14(&connection)?;
         Ok(())
     }
 

@@ -498,8 +498,8 @@ mod tests {
 
         assert!(prepare_database_upgrade(&root, "0.2.5").unwrap().is_none());
         let connection = rusqlite::Connection::open(database.path()).unwrap();
-        // 回退 v13 时必须同时移除新列，否则重跑 ALTER TABLE 会报重复列；
-        // 这里只验证升级前备份分支，真实 v12→v13 数据升级由 storage 测试覆盖。
+        // 回退 v14 时必须同时移除新列，否则重跑 ALTER TABLE 会报重复列；
+        // 这里只验证升级前备份分支，真实数据升级由 storage 测试覆盖。
         connection
             .execute(
                 "DELETE FROM schema_migrations WHERE version=?1",
@@ -508,10 +508,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE credit_cards DROP COLUMN closed_at;
-                 ALTER TABLE credit_cards DROP COLUMN final_cycle;
-                 ALTER TABLE credit_cards DROP COLUMN bank_id;
-                 ALTER TABLE credit_cards DROP COLUMN account_type;",
+                "ALTER TABLE credit_cards DROP COLUMN amount;
+                 ALTER TABLE credit_cards DROP COLUMN total_amount;",
             )
             .unwrap();
         drop(connection);

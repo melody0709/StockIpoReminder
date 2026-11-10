@@ -222,6 +222,9 @@ pub(crate) fn account_icon_svg(
             PaymentAccountKind::AutoLoan => {
                 Cow::Borrowed(include_bytes!("../../assets/banks/kind_auto_loan.svg"))
             }
+            PaymentAccountKind::CreditLoan => {
+                Cow::Borrowed(include_bytes!("../../assets/banks/kind_credit_loan.svg"))
+            }
         },
         _ => Cow::Borrowed(include_bytes!("../../assets/banks/bank_building.svg")),
     }
@@ -401,6 +404,7 @@ mod tests {
             PaymentAccountKind::CreditCard,
             PaymentAccountKind::Mortgage,
             PaymentAccountKind::AutoLoan,
+            PaymentAccountKind::CreditLoan,
         ] {
             let img = account_icon(None, kind, None);
             let size = img.size();
