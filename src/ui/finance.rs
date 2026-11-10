@@ -3,9 +3,9 @@ use slint::SharedString;
 
 use super::*;
 use crate::finance::{
-    BANK_REGISTRY, PaymentAccount, PaymentAccountKind, RepoSettings, bank_definition, bank_icon,
-    due_on_for_cycle, first_tracked_cycle, normalize_lead_days, parse_cycle, status_for_account,
-    undo_window_open, validate_payment_account,
+    BANK_REGISTRY, PaymentAccount, PaymentAccountKind, RepoSettings, account_icon, bank_definition,
+    bank_icon, due_on_for_cycle, first_tracked_cycle, normalize_lead_days, parse_cycle,
+    status_for_account, undo_window_open, validate_payment_account,
 };
 
 pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bool {
@@ -140,7 +140,11 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
                 alias: account.alias.clone().into(),
                 account_kind: account.kind.label().into(),
                 bank: account.bank_display_name().into(),
-                bank_icon: bank_icon(account.bank_id.as_deref()),
+                bank_icon: account_icon(
+                    account.bank_id.as_deref(),
+                    account.kind,
+                    account.bank_name.as_deref(),
+                ),
                 due_text: status
                     .next_due
                     .map(|due| due.format("%Y-%m-%d").to_string())
@@ -322,12 +326,52 @@ fn selected_bank_id(ui: &MainWindow, index: i32) -> Option<String> {
 
 fn update_form_bank_icon(ui: &MainWindow) {
     let bank_id = selected_bank_id(ui, ui.get_credit_form_bank_index());
-    ui.set_credit_form_bank_icon(bank_icon(bank_id.as_deref()));
+    let kind = match ui.get_credit_form_kind_index() {
+        1 => PaymentAccountKind::Mortgage,
+        2 => PaymentAccountKind::AutoLoan,
+        _ => PaymentAccountKind::CreditCard,
+    };
+    let custom_name = ui.get_credit_form_bank_name();
+    ui.set_credit_form_bank_icon(account_icon(
+        bank_id.as_deref(),
+        kind,
+        Some(custom_name.as_str()),
+    ));
     ui.set_credit_form_bank_custom(bank_id.as_deref() == Some("other"));
 }
 
 fn update_form_preview(ui: &MainWindow, runtime: &RuntimeHandle) {
     update_form_bank_icon(ui);
+    let form_id = ui.get_credit_form_id();
+    if form_id.trim().is_empty() {
+        let bank_id = selected_bank_id(ui, ui.get_credit_form_bank_index());
+        let bank_name = bank_id
+            .as_deref()
+            .and_then(bank_definition)
+            .map(|b| b.display_name)
+            .unwrap_or("");
+        let kind_label = match ui.get_credit_form_kind_index() {
+            1 => "房贷",
+            2 => "车贷",
+            _ => "信用卡",
+        };
+        let current_alias = ui.get_credit_form_alias();
+        let current_alias = current_alias.trim();
+        let is_autofillable = current_alias.is_empty()
+            || BANK_REGISTRY.iter().any(|b| {
+                for suffix in &["信用卡", "房贷", "车贷"] {
+                    if current_alias == format!("{}{}", b.display_name, suffix)
+                        || current_alias == format!("{} {}", b.display_name, suffix)
+                    {
+                        return true;
+                    }
+                }
+                false
+            });
+        if is_autofillable && !bank_name.is_empty() {
+            ui.set_credit_form_alias(format!("{bank_name} {kind_label}").into());
+        }
+    }
     let preview = (|| -> Result<String> {
         let due_day = (ui.get_credit_form_due_day_index() + 1) as u32;
         let final_cycle = ui.get_credit_form_final_cycle();

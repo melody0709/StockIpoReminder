@@ -359,3 +359,25 @@ fn main_window_declares_window_level_max_size() {
         );
     }
 }
+
+#[test]
+fn repayment_account_icons_and_semantic_fallbacks_are_correctly_registered() {
+    use crate::finance::{PaymentAccountKind, account_icon_svg};
+
+    for kind in [
+        PaymentAccountKind::CreditCard,
+        PaymentAccountKind::Mortgage,
+        PaymentAccountKind::AutoLoan,
+    ] {
+        let svg = account_icon_svg(None, kind, None);
+        assert!(svg.starts_with(b"<svg"), "语义降级必须生成有效 SVG");
+        assert!(svg.len() > 100, "SVG 资源不能过短");
+    }
+
+    let custom = account_icon_svg(
+        Some("other"),
+        PaymentAccountKind::CreditCard,
+        Some("测试银行"),
+    );
+    assert!(String::from_utf8_lossy(&custom).contains("测试"));
+}
