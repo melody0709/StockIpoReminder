@@ -46,12 +46,28 @@ pub(crate) fn wire_reminder_callbacks(
     let reminder_weak = reminder.as_weak();
     let main_weak = main_window.as_weak();
     let finance_runtime = runtime.clone();
-    reminder.on_open_finance(move |kind, _source_id| {
+    reminder.on_open_finance(move |kind, source_id| {
         if let Some(reminder) = reminder_weak.upgrade() {
             let _ = reminder.hide();
         }
         if let Some(main_window) = main_weak.upgrade() {
-            main_window.set_active_page(if kind.as_str() == "credit_card" { 5 } else { 4 });
+            let is_payment = matches!(
+                kind.as_str(),
+                "credit_card" | "mortgage" | "auto_loan" | "payment"
+            );
+            main_window.set_active_page(if is_payment { 5 } else { 4 });
+            if is_payment {
+                // 表单展开时列表是互斥隐藏的；从提醒跳转必须回到可定位的账户列表。
+                main_window.set_credit_form_visible(false);
+            }
+            main_window.set_credit_highlight_id(
+                if is_payment && !source_id.is_empty() {
+                    source_id.to_string()
+                } else {
+                    String::new()
+                }
+                .into(),
+            );
             show_and_repaint(&main_window);
             let _ = refresh_finance_ui(&main_window, &finance_runtime);
         }
@@ -67,6 +83,7 @@ pub(crate) fn wire_reminder_callbacks(
         if let Some(reminder) = reminder_weak.upgrade() {
             let _ = reminder.hide();
         }
+        let is_payment = matches!(kind.as_str(), "credit_card" | "mortgage" | "auto_loan");
         let result = match kind.as_str() {
             // 逆回购的「今日已处理」必须写在提醒自己的日期上：弹窗可以跨日保留，
             // 若用点击当天，周五的弹窗拖到周一才点就会把周一整天标成已处理。
@@ -74,15 +91,28 @@ pub(crate) fn wire_reminder_callbacks(
                 repo_ack_date(event_date.as_str(), crate::core::now_china().date_naive())
                     .and_then(|date| action_runtime.set_repo_day_acked(date, true))
             }
-            "credit_card" => action_runtime.mark_credit_card_paid(&source_id, &cycle_key),
-            _ => Ok(()),
+            "credit_card" | "mortgage" | "auto_loan" => {
+                action_runtime.mark_payment_account_paid(&source_id, &cycle_key)
+            }
+            _ => Err(anyhow::anyhow!("不支持的理财提醒类型：{kind}")),
         };
         if let Some(main_window) = action_main.upgrade() {
             if let Err(error) = result {
                 main_window.set_status_text(format!("保存提醒处理状态失败：{error:#}").into());
             }
+            if is_payment {
+                main_window.set_credit_form_visible(false);
+            }
+            main_window.set_credit_highlight_id(
+                if is_payment && !source_id.is_empty() {
+                    source_id.to_string()
+                } else {
+                    String::new()
+                }
+                .into(),
+            );
             let _ = refresh_finance_ui(&main_window, &action_runtime);
-            main_window.set_active_page(if kind.as_str() == "credit_card" { 5 } else { 4 });
+            main_window.set_active_page(if is_payment { 5 } else { 4 });
             show_and_repaint(&main_window);
         }
         action_runtime.notify_ui();

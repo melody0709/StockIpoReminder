@@ -199,3 +199,116 @@ fn interrupted_backup_commit_preserves_existing_backups_and_cleans_temporary_fil
             .all(|entry| entry.path().extension().is_none_or(|value| value != "tmp"))
     );
 }
+
+#[test]
+fn business_fingerprint_includes_v13_account_fields_and_actions() {
+    use crate::finance::{PaymentAccount, PaymentAccountKind};
+
+    let test = TestDatabase::new();
+    let now = now_china();
+    let account = PaymentAccount {
+        id: "fingerprint-loan".into(),
+        kind: PaymentAccountKind::Mortgage,
+        alias: "指纹贷款".into(),
+        bank_id: Some("cmb".into()),
+        bank_name: Some("招商银行".into()),
+        due_day: 5,
+        remind_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        lead_days: vec![3, 0],
+        overdue_enabled: true,
+        enabled: true,
+        first_tracked_cycle: "2026-01".into(),
+        final_cycle: Some("2026-12".into()),
+        closed_at: None,
+        rules_changed_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    test.database.save_payment_account(&account).unwrap();
+    let mut previous = test.database.business_state_fingerprint().unwrap();
+    for sql in [
+        "UPDATE credit_cards SET account_type='auto_loan' WHERE id='fingerprint-loan'",
+        "UPDATE credit_cards SET bank_id='ccb' WHERE id='fingerprint-loan'",
+        "UPDATE credit_cards SET final_cycle='2027-01' WHERE id='fingerprint-loan'",
+    ] {
+        test.database.open().unwrap().execute_batch(sql).unwrap();
+        let current = test.database.business_state_fingerprint().unwrap();
+        assert_ne!(current, previous, "指纹未覆盖字段变更：{sql}");
+        previous = current;
+    }
+    test.database
+        .mark_payment_account_paid(&account.id, "2027-01")
+        .unwrap();
+    let current = test.database.business_state_fingerprint().unwrap();
+    assert_ne!(current, previous, "指纹未覆盖已还动作");
+    previous = current;
+    test.database
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE credit_cards SET closed_at=?2 WHERE id=?1",
+            params![account.id, format_dt(now)],
+        )
+        .unwrap();
+    assert_ne!(
+        test.database.business_state_fingerprint().unwrap(),
+        previous
+    );
+}
+
+#[test]
+fn backup_preserves_loan_end_close_and_paid_action() {
+    use crate::finance::{PaymentAccount, PaymentAccountKind};
+
+    let test = TestDatabase::new();
+    let now = now_china();
+    let account = PaymentAccount {
+        id: "backup-loan".into(),
+        kind: PaymentAccountKind::Mortgage,
+        alias: "备份贷款".into(),
+        bank_id: Some("other".into()),
+        bank_name: Some("地方银行".into()),
+        due_day: 5,
+        remind_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        lead_days: vec![0],
+        overdue_enabled: true,
+        enabled: true,
+        first_tracked_cycle: "2026-01".into(),
+        final_cycle: Some("2026-12".into()),
+        closed_at: None,
+        rules_changed_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    test.database.save_payment_account(&account).unwrap();
+    test.database
+        .mark_payment_account_paid(&account.id, "2026-12")
+        .unwrap();
+    test.database.close_payment_account(&account.id).unwrap();
+    let path = test.database.backup(&test.root.join("backups")).unwrap();
+    let connection = Connection::open(path).unwrap();
+    let row = connection
+        .query_row(
+            "SELECT account_type,bank_id,bank,final_cycle,closed_at IS NOT NULL,
+                    (SELECT COUNT(*) FROM credit_card_actions WHERE card_id='backup-loan')
+             FROM credit_cards WHERE id='backup-loan'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, "mortgage");
+    assert_eq!(row.1, "other");
+    assert_eq!(row.2, "地方银行");
+    assert_eq!(row.3, "2026-12");
+    assert_eq!(row.4, 1);
+    assert_eq!(row.5, 1);
+}

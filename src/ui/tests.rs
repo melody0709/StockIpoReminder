@@ -280,11 +280,23 @@ fn finance_toast_targets_are_classified_before_ipo_lookup() {
     );
     assert_eq!(
         finance_toast_target("finance:card:0d1f"),
-        Some(FinanceToastTarget::CreditCard)
+        Some(FinanceToastTarget::PaymentAccount {
+            account_id: Some("0d1f".into())
+        })
+    );
+    assert_eq!(
+        finance_toast_target("finance:payment:0d1f"),
+        Some(FinanceToastTarget::PaymentAccount {
+            account_id: Some("0d1f".into())
+        })
+    );
+    assert_eq!(
+        finance_toast_target("finance:payment"),
+        Some(FinanceToastTarget::PaymentAccount { account_id: None })
     );
     assert_eq!(
         finance_toast_target("finance:card"),
-        Some(FinanceToastTarget::CreditCard)
+        Some(FinanceToastTarget::PaymentAccount { account_id: None })
     );
     // IPO 事件 ID 与更新目标不能被误判成理财。
     assert_eq!(finance_toast_target("sh-601001-2026-11-05"), None);
@@ -301,6 +313,26 @@ fn slint_source_is_registered_as_a_build_dependency() {
         build_script.contains("cargo:rerun-if-changed=ui/main.slint"),
         "build.rs 必须声明 ui/main.slint 为重跑条件"
     );
+}
+
+#[test]
+fn repayment_form_and_account_list_never_share_the_vertical_viewport() {
+    // 表单展开时若仍与账户列表并列，ListView 会被压成一条卡片高，账户多了无法滚动。
+    // 两者改为互斥：表单占满可用高度并在内部滚动，收起后才显示占满剩余高度的账户列表。
+    let ui =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/main.slint")).unwrap();
+    let start = ui
+        .find("if root.active-page == 5 :")
+        .expect("必须存在还款提醒页");
+    let end = ui[start..]
+        .find("if root.active-page == 2 :")
+        .map(|offset| start + offset)
+        .expect("还款提醒页之后必须还有健康页");
+    let page = &ui[start..end];
+    assert!(page.contains("if !root.credit-form-visible : Rectangle"));
+    assert!(page.contains("height: root.repayment-page-height"));
+    assert!(page.contains("ListView"));
+    assert!(page.contains("for card in root.credit-cards"));
 }
 
 #[test]

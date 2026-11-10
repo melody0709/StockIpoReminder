@@ -201,10 +201,20 @@ impl NativeTray {
                                 crate::ui::finance_toast_target(&event_id)
                             {
                                 // 理财 Toast 直接进对应页面，不要按 IPO 事件 ID 查详情。
-                                window.set_active_page(match target {
-                                    crate::ui::FinanceToastTarget::ReverseRepo => 4,
-                                    crate::ui::FinanceToastTarget::CreditCard => 5,
-                                });
+                                match target {
+                                    crate::ui::FinanceToastTarget::ReverseRepo => {
+                                        window.set_active_page(4);
+                                    }
+                                    crate::ui::FinanceToastTarget::PaymentAccount {
+                                        account_id,
+                                    } => {
+                                        window.set_active_page(5);
+                                        window.set_credit_form_visible(false);
+                                        window.set_credit_highlight_id(
+                                            account_id.unwrap_or_default().into(),
+                                        );
+                                    }
+                                }
                             } else if crate::updater::is_update_activation(&event_id) {
                                 // 更新通知只打开设置页的更新区域，不进入股票详情。
                                 window.set_active_page(3);

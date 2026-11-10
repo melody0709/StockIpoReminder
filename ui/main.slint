@@ -55,15 +55,22 @@ export struct OverrideRow {
 export struct CreditCardRow {
     id: string,
     alias: string,
+    account-kind: string,
     bank: string,
+    bank-icon: image,
     due-text: string,
     status-text: string,
     status-tone: int,
     lead-text: string,
     remind-text: string,
+    final-cycle-text: string,
     cycle-key: string,
     enabled: bool,
+    can-pay: bool,
     can-undo: bool,
+    is-loan: bool,
+    closed: bool,
+    action-rows: int,
 }
 
 component UpdatePill inherits Rectangle {
@@ -298,8 +305,13 @@ export component MainWindow inherits Window {
     in-out property <bool> compact-width: false;
     in-out property <bool> compact-height: false;
     in-out property <bool> show-nav-health: true;
+    // 还款页的 ScrollView 必须有确定的可视高度，否则会按内容撑出窗口；在窗口高度变化时换算一次，避免布局循环。
+    in-out property <length> repayment-page-height: 510px;
     changed width => { root.compact-width = root.width < 1000px; root.show-nav-health = root.width >= 1120px; }
-    changed height => { root.compact-height = root.height < 650px; }
+    changed height => {
+        root.compact-height = root.height < 650px;
+        root.repayment-page-height = Math.max(160px, root.height - 270px);
+    }
     in property <string> app-version: "";
     in-out property <string> status-text: "正在初始化…";
     in-out property <string> sync-text: "尚未同步";
@@ -411,19 +423,32 @@ export component MainWindow inherits Window {
     in-out property <bool> repo-form-dirty: false;
 
     in-out property <[CreditCardRow]> credit-cards: [];
-    in-out property <string> credit-summary: "暂无信用卡提醒";
+    in-out property <[string]> credit-bank-options: [];
+    in-out property <[string]> credit-bank-ids: [];
+    in-out property <[string]> credit-due-day-options: [];
+    in-out property <string> credit-summary: "暂无还款提醒";
     in-out property <string> credit-form-id: "";
+    in-out property <int> credit-form-kind-index: 0;
     in-out property <string> credit-form-alias: "";
-    in-out property <string> credit-form-bank: "";
-    in-out property <string> credit-form-due-day: "5";
+    in-out property <int> credit-form-bank-index: 0;
+    in-out property <image> credit-form-bank-icon: @image-url("../assets/banks/generic.svg");
+    in-out property <string> credit-form-bank-name: "";
+    in-out property <bool> credit-form-bank-custom: false;
+    in-out property <int> credit-form-due-day-index: 4;
     in-out property <string> credit-form-remind-time: "09:00";
+    in-out property <int> credit-form-lead-mode-index: 2;
     in-out property <string> credit-form-lead-days: "3,0";
+    in-out property <string> credit-form-final-cycle: "";
     in-out property <bool> credit-form-overdue: true;
     in-out property <bool> credit-form-enabled: true;
     in-out property <bool> credit-form-editing: false;
+    in-out property <bool> credit-form-visible: false;
+    in-out property <string> credit-form-preview: "";
+    in-out property <string> credit-highlight-id: "";
     in-out property <string> credit-error: "";
-    // 非空表示「已请求删除该卡，等待二次确认」；只存 card id，避免额外模态窗口。
+    // 非空表示「已请求删除该账户，等待二次确认」；只存 account id，避免额外模态窗口。
     in-out property <string> credit-confirm-delete: "";
+    in-out property <string> credit-confirm-close: "";
 
     in-out property <bool> show-details: false;
     in-out property <string> selected-event-id: "";
@@ -495,12 +520,15 @@ export component MainWindow inherits Window {
     callback request-uninstall(bool, string);
     callback save-repo-settings(bool, bool, string, bool, string);
     callback set-repo-acked(bool);
-    callback save-credit-card(string, string, string, string, string, string, bool, bool);
+    callback save-credit-card(string, int, string, int, string, int, string, int, string, string, bool, bool);
     callback delete-credit-card(string);
     callback edit-credit-card(string);
     callback clear-credit-editor();
     callback mark-credit-paid(string, string);
     callback undo-credit-action(string);
+    callback close-credit-account(string);
+    callback resume-credit-account(string);
+    callback preview-credit-form();
     callback hide-to-tray();
     callback exit-app();
 
@@ -619,7 +647,7 @@ export component MainWindow inherits Window {
             NavButton { label: "今日任务"; compact: root.compact-width; selected: root.active-page == 0; clicked => { root.active-page = 0; } }
             NavButton { label: "未来 60 天"; compact: root.compact-width; selected: root.active-page == 1; clicked => { root.active-page = 1; } }
             NavButton { label: "逆回购"; compact: root.compact-width; selected: root.active-page == 4; clicked => { root.active-page = 4; } }
-            NavButton { label: "信用卡"; compact: root.compact-width; selected: root.active-page == 5; clicked => { root.active-page = 5; } }
+            NavButton { label: "还款提醒"; compact: root.compact-width; selected: root.active-page == 5; clicked => { root.active-page = 5; } }
             NavButton { label: "健康与诊断"; compact: root.compact-width; selected: root.active-page == 2; clicked => { root.active-page = 2; } }
             NavButton { label: "设置"; compact: root.compact-width; selected: root.active-page == 3; clicked => { root.active-page = 3; } }
             // 六个导航项已经占掉约 798px，健康摘要剩余空间有限：
@@ -945,8 +973,8 @@ export component MainWindow inherits Window {
 
         if root.active-page == 5 : VerticalBox {
             spacing: root.compact-height ? 8px : 10px;
-            Rectangle {
-                height: 58px;
+            if !root.credit-form-visible : Rectangle {
+                min-height: 58px;
                 border-radius: 10px;
                 border-width: 1px;
                 border-color: #26334a;
@@ -954,107 +982,199 @@ export component MainWindow inherits Window {
                 HorizontalBox {
                     padding: 12px;
                     spacing: 10px;
-                    Text { text: root.credit-summary; color: #f8fafc; font-size: 18px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
-                    ActionButton { label: "新增"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.clear-credit-editor(); } }
+                    Text { text: root.credit-summary; color: #f8fafc; font-size: 18px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                    ActionButton {
+                        label: "新增还款";
+                        compact: root.compact-width;
+                        primary: true;
+                        clicked => {
+                            root.credit-confirm-delete = "";
+                            root.credit-confirm-close = "";
+                            root.clear-credit-editor();
+                            root.credit-form-visible = true;
+                            root.preview-credit-form();
+                        }
+                    }
                 }
             }
-            Rectangle {
+            if root.credit-form-visible : Rectangle {
+                height: root.repayment-page-height;
                 border-radius: 10px;
                 border-width: 1px;
                 border-color: root.credit-form-editing ? #3b82f6 : #26334a;
                 background: #111b2e;
-                VerticalBox {
+                ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    vertical-scrollbar-policy: root.compact-height ? always-on : as-needed;
+                    VerticalBox {
                     padding: 12px;
                     spacing: 8px;
-                    Text { text: root.credit-form-editing ? "编辑信用卡" : "新增信用卡"; color: #f8fafc; font-size: 16px; font-weight: 600; }
+                    Text { text: root.credit-form-editing ? "编辑还款账户" : "新增还款账户"; color: #f8fafc; font-size: 16px; font-weight: 600; }
                     HorizontalBox {
                         spacing: 8px;
-                        LineEdit { text <=> root.credit-form-alias; placeholder-text: "别名，例如 招行 Visa"; horizontal-stretch: 1; }
-                        LineEdit { text <=> root.credit-form-bank; placeholder-text: "银行（可选）"; horizontal-stretch: 1; }
+                        Text { text: "类型"; color: #cbd5e1; vertical-alignment: center; }
+                        ComboBox {
+                            width: 112px;
+                            model: ["信用卡", "房贷", "车贷"];
+                            current-index <=> root.credit-form-kind-index;
+                            enabled: !root.credit-form-editing;
+                            selected => { root.preview-credit-form(); }
+                        }
+                        LineEdit { text <=> root.credit-form-alias; placeholder-text: "别名，例如 招行 Visa / 住房贷款"; horizontal-stretch: 1; edited(text) => { root.preview-credit-form(); } }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Rectangle { width: 30px; height: 30px; Image { source: root.credit-form-bank-icon; width: 26px; height: 26px; x: 2px; y: 2px; } }
+                        ComboBox {
+                            width: root.compact-width ? 168px : 204px;
+                            model: root.credit-bank-options;
+                            current-index <=> root.credit-form-bank-index;
+                            selected => { root.preview-credit-form(); }
+                        }
+                        if root.credit-form-bank-custom : LineEdit {
+                            text <=> root.credit-form-bank-name;
+                            placeholder-text: "自定义银行名称";
+                            horizontal-stretch: 1;
+                            edited(text) => { root.preview-credit-form(); }
+                        }
                     }
                     HorizontalBox {
                         spacing: 8px;
                         Text { text: "还款日"; color: #cbd5e1; vertical-alignment: center; }
-                        // 宽度不能再压：stdlib LineEdit 左右各 12px 内边距，聚焦且有内容时
-                        // 右侧还要给 16px 清除图标让位，剩余才是文本区。
-                        LineEdit { width: 96px; text <=> root.credit-form-due-day; placeholder-text: "1-31"; }
+                        ComboBox { width: 86px; model: root.credit-due-day-options; current-index <=> root.credit-form-due-day-index; selected => { root.preview-credit-form(); } }
                         Text { text: "提醒时间"; color: #cbd5e1; vertical-alignment: center; }
-                        LineEdit { width: 108px; text <=> root.credit-form-remind-time; placeholder-text: "09:00"; }
-                        Text { text: "提前天数"; color: #cbd5e1; vertical-alignment: center; }
-                        LineEdit { width: 132px; text <=> root.credit-form-lead-days; placeholder-text: "3,0"; }
+                        LineEdit { width: 104px; text <=> root.credit-form-remind-time; placeholder-text: "09:00"; edited(text) => { root.preview-credit-form(); } }
+                        Text { text: "提前提醒"; color: #cbd5e1; vertical-alignment: center; }
+                        ComboBox {
+                            width: root.compact-width ? 204px : 252px;
+                            model: ["仅当天", "提前 1 天 + 当天", "提前 3 天 + 当天", "提前 7 天 + 提前 3 天 + 当天", "自定义"];
+                            current-index <=> root.credit-form-lead-mode-index;
+                            selected => {
+                                if (root.credit-form-lead-mode-index == 0) { root.credit-form-lead-days = "0"; }
+                                if (root.credit-form-lead-mode-index == 1) { root.credit-form-lead-days = "1,0"; }
+                                if (root.credit-form-lead-mode-index == 2) { root.credit-form-lead-days = "3,0"; }
+                                if (root.credit-form-lead-mode-index == 3) { root.credit-form-lead-days = "7,3,0"; }
+                                root.preview-credit-form();
+                            }
+                        }
+                        if root.credit-form-lead-mode-index == 4 : LineEdit { width: 118px; text <=> root.credit-form-lead-days; placeholder-text: "3,0"; edited(text) => { root.preview-credit-form(); } }
+                    }
+                    if root.credit-form-kind-index > 0 : HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "结束还款月（可选）"; color: #cbd5e1; vertical-alignment: center; }
+                        LineEdit { width: 118px; text <=> root.credit-form-final-cycle; placeholder-text: "YYYY-MM"; edited(text) => { root.preview-credit-form(); } }
+                        Text { text: "包含该月；留空则持续按月提醒。"; color: #94a3b8; font-size: 12px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
                     }
                     HorizontalBox {
                         spacing: 10px;
                         Toggle { checked <=> root.credit-form-overdue; label: "逾期次日补提醒"; }
                         Toggle { checked <=> root.credit-form-enabled; label: "启用"; }
                         Rectangle { horizontal-stretch: 1; }
-                        ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.clear-credit-editor(); } }
-                        ActionButton { label: "保存"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.save-credit-card(root.credit-form-id, root.credit-form-alias, root.credit-form-bank, root.credit-form-due-day, root.credit-form-remind-time, root.credit-form-lead-days, root.credit-form-overdue, root.credit-form-enabled); } }
+                        ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.clear-credit-editor(); } }
+                        ActionButton {
+                            label: "保存";
+                            compact: root.compact-width;
+                            primary: true;
+                            clicked => {
+                                root.credit-confirm-delete = "";
+                                root.credit-confirm-close = "";
+                                root.save-credit-card(root.credit-form-id, root.credit-form-kind-index, root.credit-form-alias, root.credit-form-bank-index, root.credit-form-bank-name, root.credit-form-due-day-index, root.credit-form-remind-time, root.credit-form-lead-mode-index, root.credit-form-lead-days, root.credit-form-final-cycle, root.credit-form-overdue, root.credit-form-enabled);
+                            }
+                        }
                     }
+                    if root.credit-form-preview != "" : Text { text: root.credit-form-preview; color: #93c5fd; font-size: 12px; wrap: word-wrap; }
                     if root.credit-error != "" : Text { text: root.credit-error; color: #fca5a5; font-size: 12px; wrap: word-wrap; }
-                    Text { text: "只保存别名、银行和日期；请勿填写完整卡号、安全码或账单金额。提前天数可用逗号分隔多个档位，例如 3,0 表示提前 3 天和当天各提醒一次。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                    Text { text: "只保存别名、银行和日期；请勿填写贷款金额、利率、完整卡号、安全码或账单金额。29/30/31 日在短月会自动按月末提醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                    }
                 }
             }
-            Rectangle {
-                vertical-stretch: 1;
+            if !root.credit-form-visible : Rectangle {
+                height: root.repayment-page-height - (root.compact-height ? 66px : 68px);
                 border-radius: 10px;
                 border-width: 1px;
                 border-color: #26334a;
                 background: #111b2e;
                 ListView {
-                    visible: root.credit-cards.length > 0;
                     for card in root.credit-cards : Rectangle {
-                        // 动作列改成单列按钮后，行高必须跟着按钮数量走：
-                        // 每个按钮 38px、按钮间距 6px、上下内边距各 10px。
-                        // action-rows 就是可见按钮数：编辑+删除 2 个 → 102，
-                        // 再加「本期已还」或「撤销已还」3 个 → 146，两个都在 4 个 → 190。
-                        // 两步确认时「取消 + 确定删除」同样是 2 个按钮，行数不变。
-                        property <int> action-rows: (card.enabled ? 1 : 0) + (card.can-undo ? 1 : 0) + 2;
-                        height: action-rows == 4 ? 190px : action-rows == 3 ? 146px : 102px;
+                        // 动作区改为最多三行、每行最多两个按钮，避免贷款新增「已结清」后继续叠加单列高度。
+                        height: card.action-rows == 3 ? 172px : 128px;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: card.status-tone >= 2 ? #b45309 : #26334a;
-                        background: #0f172a;
+                        border-color: root.credit-highlight-id == card.id ? #3b82f6 : card.status-tone >= 2 ? #b45309 : #26334a;
+                        background: root.credit-highlight-id == card.id ? #13213c : #0f172a;
                         HorizontalBox {
-                            padding: 10px;
-                            spacing: 10px;
+                            padding-left: root.compact-width ? 8px : 10px;
+                            padding-right: root.compact-width ? 18px : 22px;
+                            padding-top: root.compact-width ? 8px : 10px;
+                            padding-bottom: root.compact-width ? 8px : 10px;
+                            spacing: root.compact-width ? 8px : 10px;
+                            Rectangle { width: 32px; height: 32px; Image { source: card.bank-icon; width: 28px; height: 28px; x: 2px; y: 2px; } }
                             VerticalBox {
-                                width: 26%;
+                                width: root.compact-width ? 20% : 24%;
                                 spacing: 3px;
                                 Text { text: card.alias; color: #f8fafc; font-size: 17px; font-weight: 700; overflow: elide; }
-                                Text { text: card.bank == "" ? "未填写银行" : card.bank; color: #94a3b8; font-size: 12px; overflow: elide; }
+                                Text { text: card.account-kind + " · " + card.bank; color: #94a3b8; font-size: 12px; overflow: elide; }
                             }
                             VerticalBox {
-                                width: 22%;
+                                width: root.compact-width ? 18% : 21%;
                                 spacing: 3px;
-                                Text { text: card.due-text; color: #e2e8f0; }
-                                Text { text: card.status-text; color: card.status-tone == 3 ? #fca5a5 : card.status-tone == 2 ? #fcd34d : card.status-tone == 1 ? #fbbf24 : #86efac; font-weight: 600; }
+                                Text { text: "下次还款"; color: #94a3b8; font-size: 12px; }
+                                Text { text: card.due-text; color: #e2e8f0; font-size: 13px; overflow: elide; }
+                                Text { text: card.status-text; color: card.status-tone == 3 ? #fca5a5 : card.status-tone == 2 ? #fcd34d : card.status-tone == 1 ? #fbbf24 : #86efac; font-weight: 600; wrap: word-wrap; }
                             }
                             VerticalBox {
                                 horizontal-stretch: 1;
                                 spacing: 3px;
                                 Text { text: card.lead-text; color: #cbd5e1; font-size: 12px; wrap: word-wrap; }
-                                Text { text: card.remind-text; color: #94a3b8; font-size: 12px; }
+                                Text { text: card.remind-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                                if card.final-cycle-text != "" : Text { text: card.final-cycle-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                             }
-                            VerticalBox {
-                                // 单列动作区：列宽由 ActionButton 的 min-width（88/104）决定。
-                                // 不要写 width 去收窄它——父布局会忽略这个值并仍按 min-width 排布，
-                                // 反过来两列并排（2×104+间距）又会超出卡片而被截断，删除按钮就是这么丢的。
-                                // alignment: start 让按钮贴着卡片顶部排，不会被各行居中的留白拉开。
-                                alignment: start;
-                                spacing: 6px;
-                                if card.enabled : ActionButton { label: "本期已还"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.mark-credit-paid(card.id, card.cycle-key); } }
-                                if card.can-undo : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.undo-credit-action(card.id); } }
-                                if root.credit-confirm-delete != card.id : ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.edit-credit-card(card.id); } }
-                                if root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = card.id; } }
-                                if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
-                                if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                            Rectangle {
+                                width: root.compact-width ? 184px : 216px;
+                                VerticalBox {
+                                    alignment: start;
+                                    spacing: 6px;
+                                    if card.can-pay || card.can-undo || card.closed : HorizontalBox {
+                                        spacing: 6px;
+                                        if card.can-pay : ActionButton { label: "本期已还"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.mark-credit-paid(card.id, card.cycle-key); } }
+                                        if card.can-undo : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.undo-credit-action(card.id); } }
+                                        if card.closed : ActionButton { label: "恢复进行中"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.resume-credit-account(card.id); } }
+                                    }
+                                    if !card.closed : HorizontalBox {
+                                        spacing: 6px;
+                                        if root.credit-confirm-delete != card.id : ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.edit-credit-card(card.id); } }
+                                        if card.is-loan && root.credit-confirm-delete != card.id && root.credit-confirm-close != card.id : ActionButton { label: "已结清"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = card.id; } }
+                                        if !card.is-loan && root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
+                                        if root.credit-confirm-close == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-close = ""; } }
+                                        if root.credit-confirm-close == card.id : ActionButton { label: "确定结清"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.close-credit-account(card.id); } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                    }
+                                    if card.closed : HorizontalBox {
+                                        spacing: 6px;
+                                        if root.credit-confirm-delete != card.id : ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.edit-credit-card(card.id); } }
+                                        if root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                    }
+                                    if card.is-loan && !card.closed : HorizontalBox {
+                                        spacing: 6px;
+                                        if root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
+                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                    }
+                                }
                             }
                         }
                     }
                 }
                 if root.credit-cards.length == 0 : Text {
-                    text: "还没有信用卡提醒。添加一张卡，程序只记录别名和日期。";
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    text: "还没有还款提醒。添加信用卡、房贷或车贷后，程序只记录别名、银行和日期。";
                     color: #94a3b8;
                     font-size: 15px;
                     horizontal-alignment: center;

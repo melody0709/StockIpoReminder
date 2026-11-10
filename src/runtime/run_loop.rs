@@ -62,20 +62,20 @@ pub(crate) fn run_loop(
         // 在独立线程中执行，避免慢网把 14:50/15:20 的窗口拖过去。
         let finance_now = now_china();
         let finance_reminders =
-            crate::finance::due_finance_reminders(database, finance_now, |key| {
+            crate::finance::due_finance_reminders(database, finance_now, |reminder| {
                 ui_state
                     .finance
                     .lock()
-                    .map(|state| state.is_blocked(key, finance_now))
+                    .map(|state| state.is_blocked(reminder, finance_now))
                     .unwrap_or(true)
             })?;
         if !finance_reminders.is_empty() {
-            let keys = finance_reminders
+            let identities = finance_reminders
                 .iter()
-                .map(|reminder| reminder.occurrence_key.clone())
+                .map(crate::finance::FinanceReminder::identity)
                 .collect::<Vec<_>>();
             if let Ok(mut state) = ui_state.finance.lock() {
-                state.begin(keys);
+                state.begin(identities);
             }
             if send_ui_event(
                 events,
@@ -85,9 +85,11 @@ pub(crate) fn run_loop(
             .is_err()
                 && let Ok(mut state) = ui_state.finance.lock()
             {
-                for reminder in &finance_reminders {
-                    state.discard(std::slice::from_ref(&reminder.occurrence_key));
-                }
+                let identities = finance_reminders
+                    .iter()
+                    .map(crate::finance::FinanceReminder::identity)
+                    .collect::<Vec<_>>();
+                state.discard(&identities);
             }
         }
 

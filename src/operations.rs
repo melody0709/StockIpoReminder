@@ -361,7 +361,7 @@ pub fn create_diagnostic_bundle(data_root: &Path, database: &Database) -> Result
     crash_reports.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
     crash_reports.truncate(10);
     let summary = json!({
-        "schemaVersion": "4",
+        "schemaVersion": "5",
         "generatedAt": now_china().to_rfc3339(),
         "product": "StockIpoReminder-Rust",
         "applicationVersion": env!("CARGO_PKG_VERSION"),
@@ -380,11 +380,11 @@ pub fn create_diagnostic_bundle(data_root: &Path, database: &Database) -> Result
         "pendingCount": database.pending_count().unwrap_or_default(),
         "settings": settings,
         "settingsError": settings_error,
-        "financeReminder": database.finance_counts().ok().map(|(enabled_cards, shown_today)| {
+        "financeReminder": database.finance_counts().ok().map(|(enabled_accounts, shown_today)| {
             json!({
-                "enabledCards": enabled_cards,
+                "enabledAccounts": enabled_accounts,
                 "shownToday": shown_today,
-                "note": "仅计数，不包含信用卡别名、银行、还款日期或逆回购配置"
+                "note": "仅计数，不包含还款账户别名、银行、贷款结束月、具体日期或逆回购配置"
             })
         }),
         "windowsToast": toast_diagnostics,
@@ -498,10 +498,20 @@ mod tests {
 
         assert!(prepare_database_upgrade(&root, "0.2.5").unwrap().is_none());
         let connection = rusqlite::Connection::open(database.path()).unwrap();
+        // 回退 v13 时必须同时移除新列，否则重跑 ALTER TABLE 会报重复列；
+        // 这里只验证升级前备份分支，真实 v12→v13 数据升级由 storage 测试覆盖。
         connection
             .execute(
                 "DELETE FROM schema_migrations WHERE version=?1",
                 [LATEST_SCHEMA_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE credit_cards DROP COLUMN closed_at;
+                 ALTER TABLE credit_cards DROP COLUMN final_cycle;
+                 ALTER TABLE credit_cards DROP COLUMN bank_id;
+                 ALTER TABLE credit_cards DROP COLUMN account_type;",
             )
             .unwrap();
         drop(connection);

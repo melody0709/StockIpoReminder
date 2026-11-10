@@ -18,6 +18,7 @@ impl Database {
         migrate_secondary_notification_identity_v10(&connection)?;
         migrate_quiet_reminders_v11(&connection)?;
         migrate_v12(&connection)?;
+        migrate_v13(&connection)?;
         Ok(())
     }
 

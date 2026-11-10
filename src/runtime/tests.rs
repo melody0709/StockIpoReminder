@@ -666,3 +666,36 @@ fn daily_maintenance_creates_a_new_backup_after_business_changes() {
     assert_eq!(count, 2);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn finance_runtime_identity_does_not_deduplicate_different_kinds_or_sources() {
+    let at: ChinaDateTime = "2026-11-09T09:00:00+08:00".parse().unwrap();
+    let make = |kind, source_id: &str| crate::finance::FinanceReminder {
+        kind,
+        source_id: source_id.into(),
+        occurrence_key: "same-key".into(),
+        event_date: at.date_naive(),
+        due_at: at,
+        valid_until: at,
+        title: "测试".into(),
+        body: "测试".into(),
+        primary_action_label: "本期已还".into(),
+        primary_action_cycle: Some("2026-11".into()),
+    };
+    let credit = make(crate::finance::FinanceKind::CreditCard, "same-source");
+    let mortgage = make(crate::finance::FinanceKind::Mortgage, "same-source");
+    let other_source = make(crate::finance::FinanceKind::CreditCard, "other-source");
+    let mut state = FinanceRuntimeState::default();
+    state.begin([credit.identity()]);
+
+    assert!(state.is_blocked(&credit, at));
+    assert!(!state.is_blocked(&mortgage, at));
+    assert!(!state.is_blocked(&other_source, at));
+
+    state
+        .presented(&[credit.identity(), mortgage.identity()])
+        .unwrap();
+    assert!(state.is_blocked(&credit, at));
+    assert!(state.is_blocked(&mortgage, at));
+    assert!(!state.is_blocked(&other_source, at));
+}

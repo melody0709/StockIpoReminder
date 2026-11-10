@@ -57,66 +57,82 @@ pub(crate) enum RuntimeCommand {
 
 #[derive(Debug, Default)]
 pub(crate) struct FinanceRuntimeState {
-    in_flight: HashSet<String>,
-    retry_pending: BTreeMap<String, crate::model::ChinaDateTime>,
-    shown_this_session: HashSet<String>,
+    in_flight: HashSet<crate::finance::FinanceReminderIdentity>,
+    retry_pending: BTreeMap<crate::finance::FinanceReminderIdentity, crate::model::ChinaDateTime>,
+    shown_this_session: HashSet<crate::finance::FinanceReminderIdentity>,
 }
 
 impl FinanceRuntimeState {
-    pub(crate) fn is_blocked(&self, key: &str, now: crate::model::ChinaDateTime) -> bool {
-        self.in_flight.contains(key)
-            || self.shown_this_session.contains(key)
+    pub(crate) fn is_blocked(
+        &self,
+        reminder: &crate::finance::FinanceReminder,
+        now: crate::model::ChinaDateTime,
+    ) -> bool {
+        let identity = reminder.identity();
+        self.in_flight.contains(&identity)
+            || self.shown_this_session.contains(&identity)
             || self
                 .retry_pending
-                .get(key)
+                .get(&identity)
                 .is_some_and(|retry_at| *retry_at > now)
     }
 
-    pub(crate) fn begin(&mut self, keys: impl IntoIterator<Item = String>) {
-        for key in keys {
-            self.in_flight.insert(key);
+    pub(crate) fn begin(
+        &mut self,
+        identities: impl IntoIterator<Item = crate::finance::FinanceReminderIdentity>,
+    ) {
+        for identity in identities {
+            self.in_flight.insert(identity);
         }
     }
 
-    pub(crate) fn retry_pending(&self) -> &BTreeMap<String, crate::model::ChinaDateTime> {
+    pub(crate) fn retry_pending(
+        &self,
+    ) -> &BTreeMap<crate::finance::FinanceReminderIdentity, crate::model::ChinaDateTime> {
         &self.retry_pending
     }
 
-    pub(crate) fn presented(&mut self, keys: &[String]) -> Result<()> {
-        self.ensure_keys(keys)?;
-        for key in keys {
-            self.in_flight.remove(key);
-            self.retry_pending.remove(key);
-            self.shown_this_session.insert(key.clone());
+    pub(crate) fn presented(
+        &mut self,
+        identities: &[crate::finance::FinanceReminderIdentity],
+    ) -> Result<()> {
+        self.ensure_identities(identities)?;
+        for identity in identities {
+            self.in_flight.remove(identity);
+            self.retry_pending.remove(identity);
+            self.shown_this_session.insert(identity.clone());
         }
         Ok(())
     }
 
     pub(crate) fn failed(
         &mut self,
-        keys: &[String],
+        reminders: &[crate::finance::FinanceReminder],
         now: crate::model::ChinaDateTime,
-        valid_until: crate::model::ChinaDateTime,
     ) {
-        for key in keys {
-            self.in_flight.remove(key);
-            let retry_at = (now + chrono::Duration::seconds(30)).min(valid_until);
+        for reminder in reminders {
+            let identity = reminder.identity();
+            self.in_flight.remove(&identity);
+            let retry_at = (now + chrono::Duration::seconds(30)).min(reminder.valid_until);
             if retry_at > now {
-                self.retry_pending.insert(key.clone(), retry_at);
+                self.retry_pending.insert(identity, retry_at);
             }
         }
     }
 
-    pub(crate) fn discard(&mut self, keys: &[String]) {
-        for key in keys {
-            self.in_flight.remove(key);
-            self.retry_pending.remove(key);
+    pub(crate) fn discard(&mut self, identities: &[crate::finance::FinanceReminderIdentity]) {
+        for identity in identities {
+            self.in_flight.remove(identity);
+            self.retry_pending.remove(identity);
         }
     }
 
-    fn ensure_keys(&self, keys: &[String]) -> Result<()> {
-        if keys.is_empty() {
-            anyhow::bail!("提醒 key 不能为空");
+    fn ensure_identities(
+        &self,
+        identities: &[crate::finance::FinanceReminderIdentity],
+    ) -> Result<()> {
+        if identities.is_empty() {
+            anyhow::bail!("提醒身份不能为空");
         }
         Ok(())
     }
@@ -338,40 +354,47 @@ impl RuntimeHandle {
         self.wake();
         Ok(())
     }
-    pub fn credit_cards(&self) -> Result<Vec<crate::finance::CreditCard>> {
+    pub fn payment_accounts(&self) -> Result<Vec<crate::finance::PaymentAccount>> {
         self.ensure_ready()?;
-        self.database.credit_cards()
+        self.database.payment_accounts()
     }
-    pub fn save_credit_card(&self, card: &crate::finance::CreditCard) -> Result<()> {
+    pub fn save_payment_account(&self, account: &crate::finance::PaymentAccount) -> Result<()> {
         self.ensure_ready()?;
-        self.database.save_credit_card(card)?;
+        self.database.save_payment_account(account)?;
         self.wake();
         Ok(())
     }
-    pub fn delete_credit_card(&self, id: &str) -> Result<()> {
+    pub fn delete_payment_account(&self, id: &str) -> Result<()> {
         self.ensure_ready()?;
-        self.database.delete_credit_card(id)?;
+        self.database.delete_payment_account(id)?;
         self.wake();
         Ok(())
     }
-    pub fn credit_card_settled(&self, id: &str) -> Result<Option<String>> {
+    pub fn payment_account_settled(&self, id: &str) -> Result<Option<String>> {
         self.ensure_ready()?;
-        self.database.credit_card_settled(id)
+        self.database.payment_account_settled(id)
     }
-    pub fn mark_credit_card_paid(&self, id: &str, cycle: &str) -> Result<()> {
+    pub fn mark_payment_account_paid(&self, id: &str, cycle: &str) -> Result<()> {
         self.ensure_ready()?;
-        let card = self
-            .database
-            .credit_card(id)?
-            .ok_or_else(|| anyhow::anyhow!("信用卡不存在"))?;
-        let due = crate::finance::due_on_for_cycle(cycle, card.due_day)?;
-        self.database.mark_credit_card_paid(id, cycle, due)?;
+        self.database.mark_payment_account_paid(id, cycle)?;
         self.wake();
         Ok(())
     }
-    pub fn undo_credit_card_action(&self, id: &str) -> Result<()> {
+    pub fn undo_payment_account_action(&self, id: &str) -> Result<()> {
         self.ensure_ready()?;
-        self.database.undo_credit_card_action(id)?;
+        self.database.undo_payment_account_action(id)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn close_payment_account(&self, id: &str) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.close_payment_account(id)?;
+        self.wake();
+        Ok(())
+    }
+    pub fn resume_payment_account(&self, id: &str) -> Result<()> {
+        self.ensure_ready()?;
+        self.database.resume_payment_account(id)?;
         self.wake();
         Ok(())
     }
@@ -385,12 +408,12 @@ impl RuntimeHandle {
                 reminder.event_date,
             )?;
         }
-        let keys = reminders
+        let identities = reminders
             .iter()
-            .map(|reminder| reminder.occurrence_key.clone())
+            .map(crate::finance::FinanceReminder::identity)
             .collect::<Vec<_>>();
         if let Ok(mut state) = self.ui_state.finance.lock() {
-            state.presented(&keys)?;
+            state.presented(&identities)?;
         }
         self.wake();
         Ok(())
@@ -403,19 +426,13 @@ impl RuntimeHandle {
         let _ = category;
         let now = crate::core::now_china();
         if let Ok(mut state) = self.ui_state.finance.lock() {
-            for reminder in reminders {
-                state.failed(
-                    std::slice::from_ref(&reminder.occurrence_key),
-                    now,
-                    reminder.valid_until,
-                );
-            }
+            state.failed(reminders, now);
         }
         self.wake();
     }
-    pub fn finance_discard(&self, keys: &[String]) {
+    pub fn finance_discard(&self, identities: &[crate::finance::FinanceReminderIdentity]) {
         if let Ok(mut state) = self.ui_state.finance.lock() {
-            state.discard(keys);
+            state.discard(identities);
         }
         self.wake();
     }
@@ -431,7 +448,7 @@ impl RuntimeHandle {
                 |_| false,
             )?
             .iter()
-            .any(|item| item.occurrence_key == reminder.occurrence_key),
+            .any(|item| item.identity() == reminder.identity()),
         )
     }
     pub fn database(&self) -> Result<&Database> {

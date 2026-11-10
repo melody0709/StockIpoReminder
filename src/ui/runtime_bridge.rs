@@ -104,27 +104,41 @@ impl ReminderAlerts {
 }
 
 fn finance_target(reminders: &[crate::finance::FinanceReminder]) -> String {
-    match reminders.first().map(|item| item.kind) {
-        Some(crate::finance::FinanceKind::ReverseRepo) => "finance:repo".into(),
-        Some(crate::finance::FinanceKind::CreditCard) => reminders
-            .first()
-            .map(|item| format!("finance:card:{}", item.source_id))
-            .unwrap_or_else(|| "finance:card".into()),
-        None => "finance:card".into(),
+    if reminders.len() == 1 {
+        let item = &reminders[0];
+        return match item.kind {
+            crate::finance::FinanceKind::ReverseRepo => "finance:repo".into(),
+            crate::finance::FinanceKind::CreditCard
+            | crate::finance::FinanceKind::Mortgage
+            | crate::finance::FinanceKind::AutoLoan => {
+                format!("finance:payment:{}", item.source_id)
+            }
+        };
+    }
+    if reminders
+        .iter()
+        .all(|item| item.kind == crate::finance::FinanceKind::ReverseRepo)
+    {
+        "finance:repo".into()
+    } else {
+        // 多条或混合批次没有唯一账户目标，统一打开还款提醒页，不伪造高亮对象。
+        "finance:payment".into()
     }
 }
 
 fn finance_alert_text(reminders: &[crate::finance::FinanceReminder]) -> (String, String) {
     if reminders.len() == 1 {
         let item = &reminders[0];
-        let body = if item.kind == crate::finance::FinanceKind::CreditCard {
-            "点击查看详情".to_owned()
-        } else {
-            item.body
+        let body = match item.kind {
+            crate::finance::FinanceKind::ReverseRepo => item
+                .body
                 .lines()
                 .next()
                 .unwrap_or("点击查看详情")
-                .to_owned()
+                .to_owned(),
+            crate::finance::FinanceKind::CreditCard
+            | crate::finance::FinanceKind::Mortgage
+            | crate::finance::FinanceKind::AutoLoan => "点击查看详情".to_owned(),
         };
         (item.title.clone(), body)
     } else {
@@ -192,9 +206,18 @@ fn show_finance_batch(
         .join("\n\n");
     reminder_window.set_window_title(title.clone().into());
     reminder_window.set_reminder_title(title.into());
-    // 多条合并时也沿用第一条的类型：界面只用它决定「打开」按钮跳哪个页面，
-    // 写成 "finance" 会让一批全是信用卡的提醒跳进逆回购页。
-    reminder_window.set_reminder_kind(item.kind.as_str().into());
+    // 多条或混合批次没有唯一账户；只要包含还款账户就统一进还款提醒页。
+    let window_kind = if reminders
+        .iter()
+        .all(|item| item.kind == crate::finance::FinanceKind::ReverseRepo)
+    {
+        crate::finance::FinanceKind::ReverseRepo.as_str()
+    } else if item.kind == crate::finance::FinanceKind::ReverseRepo {
+        crate::finance::FinanceKind::CreditCard.as_str()
+    } else {
+        item.kind.as_str()
+    };
+    reminder_window.set_reminder_kind(window_kind.into());
     reminder_window.set_reminder_source_id(
         if single {
             item.source_id.clone()
@@ -211,7 +234,14 @@ fn show_finance_batch(
         }
         .into(),
     );
-    reminder_window.set_reminder_open_label(item.open_label().into());
+    reminder_window.set_reminder_open_label(
+        if window_kind == crate::finance::FinanceKind::ReverseRepo.as_str() {
+            "打开逆回购"
+        } else {
+            "打开还款提醒"
+        }
+        .into(),
+    );
     // 由 Rust 明确告诉界面这个窗口该进理财页还是今日任务：界面不该靠 kind 字符串猜分类，
     // 健康摘要/通知测试的 kind 不是 ipo，按「非 ipo 就进理财」判断会把它们送错页面。
     reminder_window.set_reminder_opens_finance(true);
@@ -666,12 +696,12 @@ pub(crate) fn drain_runtime_ui(
                     .any(|item| !runtime.finance_reminder_is_current(item).unwrap_or(false));
             if expired || stale {
                 let item = state.pending_finance.pop_front().unwrap();
-                let keys = item
+                let identities = item
                     .reminders
                     .iter()
-                    .map(|reminder| reminder.occurrence_key.clone())
+                    .map(crate::finance::FinanceReminder::identity)
                     .collect::<Vec<_>>();
-                runtime.finance_discard(&keys);
+                runtime.finance_discard(&identities);
             } else {
                 break;
             }

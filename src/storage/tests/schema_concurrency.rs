@@ -312,5 +312,5 @@ fn quiet_reminder_migration_cancels_legacy_interruptions() {
         )
         .unwrap();
     assert_eq!(cancelled, 3);
-    assert_eq!(test.database.schema_version().unwrap(), 12);
+    assert_eq!(test.database.schema_version().unwrap(), 13);
 }
