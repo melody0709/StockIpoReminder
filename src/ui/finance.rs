@@ -140,13 +140,6 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
         let can_pay = active && status.next_cycle.is_some();
         let can_undo = undo_window_open(settled.as_deref(), today);
         let closed = account.closed_at.is_some();
-        let action_rows = if account.kind.is_loan() && !closed {
-            3
-        } else if can_pay || can_undo || closed {
-            2
-        } else {
-            1
-        };
         let final_cycle_text = if account.kind.is_loan() {
             account
                 .final_cycle
@@ -349,7 +342,6 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
                 can_undo,
                 is_loan: account.kind.is_loan(),
                 closed,
-                action_rows,
             },
         ));
     }

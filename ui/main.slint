@@ -72,7 +72,6 @@ export struct CreditCardRow {
     can-undo: bool,
     is-loan: bool,
     closed: bool,
-    action-rows: int,
 }
 
 component UpdatePill inherits Rectangle {
@@ -1123,8 +1122,7 @@ export component MainWindow inherits Window {
                 background: #111b2e;
                 ListView {
                     for card in root.credit-cards : Rectangle {
-                        // 动作区改为最多三行、每行最多两个按钮，避免贷款新增「已结清」后继续叠加单列高度。
-                        height: card.action-rows == 3 ? 172px : 128px;
+                        height: card.is-loan && !card.closed && card.can-pay && card.can-undo ? 144px : 100px;
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: root.credit-highlight-id == card.id ? #3b82f6 : card.status-tone >= 2 ? #b45309 : #26334a;
@@ -1132,26 +1130,29 @@ export component MainWindow inherits Window {
                         HorizontalBox {
                             padding-left: root.compact-width ? 8px : 10px;
                             padding-right: root.compact-width ? 18px : 22px;
-                            padding-top: root.compact-width ? 8px : 10px;
-                            padding-bottom: root.compact-width ? 8px : 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
                             spacing: root.compact-width ? 8px : 10px;
                             Rectangle { width: 32px; height: 32px; Image { source: card.bank-icon; width: 28px; height: 28px; x: 2px; y: 2px; } }
-                            VerticalBox {
+                            VerticalLayout {
                                 width: root.compact-width ? 25% : 28%;
+                                alignment: center;
                                 spacing: 3px;
                                 Text { text: card.alias; color: #f8fafc; font-size: 17px; font-weight: 700; overflow: elide; }
                                 Text { text: card.account-kind + " · " + card.bank; color: #94a3b8; font-size: 12px; overflow: elide; }
                                 if card.amount-text != "" : Text { text: card.amount-text; color: card.amount-tone == 1 ? #86efac : card.amount-tone == 2 ? #64748b : #38bdf8; font-size: 12px; overflow: elide; }
                             }
-                            VerticalBox {
+                            VerticalLayout {
                                 width: root.compact-width ? 15% : 18%;
+                                alignment: center;
                                 spacing: 3px;
                                 Text { text: "下次还款"; color: #94a3b8; font-size: 12px; }
                                 Text { text: card.due-text; color: #e2e8f0; font-size: 13px; overflow: elide; }
                                 Text { text: card.status-text; color: card.status-tone == 3 ? #fca5a5 : card.status-tone == 2 ? #fcd34d : card.status-tone == 1 ? #fbbf24 : #86efac; font-weight: 600; wrap: word-wrap; }
                             }
-                            VerticalBox {
+                            VerticalLayout {
                                 horizontal-stretch: 1;
+                                alignment: center;
                                 spacing: 3px;
                                 Text { text: card.lead-text; color: #cbd5e1; font-size: 12px; wrap: word-wrap; }
                                 Text { text: card.remind-text; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
@@ -1159,38 +1160,34 @@ export component MainWindow inherits Window {
                             }
                             Rectangle {
                                 width: root.compact-width ? 184px : 216px;
-                                VerticalBox {
-                                    alignment: start;
+                                // 原生 Layout 没有 Box 的默认内边距，按钮不会超出条目底部。
+                                VerticalLayout {
+                                    alignment: center;
                                     spacing: 6px;
-                                    if card.can-pay || card.can-undo || card.closed : HorizontalBox {
+                                    HorizontalLayout {
                                         spacing: 6px;
                                         if card.can-pay : ActionButton { label: "本期已还"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.mark-credit-paid(card.id, card.cycle-key); } }
-                                        if card.can-undo : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.undo-credit-action(card.id); } }
+                                        if !card.can-pay && !card.closed && card.can-undo : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.undo-credit-action(card.id); } }
                                         if card.closed : ActionButton { label: "恢复进行中"; compact: root.compact-width; primary: true; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.resume-credit-account(card.id); } }
+                                        ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.edit-credit-card(card.id); } }
                                     }
-                                    if !card.closed : HorizontalBox {
+                                    if root.credit-confirm-delete != card.id && root.credit-confirm-close != card.id : HorizontalLayout {
                                         spacing: 6px;
-                                        if root.credit-confirm-delete != card.id : ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.edit-credit-card(card.id); } }
-                                        if card.is-loan && root.credit-confirm-delete != card.id && root.credit-confirm-close != card.id : ActionButton { label: "已结清"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = card.id; } }
-                                        if !card.is-loan && root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
-                                        if root.credit-confirm-close == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-close = ""; } }
-                                        if root.credit-confirm-close == card.id : ActionButton { label: "确定结清"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.close-credit-account(card.id); } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                        if card.is-loan && !card.closed : ActionButton { label: "已结清"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = card.id; } }
+                                        if card.can-undo && (card.closed || (!card.is-loan && card.can-pay)) : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.undo-credit-action(card.id); } }
+                                        ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
                                     }
-                                    if card.closed : HorizontalBox {
+                                    if root.credit-confirm-close == card.id : HorizontalLayout {
                                         spacing: 6px;
-                                        if root.credit-confirm-delete != card.id : ActionButton { label: "编辑"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.edit-credit-card(card.id); } }
-                                        if root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                        ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-close = ""; } }
+                                        ActionButton { label: "确定结清"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.close-credit-account(card.id); } }
                                     }
-                                    if card.is-loan && !card.closed : HorizontalBox {
+                                    if root.credit-confirm-delete == card.id : HorizontalLayout {
                                         spacing: 6px;
-                                        if root.credit-confirm-delete != card.id : ActionButton { label: "删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-close = ""; root.credit-confirm-delete = card.id; } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
-                                        if root.credit-confirm-delete == card.id : ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
+                                        ActionButton { label: "取消"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; } }
+                                        ActionButton { label: "确定删除"; compact: root.compact-width; danger: true; clicked => { root.credit-confirm-delete = ""; root.delete-credit-card(card.id); } }
                                     }
+                                    if card.is-loan && !card.closed && card.can-pay && card.can-undo : ActionButton { label: "撤销已还"; compact: root.compact-width; clicked => { root.credit-confirm-delete = ""; root.credit-confirm-close = ""; root.undo-credit-action(card.id); } }
                                 }
                             }
                         }

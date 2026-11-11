@@ -336,6 +336,137 @@ fn repayment_form_and_account_list_never_share_the_vertical_viewport() {
 }
 
 #[test]
+fn repayment_delete_buttons_fit_and_confirm_at_minimum_and_normal_window_sizes() {
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    struct HeadlessPlatform(Rc<MinimalSoftwareWindow>);
+    impl slint::platform::Platform for HeadlessPlatform {
+        fn create_window_adapter(
+            &self,
+        ) -> std::result::Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone()))).unwrap();
+    let ui = MainWindow::new().unwrap();
+    ui.set_active_page(5);
+    ui.set_credit_summary("本月待还 ¥2,530.00".into());
+    let deleted = Rc::new(std::cell::Cell::new(false));
+    let undone = Rc::new(std::cell::Cell::new(false));
+    let undone_callback = undone.clone();
+    ui.on_undo_credit_action(move |id| {
+        assert_eq!(id, "layout-account");
+        undone_callback.set(true);
+    });
+    let deleted_callback = deleted.clone();
+    ui.on_delete_credit_card(move |id| {
+        assert_eq!(id, "layout-account");
+        deleted_callback.set(true);
+    });
+    ui.show().unwrap();
+
+    for (width, height) in [(800, 500), (1180, 780)] {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        for (is_loan, can_pay, can_undo, closed) in [
+            (true, true, false, false),
+            (true, true, true, false),
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, false, true, true),
+            (false, false, false, false),
+        ] {
+            ui.set_credit_cards(ModelRc::new(VecModel::from(vec![CreditCardRow {
+                id: "layout-account".into(),
+                alias: "农业银行 房贷".into(),
+                account_kind: "房贷".into(),
+                bank: "农业银行".into(),
+                amount_text: "每期 ¥2,530.00 · 借款 ¥600,000".into(),
+                due_text: "2026-11-30".into(),
+                status_text: "还有 19 天".into(),
+                lead_text: "提前 3 天 / 当天".into(),
+                remind_text: "09:00 提醒 · 逾期次日再提醒".into(),
+                final_cycle_text: if is_loan { "未设置结束月" } else { "" }.into(),
+                is_loan,
+                can_pay,
+                can_undo,
+                closed,
+                ..Default::default()
+            }])));
+            deleted.set(false);
+            undone.set(false);
+            for confirmation in [false, true] {
+                slint::platform::update_timers_and_animations();
+                window.request_redraw();
+                let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(width, height);
+                assert!(window.draw_if_needed(|renderer| {
+                    renderer.render(pixels.make_mut_slice(), width as usize);
+                }));
+                let mut bounds = (width, height, 0, 0);
+                for (index, pixel) in pixels.as_slice().iter().enumerate() {
+                    if matches!((pixel.r, pixel.g, pixel.b), (127, 29, 29) | (153, 27, 27)) {
+                        let (x, y) = (index as u32 % width, index as u32 / width);
+                        bounds = (
+                            bounds.0.min(x),
+                            bounds.1.min(y),
+                            bounds.2.max(x),
+                            bounds.3.max(y),
+                        );
+                    }
+                }
+                let (left, top, right, bottom) = bounds;
+                assert!(
+                    right > left && bottom > top,
+                    "删除按钮必须可见: {width}x{height}, loan={is_loan}, pay={can_pay}, undo={can_undo}, closed={closed}, confirmation={confirmation}"
+                );
+                assert_eq!(bottom - top + 1, 36, "38px 按钮的内部必须完整显示");
+                assert!(right - left + 1 >= 86, "窄窗口也不能横向裁切按钮");
+                // 点按钮最下沿，防止看似显示正常但已超出条目的点击区域。
+                let position =
+                    slint::LogicalPosition::new((left + right) as f32 / 2.0, bottom as f32);
+                window.dispatch_event(WindowEvent::PointerPressed {
+                    position,
+                    button: PointerEventButton::Left,
+                });
+                window.dispatch_event(WindowEvent::PointerReleased {
+                    position,
+                    button: PointerEventButton::Left,
+                });
+                if confirmation {
+                    assert!(deleted.get());
+                    assert_eq!(ui.get_credit_confirm_delete(), "");
+                    if closed && can_undo {
+                        slint::platform::update_timers_and_animations();
+                        window.draw_if_needed(|renderer| {
+                            renderer.render(pixels.make_mut_slice(), width as usize);
+                        });
+                        let position = slint::LogicalPosition::new(
+                            left as f32 - 6.0 - (right - left + 2) as f32 / 2.0,
+                            (top + bottom) as f32 / 2.0,
+                        );
+                        window.dispatch_event(WindowEvent::PointerPressed {
+                            position,
+                            button: PointerEventButton::Left,
+                        });
+                        window.dispatch_event(WindowEvent::PointerReleased {
+                            position,
+                            button: PointerEventButton::Left,
+                        });
+                        assert!(undone.get(), "已结清账户仍须保留撤销已还操作");
+                    }
+                } else {
+                    assert!(!deleted.get(), "首次点击不能直接删除");
+                    assert_eq!(ui.get_credit_confirm_delete(), "layout-account");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn main_window_declares_window_level_max_size() {
     // 页面布局汇总出的 max 会被 Slint 当成窗口尺寸上限：逆回购页「提醒时段」的时点行
     // 四个控件全部固定宽（显式 width 同时是 min 和 max），曾把根布局 max-width 钉在
