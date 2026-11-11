@@ -87,9 +87,16 @@ pub(crate) struct PaymentAccount {
     pub updated_at: ChinaDateTime,
     pub amount: Option<f64>,
     pub total_amount: Option<f64>,
+    /// 信用卡「本期金额」所属账期（YYYY-MM）；贷款月供不绑定账期。
+    pub amount_cycle: Option<String>,
 }
 
 impl PaymentAccount {
+    /// 金额是否仍然适用于指定账期；贷款月供长期有效。
+    pub(crate) fn amount_matches_cycle(&self, cycle: &str) -> bool {
+        self.kind != PaymentAccountKind::CreditCard || self.amount_cycle.as_deref() == Some(cycle)
+    }
+
     pub(crate) fn bank_display_name(&self) -> String {
         match self.bank_id.as_deref() {
             Some("other") => self
@@ -240,6 +247,9 @@ pub(crate) fn validate_payment_account(account: &PaymentAccount) -> Result<()> {
     }
     if account.kind == PaymentAccountKind::CreditCard && account.total_amount.is_some() {
         bail!("信用卡不支持填写借款总额");
+    }
+    if let Some(cycle) = account.amount_cycle.as_deref() {
+        parse_cycle(cycle).context("金额账期格式必须是 YYYY-MM")?;
     }
     if let Some(amount) = account.amount {
         if !amount.is_finite() || amount < 0.0 || amount > 100_000_000.0 {
@@ -683,6 +693,7 @@ mod tests {
             updated_at: dt("2026-10-01T00:00:00+08:00"),
             amount: None,
             total_amount: None,
+            amount_cycle: None,
         }
     }
 
@@ -1038,6 +1049,11 @@ mod tests {
         assert!(validate_payment_account(&card).is_ok());
         card.total_amount = Some(50000.0);
         assert!(validate_payment_account(&card).is_err());
+        card.total_amount = None;
+        card.amount_cycle = Some("2026-1".into());
+        assert!(validate_payment_account(&card).is_err());
+        card.amount_cycle = Some("2026-11".into());
+        assert!(validate_payment_account(&card).is_ok());
     }
 
     #[test]

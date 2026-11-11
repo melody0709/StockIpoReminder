@@ -144,6 +144,7 @@ mod tests {
             updated_at: now,
             amount: None,
             total_amount: None,
+            amount_cycle: None,
         }
     }
 

@@ -36,7 +36,7 @@ const RUNTIME_HEARTBEAT_WARNING_MINUTES: i64 = 3;
 const RUNTIME_HEARTBEAT_FAILED_MINUTES: i64 = 15;
 const BACKUP_PAGES_PER_STEP: i32 = 1024;
 const BACKUP_STEP_PAUSE: StdDuration = StdDuration::from_millis(1);
-pub const LATEST_SCHEMA_VERSION: i64 = 14;
+pub const LATEST_SCHEMA_VERSION: i64 = 16;
 
 #[derive(Clone)]
 pub struct Database {

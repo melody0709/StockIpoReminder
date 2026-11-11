@@ -431,6 +431,19 @@ fn test_parse_and_format_amount_in_ui() {
 }
 
 #[test]
+fn payment_reminder_kinds_cover_all_four_account_types() {
+    // 弹窗「打开还款提醒」和「本期已还」都必须覆盖信用贷，否则会跳错页面或报不支持。
+    for kind in ["credit_card", "mortgage", "auto_loan", "credit_loan"] {
+        assert!(is_payment_reminder_kind(kind), "{kind}");
+        assert!(opens_payment_page(kind), "{kind}");
+    }
+    assert!(opens_payment_page("payment"));
+    assert!(!is_payment_reminder_kind("payment"));
+    assert!(!opens_payment_page("reverse_repo"));
+    assert!(!is_payment_reminder_kind("reverse_repo"));
+}
+
+#[test]
 fn test_monthly_summary_formatting() {
     use crate::ui::finance::format_monthly_summary;
 
@@ -504,4 +517,172 @@ fn test_monthly_summary_formatting() {
         format_monthly_summary(2, 2, 2, 0, 2, 0, 0, sum, 0.0, Some(day)),
         "本月待还 ¥16,000.00 · 已还 ¥0.00 (本月应还 ¥16,000.00 · 2 项启用)"
     );
+
+    // 12. 本月范围内已还清、但仍有旧账逾期：不能显示「本月已全部结清」盖掉逾期。
+    assert_eq!(
+        format_monthly_summary(2, 2, 1, 0, 0, 1, 1, 0.0, 3200.0, None),
+        "1 项已逾期 · 本月已还 ¥3,200.00 · 1 项已还"
+    );
+
+    // 13. 同上但本月已还项未填金额。
+    assert_eq!(
+        format_monthly_summary(3, 3, 1, 1, 0, 1, 1, 0.0, 3200.0, None),
+        "1 项已逾期 · 本月已还 ¥3,200.00 (另 1 项未填金额)"
+    );
+}
+
+#[test]
+fn repayment_editor_preserves_paid_summary_and_confirms_unknown_amounts() {
+    use crate::finance::{PaymentAccount, PaymentAccountKind, cycle_key, shift_cycle};
+
+    struct HeadlessPlatform;
+    impl slint::platform::Platform for HeadlessPlatform {
+        fn create_window_adapter(
+            &self,
+        ) -> std::result::Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError>
+        {
+            Ok(
+                slint::platform::software_renderer::MinimalSoftwareWindow::new(
+                    slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
+                ),
+            )
+        }
+    }
+
+    fn save_form(ui: &MainWindow) {
+        ui.invoke_save_credit_card(
+            ui.get_credit_form_id(),
+            ui.get_credit_form_kind_index(),
+            ui.get_credit_form_alias(),
+            ui.get_credit_form_bank_index(),
+            ui.get_credit_form_bank_name(),
+            ui.get_credit_form_due_day_index(),
+            ui.get_credit_form_remind_time(),
+            ui.get_credit_form_lead_mode_index(),
+            ui.get_credit_form_lead_days(),
+            ui.get_credit_form_final_cycle(),
+            ui.get_credit_form_overdue(),
+            ui.get_credit_form_enabled(),
+            ui.get_credit_form_amount(),
+            ui.get_credit_form_total_amount(),
+        );
+        assert_eq!(ui.get_credit_error(), "");
+    }
+
+    slint::platform::set_platform(Box::new(HeadlessPlatform)).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "stock-ipo-repayment-ui-test-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let database = crate::storage::Database::new(&root);
+    database.initialize().unwrap();
+    let runtime = RuntimeHandle::for_test(database.clone());
+    let ui = MainWindow::new().unwrap();
+    wire_finance_callbacks(&ui, runtime.clone());
+    let now = crate::core::now_china();
+    let current = cycle_key(now.date_naive());
+    let next = shift_cycle(&current, 1).unwrap();
+    let mut account = PaymentAccount {
+        id: "summary-card".into(),
+        kind: PaymentAccountKind::CreditCard,
+        alias: "账单测试".into(),
+        bank_id: None,
+        bank_name: None,
+        due_day: 20,
+        remind_time: model::time(9, 0),
+        lead_days: vec![0],
+        overdue_enabled: false,
+        enabled: true,
+        first_tracked_cycle: current.clone(),
+        final_cycle: None,
+        closed_at: None,
+        rules_changed_at: now,
+        created_at: now,
+        updated_at: now,
+        amount: Some(3200.0),
+        total_amount: None,
+        amount_cycle: Some(current.clone()),
+    };
+    database.save_payment_account(&account).unwrap();
+    database
+        .mark_payment_account_paid(&account.id, &current)
+        .unwrap();
+    assert!(refresh_finance_ui(&ui, &runtime));
+    assert!(ui.get_credit_summary().contains("3,200.00"));
+
+    ui.invoke_edit_credit_card(account.id.clone().into());
+    assert!(ui.get_credit_form_preview().contains(&next));
+    assert!(ui.get_credit_form_preview().contains("重新填写"));
+    assert!(!ui.get_credit_form_preview().contains("还款金额 ¥3,200.00"));
+    ui.set_credit_form_amount("3300".into());
+    ui.set_credit_form_amount_touched(true);
+    ui.invoke_preview_credit_form();
+    assert!(ui.get_credit_form_preview().contains("3,300.00"));
+    assert!(!ui.get_credit_form_preview().contains("重新填写"));
+    save_form(&ui);
+    assert!(ui.get_credit_summary().contains("3,200.00"));
+    assert!(
+        ui.get_credit_cards()
+            .row_data(0)
+            .unwrap()
+            .amount_text
+            .contains("3,200.00")
+    );
+    assert_eq!(
+        database
+            .payment_account(&account.id)
+            .unwrap()
+            .unwrap()
+            .amount_cycle,
+        Some(next)
+    );
+
+    // 迁移后账期待确认：只改别名不能确认，重新输入相同金额可以确认。
+    database.delete_payment_account(&account.id).unwrap();
+    account.id = "unconfirmed-card".into();
+    account.amount_cycle = None;
+    database.save_payment_account(&account).unwrap();
+    assert!(refresh_finance_ui(&ui, &runtime));
+    assert!(
+        ui.get_credit_cards()
+            .row_data(0)
+            .unwrap()
+            .amount_text
+            .contains("账期待确认")
+    );
+    assert!(!ui.get_credit_summary().contains("3,200.00"));
+    ui.invoke_edit_credit_card(account.id.clone().into());
+    ui.set_credit_form_alias("改名后仍待确认".into());
+    save_form(&ui);
+    assert_eq!(
+        database
+            .payment_account(&account.id)
+            .unwrap()
+            .unwrap()
+            .amount_cycle,
+        None
+    );
+    ui.invoke_edit_credit_card(account.id.clone().into());
+    ui.set_credit_form_amount_touched(true);
+    ui.invoke_preview_credit_form();
+    assert!(!ui.get_credit_form_preview().contains("重新填写"));
+    save_form(&ui);
+    assert_eq!(
+        database
+            .payment_account(&account.id)
+            .unwrap()
+            .unwrap()
+            .amount_cycle,
+        Some(current)
+    );
+    assert!(ui.get_credit_summary().contains("3,200.00"));
+    let previous_summary = ui.get_credit_summary();
+    rusqlite::Connection::open(database.path())
+        .unwrap()
+        .execute("ALTER TABLE credit_card_actions DROP COLUMN amount", [])
+        .unwrap();
+    assert!(!refresh_finance_ui(&ui, &runtime));
+    assert_eq!(ui.get_credit_summary(), previous_summary);
+    assert!(ui.get_status_text().contains("读取还款记录失败"));
+    let _ = std::fs::remove_dir_all(root);
 }

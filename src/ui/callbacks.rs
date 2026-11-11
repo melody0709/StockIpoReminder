@@ -1,5 +1,18 @@
 use super::*;
 
+/// 还款类提醒支持「本期已还」。
+pub(crate) fn is_payment_reminder_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "credit_card" | "mortgage" | "auto_loan" | "credit_loan"
+    )
+}
+
+/// 「打开」按钮进入还款页的类型；`payment` 是旧版本提醒遗留的分类，只用于兼容跳转。
+pub(crate) fn opens_payment_page(kind: &str) -> bool {
+    is_payment_reminder_kind(kind) || kind == "payment"
+}
+
 pub(crate) fn wire_reminder_callbacks(
     reminder: &ReminderWindow,
     main_window: &MainWindow,
@@ -51,10 +64,7 @@ pub(crate) fn wire_reminder_callbacks(
             let _ = reminder.hide();
         }
         if let Some(main_window) = main_weak.upgrade() {
-            let is_payment = matches!(
-                kind.as_str(),
-                "credit_card" | "mortgage" | "auto_loan" | "payment"
-            );
+            let is_payment = opens_payment_page(kind.as_str());
             main_window.set_active_page(if is_payment { 5 } else { 4 });
             if is_payment {
                 // 表单展开时列表是互斥隐藏的；从提醒跳转必须回到可定位的账户列表。
@@ -83,7 +93,7 @@ pub(crate) fn wire_reminder_callbacks(
         if let Some(reminder) = reminder_weak.upgrade() {
             let _ = reminder.hide();
         }
-        let is_payment = matches!(kind.as_str(), "credit_card" | "mortgage" | "auto_loan");
+        let is_payment = is_payment_reminder_kind(kind.as_str());
         let result = match kind.as_str() {
             // 逆回购的「今日已处理」必须写在提醒自己的日期上：弹窗可以跨日保留，
             // 若用点击当天，周五的弹窗拖到周一才点就会把周一整天标成已处理。
@@ -91,7 +101,7 @@ pub(crate) fn wire_reminder_callbacks(
                 repo_ack_date(event_date.as_str(), crate::core::now_china().date_naive())
                     .and_then(|date| action_runtime.set_repo_day_acked(date, true))
             }
-            "credit_card" | "mortgage" | "auto_loan" => {
+            "credit_card" | "mortgage" | "auto_loan" | "credit_loan" => {
                 action_runtime.mark_payment_account_paid(&source_id, &cycle_key)
             }
             _ => Err(anyhow::anyhow!("不支持的理财提醒类型：{kind}")),

@@ -175,14 +175,14 @@ impl Database {
             &mut state,
             &mut row_count,
             "credit-cards",
-            "SELECT quote(id)||','||quote(account_type)||','||quote(alias)||','||quote(bank_id)||','||quote(bank)||','||quote(due_day)||','||quote(remind_time)||','||quote(lead_days_json)||','||quote(overdue_enabled)||','||quote(enabled)||','||quote(first_tracked_cycle)||','||quote(final_cycle)||','||quote(closed_at)||','||quote(amount)||','||quote(total_amount) FROM credit_cards ORDER BY id",
+            "SELECT quote(id)||','||quote(account_type)||','||quote(alias)||','||quote(bank_id)||','||quote(bank)||','||quote(due_day)||','||quote(remind_time)||','||quote(lead_days_json)||','||quote(overdue_enabled)||','||quote(enabled)||','||quote(first_tracked_cycle)||','||quote(final_cycle)||','||quote(closed_at)||','||quote(amount)||','||quote(total_amount)||','||quote(amount_cycle) FROM credit_cards ORDER BY id",
         )?;
         append_fingerprint_rows(
             &connection,
             &mut state,
             &mut row_count,
             "credit-card-actions",
-            "SELECT quote(card_id)||','||quote(cycle_key)||','||quote(due_on)||','||quote(action) FROM credit_card_actions ORDER BY card_id,cycle_key",
+            "SELECT quote(card_id)||','||quote(cycle_key)||','||quote(due_on)||','||quote(action)||','||quote(amount) FROM credit_card_actions ORDER BY card_id,cycle_key",
         )?;
         Ok((row_count > 0).then(|| sha256(state)))
     }

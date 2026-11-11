@@ -20,6 +20,8 @@ impl Database {
         migrate_v12(&connection)?;
         migrate_v13(&connection)?;
         migrate_v14(&connection)?;
+        migrate_v15(&connection)?;
+        migrate_v16(&connection)?;
         Ok(())
     }
 

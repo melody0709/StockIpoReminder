@@ -443,6 +443,7 @@ export component MainWindow inherits Window {
     in-out property <string> credit-form-lead-days: "3,0";
     in-out property <string> credit-form-final-cycle: "";
     in-out property <string> credit-form-amount: "";
+    in-out property <bool> credit-form-amount-touched: false;
     in-out property <string> credit-form-total-amount: "";
     in-out property <bool> credit-form-overdue: true;
     in-out property <bool> credit-form-enabled: true;
@@ -1072,7 +1073,7 @@ export component MainWindow inherits Window {
                             width: root.compact-width ? 104px : 124px;
                             text <=> root.credit-form-amount;
                             placeholder-text: root.credit-form-kind-index == 0 ? "如 3200" : "月供，如 5800";
-                            edited(text) => { root.preview-credit-form(); }
+                            edited(text) => { root.credit-form-amount-touched = true; root.preview-credit-form(); }
                         }
                         Text { text: "元"; color: #94a3b8; vertical-alignment: center; }
                         if root.credit-form-kind-index > 0 : Text { text: "借款总额"; color: #cbd5e1; vertical-alignment: center; }
@@ -1110,7 +1111,7 @@ export component MainWindow inherits Window {
                     }
                     if root.credit-form-preview != "" : Text { text: root.credit-form-preview; color: #93c5fd; font-size: 12px; wrap: word-wrap; }
                     if root.credit-error != "" : Text { text: root.credit-error; color: #fca5a5; font-size: 12px; wrap: word-wrap; }
-                    Text { text: "数据仅保存在本机，离线不联网；金额选填，仅用于本地月度汇总目测；请勿填写完整卡号、密码或安全码。29/30/31 日在短月会自动按月末提醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
+                    Text { text: "还款数据仅保存在本机；金额选填，用于月度汇总。已还金额以确认时为准，修正需先撤销已还、重填再确认。请勿填写完整卡号、密码或安全码。29/30/31 日在短月按月末提醒。"; color: #94a3b8; font-size: 12px; wrap: word-wrap; }
                     }
                 }
             }

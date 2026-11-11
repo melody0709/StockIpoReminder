@@ -498,7 +498,7 @@ mod tests {
 
         assert!(prepare_database_upgrade(&root, "0.2.5").unwrap().is_none());
         let connection = rusqlite::Connection::open(database.path()).unwrap();
-        // 回退 v14 时必须同时移除新列，否则重跑 ALTER TABLE 会报重复列；
+        // 回退 v16 时必须同时移除新列，否则重跑 ALTER TABLE 会报重复列；
         // 这里只验证升级前备份分支，真实数据升级由 storage 测试覆盖。
         connection
             .execute(
@@ -507,10 +507,7 @@ mod tests {
             )
             .unwrap();
         connection
-            .execute_batch(
-                "ALTER TABLE credit_cards DROP COLUMN amount;
-                 ALTER TABLE credit_cards DROP COLUMN total_amount;",
-            )
+            .execute_batch("ALTER TABLE credit_card_actions DROP COLUMN amount;")
             .unwrap();
         drop(connection);
 

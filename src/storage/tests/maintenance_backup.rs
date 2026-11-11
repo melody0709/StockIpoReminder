@@ -225,6 +225,7 @@ fn business_fingerprint_includes_v13_account_fields_and_actions() {
         updated_at: now,
         amount: None,
         total_amount: None,
+        amount_cycle: None,
     };
     test.database.save_payment_account(&account).unwrap();
     let mut previous = test.database.business_state_fingerprint().unwrap();
@@ -234,6 +235,7 @@ fn business_fingerprint_includes_v13_account_fields_and_actions() {
         "UPDATE credit_cards SET final_cycle='2027-01' WHERE id='fingerprint-loan'",
         "UPDATE credit_cards SET amount=5800.0 WHERE id='fingerprint-loan'",
         "UPDATE credit_cards SET total_amount=100000.0 WHERE id='fingerprint-loan'",
+        "UPDATE credit_cards SET amount_cycle='2026-11' WHERE id='fingerprint-loan'",
     ] {
         test.database.open().unwrap().execute_batch(sql).unwrap();
         let current = test.database.business_state_fingerprint().unwrap();
@@ -245,6 +247,17 @@ fn business_fingerprint_includes_v13_account_fields_and_actions() {
         .unwrap();
     let current = test.database.business_state_fingerprint().unwrap();
     assert_ne!(current, previous, "指纹未覆盖已还动作");
+    previous = current;
+    test.database
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE credit_card_actions SET amount=5900 WHERE card_id=?1",
+            [&account.id],
+        )
+        .unwrap();
+    let current = test.database.business_state_fingerprint().unwrap();
+    assert_ne!(current, previous, "指纹未覆盖已还金额快照");
     previous = current;
     test.database
         .open()
@@ -283,8 +296,9 @@ fn backup_preserves_loan_end_close_and_paid_action() {
         rules_changed_at: now,
         created_at: now,
         updated_at: now,
-        amount: None,
+        amount: Some(5800.0),
         total_amount: None,
+        amount_cycle: None,
     };
     test.database.save_payment_account(&account).unwrap();
     test.database
@@ -296,7 +310,8 @@ fn backup_preserves_loan_end_close_and_paid_action() {
     let row = connection
         .query_row(
             "SELECT account_type,bank_id,bank,final_cycle,closed_at IS NOT NULL,
-                    (SELECT COUNT(*) FROM credit_card_actions WHERE card_id='backup-loan')
+                    (SELECT COUNT(*) FROM credit_card_actions WHERE card_id='backup-loan'),
+                    (SELECT amount FROM credit_card_actions WHERE card_id='backup-loan')
              FROM credit_cards WHERE id='backup-loan'",
             [],
             |row| {
@@ -307,6 +322,7 @@ fn backup_preserves_loan_end_close_and_paid_action() {
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, f64>(6)?,
                 ))
             },
         )
@@ -317,4 +333,5 @@ fn backup_preserves_loan_end_close_and_paid_action() {
     assert_eq!(row.3, "2026-12");
     assert_eq!(row.4, 1);
     assert_eq!(row.5, 1);
+    assert_eq!(row.6, 5800.0);
 }

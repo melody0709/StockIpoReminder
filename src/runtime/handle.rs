@@ -185,6 +185,20 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test(database: Database) -> Self {
+        let (command_sender, _) = mpsc::channel();
+        let (_, event_receiver) = mpsc::channel();
+        Self {
+            database,
+            command_sender,
+            event_receiver: Arc::new(Mutex::new(event_receiver)),
+            ui_state: RuntimeUiState::new(),
+            ready: Arc::new(AtomicBool::new(true)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn request_sync(&self, reason: impl Into<String>) {
         let _ = self.command_sender.send(RuntimeCommand::Sync(SyncRequest {
             reason: reason.into(),
@@ -373,6 +387,11 @@ impl RuntimeHandle {
     pub fn payment_account_settled(&self, id: &str) -> Result<Option<String>> {
         self.ensure_ready()?;
         self.database.payment_account_settled(id)
+    }
+
+    pub fn payment_account_paid_amount(&self, id: &str, cycle: &str) -> Result<Option<f64>> {
+        self.ensure_ready()?;
+        self.database.payment_account_paid_amount(id, cycle)
     }
     pub fn mark_payment_account_paid(&self, id: &str, cycle: &str) -> Result<()> {
         self.ensure_ready()?;

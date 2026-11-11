@@ -109,7 +109,21 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
     let mut no_amount_count = 0usize;
 
     for account in &accounts {
-        let settled = runtime.payment_account_settled(&account.id).unwrap_or(None);
+        let payment_state = runtime
+            .payment_account_settled(&account.id)
+            .and_then(|settled| {
+                runtime
+                    .payment_account_paid_amount(&account.id, &current_cycle)
+                    .map(|amount| (settled, amount))
+            });
+        let (settled, paid_amount_for_current_cycle) = match payment_state {
+            Ok(value) => value,
+            Err(error) => {
+                ui.set_credit_error(format!("读取还款记录失败：{error:#}").into());
+                ui.set_status_text(format!("读取还款记录失败：{error:#}").into());
+                return false;
+            }
+        };
         let status = status_for_account(account, settled.as_deref(), today);
         let active = account.enabled && account.closed_at.is_none();
         if active {
@@ -155,10 +169,19 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
             .as_deref()
             .is_some_and(|s| cycle_at_least(s, &current_cycle));
 
+        // 信用卡「本期金额」只对填写时的账期有效；跨月后旧金额不能继续计入本月汇总。
+        let amount_for_current_cycle = account
+            .amount
+            .filter(|_| account.amount_matches_cycle(&current_cycle));
+        let credit_amount_stale = account.kind == PaymentAccountKind::CreditCard
+            && account.amount.is_some()
+            && !cycle_before(&current_cycle, &account.first_tracked_cycle)
+            && !account.amount_matches_cycle(&current_cycle);
+
         if in_month_scope {
             if is_current_cycle_paid {
                 paid_count = paid_count.saturating_add(1);
-                if let Some(amt) = account.amount {
+                if let Some(amt) = paid_amount_for_current_cycle {
                     total_paid_amount += amt;
                     has_amount_count = has_amount_count.saturating_add(1);
                 } else {
@@ -166,7 +189,7 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
                 }
             } else {
                 pending_count = pending_count.saturating_add(1);
-                if let Some(amt) = account.amount {
+                if let Some(amt) = amount_for_current_cycle {
                     total_pending_amount += amt;
                     has_amount_count = has_amount_count.saturating_add(1);
                 } else {
@@ -175,6 +198,15 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
             }
         }
 
+        let amount_label = if account.kind == PaymentAccountKind::CreditCard {
+            if credit_amount_stale {
+                account.amount_cycle.as_deref().unwrap_or("账期待确认")
+            } else {
+                "本期"
+            }
+        } else {
+            "每期"
+        };
         let (amount_text, amount_tone) = if closed {
             let text = if let Some(total) = account.total_amount {
                 format!("贷款已结清 · 借款 {}", format_cny_auto(total))
@@ -184,19 +216,14 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
             (text, 2)
         } else if !account.enabled {
             let text = if let Some(amt) = account.amount {
-                let label = if account.kind == PaymentAccountKind::CreditCard {
-                    "本期"
-                } else {
-                    "每期"
-                };
                 if let Some(total) = account.total_amount {
                     format!(
-                        "{label} {} · 借款 {}",
+                        "{amount_label} {} · 借款 {}",
                         format_cny(amt),
                         format_cny_auto(total)
                     )
                 } else {
-                    format!("{label} {}", format_cny(amt))
+                    format!("{amount_label} {}", format_cny(amt))
                 }
             } else if let Some(total) = account.total_amount {
                 format!("借款 {}", format_cny_auto(total))
@@ -206,19 +233,14 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
             (text, 2)
         } else if status.next_cycle.is_none() && account.final_cycle.is_some() {
             let text = if let Some(amt) = account.amount {
-                let label = if account.kind == PaymentAccountKind::CreditCard {
-                    "本期"
-                } else {
-                    "每期"
-                };
                 if let Some(total) = account.total_amount {
                     format!(
-                        "周期已结束 · {label} {} · 借款 {}",
+                        "周期已结束 · {amount_label} {} · 借款 {}",
                         format_cny(amt),
                         format_cny_auto(total)
                     )
                 } else {
-                    format!("周期已结束 · {label} {}", format_cny(amt))
+                    format!("周期已结束 · {amount_label} {}", format_cny(amt))
                 }
             } else if let Some(total) = account.total_amount {
                 format!("周期已结束 · 借款 {}", format_cny_auto(total))
@@ -227,7 +249,7 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
             };
             (text, 2)
         } else if is_current_cycle_paid {
-            let text = if let Some(amt) = account.amount {
+            let text = if let Some(amt) = paid_amount_for_current_cycle {
                 if let Some(total) = account.total_amount {
                     format!(
                         "✓ 本期已还 {} · 借款 {}",
@@ -243,20 +265,29 @@ pub(crate) fn refresh_finance_ui(ui: &MainWindow, runtime: &RuntimeHandle) -> bo
                 "✓ 本期已还".to_owned()
             };
             (text, 1)
-        } else if let Some(amt) = account.amount {
-            let label = if account.kind == PaymentAccountKind::CreditCard {
-                "本期"
-            } else {
-                "每期"
-            };
+        } else if credit_amount_stale {
             let text = if let Some(total) = account.total_amount {
                 format!(
-                    "{label} {} · 借款 {}",
+                    "本期待填写 · {amount_label} {} · 借款 {}",
+                    format_cny(account.amount.unwrap_or_default()),
+                    format_cny_auto(total)
+                )
+            } else {
+                format!(
+                    "本期待填写 · {amount_label} {}",
+                    format_cny(account.amount.unwrap_or_default())
+                )
+            };
+            (text, 0)
+        } else if let Some(amt) = account.amount {
+            let text = if let Some(total) = account.total_amount {
+                format!(
+                    "{amount_label} {} · 借款 {}",
                     format_cny(amt),
                     format_cny_auto(total)
                 )
             } else {
-                format!("{label} {}", format_cny(amt))
+                format!("{amount_label} {}", format_cny(amt))
             };
             (text, 0)
         } else if let Some(total) = account.total_amount {
@@ -368,23 +399,25 @@ pub(crate) fn format_monthly_summary(
     if total_accounts == 0 {
         "暂无还款提醒".to_owned()
     } else if has_amount_count > 0 {
-        if pending_count == 0 && total_active_in_scope > 0 {
-            if no_amount_count == 0 {
-                format!(
-                    "本月已全部结清 {} · {} 项已还",
-                    format_cny(total_paid_amount),
-                    paid_count
-                )
-            } else {
-                format!(
-                    "本月已全部结清 {} (另 {} 项未填金额) · {} 项已还",
-                    format_cny(total_paid_amount),
-                    no_amount_count,
-                    paid_count
-                )
-            }
-        } else if overdue > 0 {
-            if no_amount_count > 0 {
+        // 逾期提示优先：即使本月范围内的账户都已还清，也不能把仍在逾期的旧账盖掉。
+        if overdue > 0 {
+            if pending_count == 0 {
+                if no_amount_count > 0 {
+                    format!(
+                        "{} 项已逾期 · 本月已还 {} (另 {} 项未填金额)",
+                        overdue,
+                        format_cny(total_paid_amount),
+                        no_amount_count
+                    )
+                } else {
+                    format!(
+                        "{} 项已逾期 · 本月已还 {} · {} 项已还",
+                        overdue,
+                        format_cny(total_paid_amount),
+                        paid_count
+                    )
+                }
+            } else if no_amount_count > 0 {
                 format!(
                     "{} 项已逾期 · 本月待还 {} (另 {} 项未填金额) · 已还 {}",
                     overdue,
@@ -399,6 +432,21 @@ pub(crate) fn format_monthly_summary(
                     format_cny(total_pending_amount),
                     format_cny(total_paid_amount),
                     format_cny(total_due_amount)
+                )
+            }
+        } else if pending_count == 0 && total_active_in_scope > 0 {
+            if no_amount_count == 0 {
+                format!(
+                    "本月已全部结清 {} · {} 项已还",
+                    format_cny(total_paid_amount),
+                    paid_count
+                )
+            } else {
+                format!(
+                    "本月已全部结清 {} (另 {} 项未填金额) · {} 项已还",
+                    format_cny(total_paid_amount),
+                    no_amount_count,
+                    paid_count
                 )
             }
         } else if no_amount_count > 0 {
@@ -619,8 +667,8 @@ fn update_form_preview(ui: &MainWindow, runtime: &RuntimeHandle) {
         let due_day = (ui.get_credit_form_due_day_index() + 1) as u32;
         let final_cycle = ui.get_credit_form_final_cycle();
         let final_cycle = final_cycle.trim();
-        let is_loan = account_kind(ui.get_credit_form_kind_index())?.is_loan();
-        if is_loan && !final_cycle.is_empty() {
+        let form_is_loan = account_kind(ui.get_credit_form_kind_index())?.is_loan();
+        if form_is_loan && !final_cycle.is_empty() {
             parse_cycle(final_cycle).context("结束还款月格式必须是 YYYY-MM")?;
         }
         let form_id = ui.get_credit_form_id();
@@ -633,13 +681,42 @@ fn update_form_preview(ui: &MainWindow, runtime: &RuntimeHandle) {
                     .find(|account| account.id == form_id.as_str())
             })
             .flatten();
-        let first = existing
+        let is_loan = existing
             .as_ref()
-            .map(|account| account.first_tracked_cycle.clone())
-            .unwrap_or_else(|| first_tracked_cycle(crate::core::now_china().date_naive(), due_day));
-        let due = due_on_for_cycle(&first, due_day)?;
-        let amount_part = match parse_optional_amount(&ui.get_credit_form_amount()) {
-            Ok(Some(amt)) => format!("，还款金额 {}", format_cny(amt)),
+            .map_or(form_is_loan, |account| account.kind.is_loan());
+        let today = crate::core::now_china().date_naive();
+        // 编辑已存在账户时按已还进度和表单里修改后的规则推算下一待还账期，
+        // 不能直接用 first_tracked_cycle，否则首期已还后预览仍显示首期。
+        let (next_cycle, amount_cycle) = match existing.as_ref() {
+            Some(account) => {
+                let mut preview = account.clone();
+                preview.due_day = due_day;
+                preview.final_cycle = if is_loan {
+                    (!final_cycle.is_empty()).then(|| final_cycle.to_owned())
+                } else {
+                    None
+                };
+                let settled = runtime.payment_account_settled(&account.id)?;
+                (
+                    status_for_account(&preview, settled.as_deref(), today).next_cycle,
+                    account.amount_cycle.clone(),
+                )
+            }
+            None => (Some(first_tracked_cycle(today, due_day)), None),
+        };
+        let Some(next_cycle) = next_cycle else {
+            return Ok("下一期预览：还款周期已结束".to_owned());
+        };
+        let due = due_on_for_cycle(&next_cycle, due_day)?;
+        let amount = parse_optional_amount(&ui.get_credit_form_amount())?;
+        let stale_amount = !is_loan
+            && !ui.get_credit_form_amount_touched()
+            && existing
+                .as_ref()
+                .is_some_and(|account| account.amount.is_some())
+            && amount_cycle.as_deref() != Some(next_cycle.as_str());
+        let amount_part = match amount {
+            Some(amt) if !stale_amount => format!("，还款金额 {}", format_cny(amt)),
             _ => String::new(),
         };
         let total_part = if is_loan {
@@ -650,18 +727,42 @@ fn update_form_preview(ui: &MainWindow, runtime: &RuntimeHandle) {
         } else {
             String::new()
         };
+        let stale_amount_part = if stale_amount {
+            "；旧金额账期不适用于本期，请按本期账单重新填写金额"
+        } else {
+            ""
+        };
         Ok(format!(
-            "下一期预览：{} 账期，实际还款日 {}{}{}",
-            first,
+            "下一期预览：{} 账期，实际还款日 {}{}{}{}",
+            next_cycle,
             due.format("%Y-%m-%d"),
             amount_part,
             total_part,
+            stale_amount_part,
         ))
     })();
     ui.set_credit_form_preview(match preview {
         Ok(value) => value.into(),
         Err(_) => "".into(),
     });
+}
+
+/// 表单保存时应绑定到的信用卡账期：按已还进度和当前还款日推算下一待还账期。
+fn next_cycle_for_form(
+    existing: Option<&PaymentAccount>,
+    due_day: u32,
+    runtime: &RuntimeHandle,
+    today: NaiveDate,
+) -> Result<String> {
+    let Some(account) = existing else {
+        return Ok(first_tracked_cycle(today, due_day));
+    };
+    let mut preview = account.clone();
+    preview.due_day = due_day;
+    let settled = runtime.payment_account_settled(&account.id)?;
+    Ok(status_for_account(&preview, settled.as_deref(), today)
+        .next_cycle
+        .unwrap_or_else(|| cycle_key(today)))
 }
 
 fn account_from_form(
@@ -717,6 +818,27 @@ fn account_from_form(
     };
     let due_day = (due_day_index + 1) as u32;
     let amount = parse_optional_amount(amount_str)?;
+    // 信用卡金额跟随账期：只有用户重新填写金额时才绑定到新的待还账期；
+    // 只改别名等其它字段时保留原账期，避免旧账单被误当成新一期。
+    let amount_cycle = if kind == PaymentAccountKind::CreditCard && amount.is_some() {
+        let unchanged = existing.as_ref().is_some_and(|account| {
+            account.amount == amount && !ui.get_credit_form_amount_touched()
+        });
+        if unchanged {
+            existing
+                .as_ref()
+                .and_then(|account| account.amount_cycle.clone())
+        } else {
+            Some(next_cycle_for_form(
+                existing.as_ref(),
+                due_day,
+                runtime,
+                now.date_naive(),
+            )?)
+        }
+    } else {
+        None
+    };
     let total_amount = if kind.is_loan() {
         parse_optional_amount(total_amount_str)?
     } else {
@@ -759,6 +881,7 @@ fn account_from_form(
         updated_at: now,
         amount,
         total_amount,
+        amount_cycle,
     };
     validate_payment_account(&account)?;
     Ok(account)
@@ -947,6 +1070,7 @@ pub(crate) fn wire_finance_callbacks(ui: &MainWindow, runtime: RuntimeHandle) {
                 .unwrap_or_default()
                 .into(),
         );
+        ui.set_credit_form_amount_touched(false);
         ui.set_credit_form_total_amount(
             account
                 .total_amount
@@ -1101,6 +1225,7 @@ pub(crate) fn clear_credit_editor(ui: &MainWindow) {
     ui.set_credit_form_lead_days("3,0".into());
     ui.set_credit_form_final_cycle("".into());
     ui.set_credit_form_amount("".into());
+    ui.set_credit_form_amount_touched(false);
     ui.set_credit_form_total_amount("".into());
     ui.set_credit_form_overdue(true);
     ui.set_credit_form_enabled(true);
